@@ -594,9 +594,16 @@ class TestGpuAutoSelection(_GpuCacheResetMixin, unittest.TestCase):
     def test_estimate_required_memory_formulas(self):
         eight_gb = 8 * (1024**3)
 
-        with patch(
-            "utils.hardware.hardware.estimate_fp16_model_size_bytes",
-            return_value = (eight_gb, "config"),
+        # These are CUDA-shaped assertions (bitsandbytes-style QUANT_4BIT_FACTOR,
+        # CUDA_OVERHEAD_BYTES) -- pin the device so the test means the same thing
+        # on a CUDA CI runner and on an Apple Silicon dev machine, where
+        # estimate_required_model_memory_gb now takes the MLX-specific branch.
+        with (
+            patch("utils.hardware.hardware.get_device", return_value = DeviceType.CUDA),
+            patch(
+                "utils.hardware.hardware.estimate_fp16_model_size_bytes",
+                return_value = (eight_gb, "config"),
+            ),
         ):
             # FP16 inference: 8GB * 1.3 = 10.4GB
             required_gb, metadata = estimate_required_model_memory_gb(
@@ -1973,6 +1980,62 @@ class TestPerGpuFitGuardAllCounts(unittest.TestCase):
             metadata.get("attention_implementation"),
             "eager",
         )
+
+    def test_mlx_training_estimate_skips_torch_attention_resolution_and_cuda_overhead(self):
+        # On MLX there is no torch to resolve an attention implementation
+        # against, so _determine_attention_impl_for_gpu_estimate would always
+        # raise and (pre-fix) silently fall back to "eager" -- wrongly
+        # charging MLX's fused attention CUDA's 12x non-flash activation
+        # penalty. The MLX branch must skip that call entirely, must not add
+        # CUDA_OVERHEAD_BYTES, and must use MLX's measured 4-bit quantization
+        # factor instead of bitsandbytes'.
+        from utils.hardware.vram_estimation import QUANT_4BIT_FACTOR, MLX_QUANT_4BIT_FACTOR
+
+        with (
+            patch("utils.hardware.hardware.get_device", return_value = DeviceType.MLX),
+            patch(
+                "utils.hardware.hardware.estimate_fp16_model_size_bytes",
+                return_value = (8 * (1024**3), "config"),
+            ),
+            patch(
+                "utils.hardware.hardware._resolve_model_identifier_for_gpu_estimate",
+                return_value = "unsloth/test",
+            ),
+            patch(
+                "utils.hardware.hardware._load_config_for_gpu_estimate",
+                return_value = SimpleNamespace(
+                    hidden_size = 4096,
+                    num_hidden_layers = 32,
+                    num_attention_heads = 32,
+                    num_key_value_heads = 8,
+                    intermediate_size = 14336,
+                    vocab_size = 128256,
+                    tie_word_embeddings = False,
+                ),
+            ),
+            patch(
+                "utils.hardware.hardware._determine_attention_impl_for_gpu_estimate",
+                side_effect = AssertionError(
+                    "MLX estimate must not call the torch-based attention resolver"
+                ),
+            ),
+            patch("utils.hardware.hardware.get_visible_gpu_count", return_value = 1),
+        ):
+            required_gb, metadata = estimate_required_model_memory_gb(
+                "unsloth/test",
+                training_type = "LoRA/QLoRA",
+                load_in_4bit = True,
+            )
+
+        self.assertEqual(metadata.get("estimation_mode"), "detailed")
+        self.assertEqual(metadata.get("attention_implementation"), "sdpa")
+        breakdown = metadata["vram_breakdown"]
+        self.assertEqual(breakdown["cuda_overhead_gb"], 0.0)
+        # MLX's real 6.15 bits/weight is heavier than bnb nf4's ~5 bits, so
+        # the MLX estimate should charge more per weight, not less.
+        self.assertGreater(MLX_QUANT_4BIT_FACTOR, 0)
+        self.assertLess(MLX_QUANT_4BIT_FACTOR, QUANT_4BIT_FACTOR)
+        self.assertLess(required_gb, 15.0)  # sanity: nowhere near the pre-fix ~2.5x overestimate
 
     def test_attention_resolver_does_not_mutate_loaded_config(self):
         from utils.hardware import hardware as hardware_module

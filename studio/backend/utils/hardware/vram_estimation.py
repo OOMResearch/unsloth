@@ -18,6 +18,16 @@ from typing import Dict, Optional
 QUANT_4BIT_FACTOR = 16 / 5
 DOUBLE_QUANT_4BIT_FACTOR = 3.6  # bnb_4bit_use_double_quant; see VRAM_ESTIMATION.md section 1
 CUDA_OVERHEAD_BYTES = int(1.4 * 1024**3)  # calibrated on RTX 5070 Ti
+# Apple Silicon (MLX) runtime 4-bit affine quantization has different overhead
+# than bitsandbytes nf4 -- measured 6.15 bits/weight on Qwen2.5-7B-Instruct via
+# mlx-lm 0.31.3 / mlx 0.32.1 ("Quantized model with 6.146 bits per weight"),
+# vs. QUANT_4BIT_FACTOR's ~5-bit nf4 assumption. Using the CUDA factor for MLX
+# understates model-weight memory.
+MLX_QUANT_4BIT_FACTOR = 16 / 6.15
+# MLX has no separate CUDA-style context overhead to reserve; the trainer's
+# own wired_limit/memory_limit auto-guard (unsloth_zoo/mlx/trainer.py) already
+# reserves headroom at the training-loop layer, so this estimator adds none.
+MLX_OVERHEAD_BYTES = 0
 NON_FLASH_ATTENTION_FACTOR = (
     12.0  # eager attention score+workspace overhead; see VRAM_ESTIMATION.md section 5
 )

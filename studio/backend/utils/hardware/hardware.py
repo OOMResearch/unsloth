@@ -4182,8 +4182,18 @@ def estimate_required_model_memory_gb(
         compute_gradient_bytes,
         CUDA_OVERHEAD_BYTES,
         QUANT_4BIT_FACTOR,
+        MLX_OVERHEAD_BYTES,
+        MLX_QUANT_4BIT_FACTOR,
         DEFAULT_TARGET_MODULES,
     )
+
+    # Apple Silicon has no separate VRAM pool or bitsandbytes-style quantized
+    # loading, and no torch install to resolve an attention implementation
+    # against -- CUDA's constants and its flash-attention resolution below
+    # both need an MLX-specific substitute.
+    is_mlx = get_device() == DeviceType.MLX
+    quant_4bit_factor = MLX_QUANT_4BIT_FACTOR if is_mlx else QUANT_4BIT_FACTOR
+    overhead_bytes = MLX_OVERHEAD_BYTES if is_mlx else CUDA_OVERHEAD_BYTES
 
     model_size_bytes, source = estimate_fp16_model_size_bytes(model_name, hf_token = hf_token)
     metadata: Dict[str, Any] = {
@@ -4200,7 +4210,7 @@ def estimate_required_model_memory_gb(
 
     if training_type is None:
         if load_in_4bit:
-            base_4bit_gb = model_size_gb / QUANT_4BIT_FACTOR
+            base_4bit_gb = model_size_gb / quant_4bit_factor
             required_gb = base_4bit_gb + max(base_4bit_gb * 0.3, min_buffer_gb)
         else:
             required_gb = model_size_gb * 1.3
@@ -4223,7 +4233,17 @@ def estimate_required_model_memory_gb(
 
     estimate_model = _resolve_model_identifier_for_gpu_estimate(model_name, hf_token = hf_token)
     config = _load_config_for_gpu_estimate(estimate_model, hf_token = hf_token)
-    if config is not None:
+    if is_mlx:
+        # _determine_attention_impl_for_gpu_estimate resolves against torch's
+        # flash-attention/SDPA stack, which is never installed on the MLX
+        # path -- it would always raise and fall through to the "eager"
+        # conservative default below, wrongly charging MLX's compiled, fused
+        # attention (verified recompile-free and flat-throughput in this
+        # session's profiling) the same 12x eager-attention activation
+        # penalty CUDA pays when flash attention truly isn't available.
+        # MLX's fused attention is architecturally the SDPA-equivalent path.
+        vram_config.attention_implementation = "sdpa"
+    elif config is not None:
         try:
             vram_config.attention_implementation = _determine_attention_impl_for_gpu_estimate(
                 config
@@ -4242,7 +4262,11 @@ def estimate_required_model_memory_gb(
     arch = extract_arch_config(config) if config is not None else None
 
     if arch is not None:
+        if is_mlx:
+            arch.quant_4bit_factor = quant_4bit_factor
         breakdown = estimate_training_vram(arch, vram_config)
+        if is_mlx:
+            breakdown.cuda_overhead = overhead_bytes
         # why: extract_arch_config only sees text_config; add the vision/audio
         # tower bytes that the text-arch fp16 total misses.
         arch_fp16_bytes = compute_total_params(arch) * 2
@@ -4271,11 +4295,11 @@ def estimate_required_model_memory_gb(
         return required_gb, metadata
 
     # Fallback when model config is unavailable.
-    overhead_gb = CUDA_OVERHEAD_BYTES / (1024**3)
+    overhead_gb = overhead_bytes / (1024**3)
     if training_method == "full":
         required_gb = model_size_gb * 3.5 + overhead_gb
     elif training_method == "qlora":
-        base_4bit_gb = model_size_gb / QUANT_4BIT_FACTOR
+        base_4bit_gb = model_size_gb / quant_4bit_factor
         lora_overhead_gb = model_size_gb * 0.04
         act_gb = model_size_gb * 0.15 * (batch_size / 4) * (max_seq_length / 2048)
         required_gb = base_4bit_gb + lora_overhead_gb + act_gb + overhead_gb

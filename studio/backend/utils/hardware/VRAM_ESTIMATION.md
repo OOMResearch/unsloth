@@ -157,6 +157,18 @@ When sharding across multiple GPUs, each additional GPU (beyond the first) contr
 usable_gb = free[gpu_0] + sum(free[gpu_i] * 0.85 for i in 1..N)
 ```
 
+## 9. Apple Silicon (MLX)
+
+Everything above is CUDA-shaped by default. On MLX (`get_device() == DeviceType.MLX`), three terms are substituted before `estimate_training_vram` runs:
+
+| Term | CUDA | MLX | Why |
+|------|------|-----|-----|
+| 4-bit quant factor | `16/5` (BNB NF4, ~5 bit/weight) | `16/6.15` (~6.15 bit/weight) | Measured on Qwen2.5-7B-Instruct via mlx-lm 0.31.3 / mlx 0.32.1 ("Quantized model with 6.146 bits per weight"). MLX's runtime affine 4-bit quantization has more overhead than BNB NF4; using the CUDA factor understates weight memory. |
+| Attention implementation | Resolved via Unsloth's `resolve_attention_implementation` against torch | Fixed to `sdpa` | There is no torch install on the MLX path, so the resolver always raises and falls to the conservative `eager` default -- charging the section 5 quadratic non-flash penalty (12x) to MLX's compiled, fused attention, which is architecturally the SDPA-equivalent path and does not need it. |
+| Fixed overhead | 1.4 GB (section 7) | 0 | MLX has no separate CUDA-context-style allocation to reserve here; the trainer's own `wired_limit`/`memory_limit` auto-guard (`unsloth_zoo/mlx/trainer.py`) reserves headroom at the training-loop layer instead. |
+
+Before this substitution, a 7B QLoRA config (batch 4, seq 2048, rank 16) that measured **7.58 GB** peak Metal memory on an M5 Max was estimated at **18.83 GB** -- a ~2.5x overestimate driven almost entirely by the wrongly-applied eager-attention penalty. With the substitution, the same config estimates **8.55 GB**, within ~13% of measured and on the conservative side.
+
 ---
 
 ## Parameter Flow
