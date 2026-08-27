@@ -323,6 +323,78 @@ def test_stack_available_requires_runtime_imports_and_versions(monkeypatch):
     assert imported == list(mr._MLX_RUNTIME_IMPORTS)
 
 
+def test_version_blocker_names_the_stale_package_not_installed(monkeypatch):
+    # Every existing version test mocks installed == floor, so the actual
+    # "installed is older than the floor" comparison in _mlx_version_blockers()
+    # -- the code that produces the user-facing blocker message -- has never
+    # been exercised. Only the aggregate mlx_stack_available() bool was tested.
+    import importlib.metadata as metadata
+
+    stale_name = next(iter(mr._MLX_MIN_VERSIONS))
+    stale_floor = mr._MLX_MIN_VERSIONS[stale_name]
+    stale_installed = "0.0.1"
+
+    def _version(name):
+        if name == stale_name:
+            return stale_installed
+        return mr._MLX_MIN_VERSIONS[name]
+
+    monkeypatch.setattr(metadata, "version", _version)
+    blockers = mr._mlx_version_blockers()
+
+    assert len(blockers) == 1
+    (message,) = blockers
+    assert stale_name in message
+    assert stale_installed in message
+    assert stale_floor in message
+    assert "older than" in message
+    assert mr._mlx_versions_satisfy_minimums() is False
+    assert mr.mlx_stack_blockers() == blockers
+
+
+def test_version_blocker_reports_an_unreadable_version_without_raising(monkeypatch):
+    # A version string Version() cannot parse must degrade to a named blocker,
+    # not raise out of the detection path.
+    import importlib.metadata as metadata
+
+    bad_name = next(iter(mr._MLX_MIN_VERSIONS))
+
+    def _version(name):
+        if name == bad_name:
+            return "not-a-version"
+        return mr._MLX_MIN_VERSIONS[name]
+
+    monkeypatch.setattr(metadata, "version", _version)
+    blockers = mr._mlx_version_blockers()
+
+    assert len(blockers) == 1
+    (message,) = blockers
+    assert bad_name in message
+    assert "unreadable" in message
+    assert mr._mlx_versions_satisfy_minimums() is False
+
+
+def test_version_blocker_names_a_missing_package_with_its_floor(monkeypatch):
+    import importlib.metadata as metadata
+
+    missing_name = next(iter(mr._MLX_MIN_VERSIONS))
+    missing_floor = mr._MLX_MIN_VERSIONS[missing_name]
+
+    def _version(name):
+        if name == missing_name:
+            raise metadata.PackageNotFoundError(name)
+        return mr._MLX_MIN_VERSIONS[name]
+
+    monkeypatch.setattr(metadata, "version", _version)
+    blockers = mr._mlx_version_blockers()
+
+    assert len(blockers) == 1
+    (message,) = blockers
+    assert missing_name in message
+    assert missing_floor in message
+    assert "not installed" in message
+
+
 def test_no_op_off_apple_silicon(monkeypatch):
     monkeypatch.setattr(mr, "is_apple_silicon", lambda: False)
     called = {"n": 0}
