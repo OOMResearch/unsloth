@@ -995,6 +995,35 @@ def test_mlx_pinned_fallback_rejects_cross_repository_bnb_remap():
     )
 
 
+def test_mlx_unsupported_architecture_error_names_model_and_type():
+    from core.training import worker
+
+    # Real message shapes from mlx_lm/mlx_vlm when a model's architecture has
+    # no MLX implementation -- reproduced end-to-end against microsoft/git-base
+    # (mlx_vlm has no "git" model), which otherwise reached the user as a raw
+    # ValueError naming mlx_vlm's internal module-lookup path, not the model.
+    vlm_error = ValueError(
+        "Model type git not supported. Error: No module named "
+        "'mlx_vlm.speculative.drafters.git'"
+    )
+    text_error = ValueError("Model type made_up_arch not supported.")
+
+    for error, expected_type in ((vlm_error, "git"), (text_error, "made_up_arch")):
+        translated = worker._mlx_unsupported_architecture_error("microsoft/git-base", error)
+        assert translated is not None
+        message = str(translated)
+        assert "microsoft/git-base" in message
+        assert expected_type in message
+        assert "Apple Silicon" in message
+        # The internal mlx_vlm module-lookup path must not leak into the
+        # user-facing message.
+        assert "mlx_vlm.speculative.drafters" not in message
+
+    assert worker._mlx_unsupported_architecture_error(
+        "unsloth/test", ValueError("some unrelated failure")
+    ) is None
+
+
 def test_untrainable_gate_rejects_remote_adapter():
     route = _load_route_module("training_route_remote_adapter")
     request = _request()

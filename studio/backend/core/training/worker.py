@@ -289,6 +289,29 @@ def _mlx_revision_fallback_error(config: dict) -> RuntimeError | None:
     return None
 
 
+# mlx-lm and mlx-vlm both raise a bare ValueError("Model type {model_type} not
+# supported[. Error: ...]") when a model's architecture has no MLX
+# implementation yet. Unhandled, that reaches the user as-is -- including
+# mlx-vlm's internal module-lookup path ("No module named
+# 'mlx_vlm.speculative.drafters.<type>'"), which names an implementation
+# detail, not the actual problem. This is deterministic per architecture, so
+# retrying (the cache-fallback machinery below exists for) cannot fix it --
+# translate it before that machinery ever sees it.
+_MLX_UNSUPPORTED_MODEL_TYPE_RE = re.compile(r"^Model type (\S+) not supported\b")
+
+
+def _mlx_unsupported_architecture_error(model_name: str, error: BaseException) -> RuntimeError | None:
+    match = _MLX_UNSUPPORTED_MODEL_TYPE_RE.match(str(error))
+    if match is None:
+        return None
+    model_type = match.group(1)
+    return RuntimeError(
+        f"'{model_name}' uses the '{model_type}' architecture, which isn't "
+        "supported for training on Apple Silicon (MLX) yet. Pick a "
+        "different model, or train this one on a CUDA machine."
+    )
+
+
 def _require_strict_cached_dataset(config: dict, dataset: Any, split: str) -> Any:
     if (
         config.get("require_exact_resume_resources") or config.get("require_exact_dataset_resource")
@@ -2835,6 +2858,9 @@ def _run_mlx_training(event_queue, stop_queue, config):
             revision = model_revision,
         )
     except Exception as error:
+        arch_error = _mlx_unsupported_architecture_error(model_name, error)
+        if arch_error is not None:
+            raise arch_error from error
         if not model_local_only:
             raise
         fallback_error = _model_cache_fallback_error(config, error)
