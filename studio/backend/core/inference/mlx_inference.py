@@ -1136,6 +1136,7 @@ def _kv_quant_probe(language_model, entries, bits):
 
         converted = skipped = 0
         retainable = True
+        quantized_states = []
         for entry in entries:
             convert = getattr(entry, "to_quantized", None)
             if convert is None:
@@ -1143,13 +1144,20 @@ def _kv_quant_probe(language_model, entries, bits):
                 continue
             try:
                 quantized = convert(group_size = MLX_KV_GROUP_SIZE, bits = bits)
-                mx.eval(quantized.state)
+                quantized_states.append(quantized.state)
                 converted += 1
             except Exception as exc:
                 return converted, skipped, f"MLX cannot quantize it ({type(exc).__name__})", True
             # Same helper insertion uses, so the caveat matches what insertion sees.
             if retainable and _kv_entry_nbytes(quantized) is None:
                 retainable = False
+        # A single eval after the loop instead of one per entry: still forces
+        # every quantized state to materialize, at one call's overhead.
+        if quantized_states:
+            try:
+                mx.eval(quantized_states)
+            except Exception as exc:
+                return converted, skipped, f"MLX cannot quantize it ({type(exc).__name__})", True
         return converted, skipped, None, retainable
     finally:
         _restore_mlx_rng_key(rng_key)
@@ -1809,35 +1817,42 @@ def _make_mlx_presence_penalty_processor(penalty: float):
     generate_step calls processors as ``fn(tokens, logits)`` with ``tokens`` the
     full running sequence; the first call is prompt-only, so latch that length
     and penalize only after it.
+
+    The running mask is carried across calls and updated only with the tokens
+    new since the previous call (one per step, ordinarily), instead of
+    rescanning the whole completion-so-far every step: that rescan made total
+    streaming work quadratic in response length.
     """
-    state = {"prompt_len": None}
+    import mlx.core as mx
+
+    state = {"prompt_len": None, "seen_len": None, "mask": None}
 
     def _processor(tokens, logits):
+        vocab = logits.shape[-1]
         if state["prompt_len"] is None:
             # First call is prompt-only; latch its length.
             state["prompt_len"] = int(tokens.shape[0])
+            state["seen_len"] = state["prompt_len"]
+            state["mask"] = mx.zeros((vocab + 1,), dtype = logits.dtype)
             return logits
-        generated = tokens[state["prompt_len"] :]
-        if generated.size == 0:
-            return logits
-        import mlx.core as mx
-
-        vocab = logits.shape[-1]
-        # Bound ids to [0, vocab) before indexing logits: MLX does no bounds
-        # checking and out-of-bounds indexing is undefined behavior (crash /
-        # corruption), unlike torch's harmless negative wrap. MLX also lacks
-        # boolean-mask filtering, so out-of-range/negative ids route to a
-        # scratch slot at index vocab (dropped before the subtract) that never
-        # collides with a real token: real ids (including 0) are penalized
-        # once, strays ignored.
-        valid = (generated >= 0) & (generated < vocab)
-        safe = mx.where(valid, generated, vocab).astype(mx.int32)
-        # Scatter penalty into a (vocab + 1)-wide mask: duplicate ids are
-        # idempotent (presence applies once per token); scratch column dropped.
-        mask = mx.zeros((vocab + 1,), dtype = logits.dtype)
-        mask[safe] = penalty
-        logits = logits - mask[:vocab]
-        return logits
+        new_tokens = tokens[state["seen_len"] :]
+        state["seen_len"] = int(tokens.shape[0])
+        if new_tokens.size:
+            # Bound ids to [0, vocab) before indexing logits: MLX does no bounds
+            # checking and out-of-bounds indexing is undefined behavior (crash /
+            # corruption), unlike torch's harmless negative wrap. MLX also lacks
+            # boolean-mask filtering, so out-of-range/negative ids route to a
+            # scratch slot at index vocab (dropped before the subtract) that never
+            # collides with a real token: real ids (including 0) are penalized
+            # once, strays ignored.
+            valid = (new_tokens >= 0) & (new_tokens < vocab)
+            safe = mx.where(valid, new_tokens, vocab).astype(mx.int32)
+            # Scatter penalty into the persistent (vocab + 1)-wide mask: duplicate
+            # ids are idempotent (presence applies once per token); scratch
+            # column dropped. Only the tokens new since the last call are
+            # scattered, so this stays O(1) amortized instead of rescanning.
+            state["mask"][safe] = penalty
+        return logits - state["mask"][:vocab]
 
     return _processor
 
@@ -1850,23 +1865,29 @@ def _make_mlx_frequency_penalty_processor(penalty: float):
     occurrences and scales once, in float32: accumulating the penalty itself in
     a float16 logits dtype rounds on every repeat, which drifts by tens of
     logits over a long run (1000 repeats at 0.3 lands on -274.25, not -300).
+
+    Like the presence processor, counts are carried across calls and updated
+    only with the tokens new since the previous call, avoiding an O(n) rescan
+    of the whole completion every step.
     """
-    state = {"prompt_len": None}
+    import mlx.core as mx
+
+    state = {"prompt_len": None, "seen_len": None, "counts": None}
 
     def _processor(tokens, logits):
+        vocab = logits.shape[-1]
         if state["prompt_len"] is None:
             state["prompt_len"] = int(tokens.shape[0])
+            state["seen_len"] = state["prompt_len"]
+            state["counts"] = mx.zeros((vocab + 1,), dtype = mx.float32)
             return logits
-        generated = tokens[state["prompt_len"] :]
-        if generated.size == 0:
-            return logits
-        import mlx.core as mx
-
-        vocab = logits.shape[-1]
-        valid = (generated >= 0) & (generated < vocab)
-        safe = mx.where(valid, generated, vocab).astype(mx.int32)
-        counts = mx.zeros((vocab + 1,), dtype = mx.float32).at[safe].add(1.0)
-        return logits - (penalty * counts[:vocab]).astype(logits.dtype)
+        new_tokens = tokens[state["seen_len"] :]
+        state["seen_len"] = int(tokens.shape[0])
+        if new_tokens.size:
+            valid = (new_tokens >= 0) & (new_tokens < vocab)
+            safe = mx.where(valid, new_tokens, vocab).astype(mx.int32)
+            state["counts"] = state["counts"].at[safe].add(1.0)
+        return logits - (penalty * state["counts"][:vocab]).astype(logits.dtype)
 
     return _processor
 
@@ -1878,22 +1899,28 @@ def _make_mlx_logit_bias_processor(logit_bias: dict):
     ids; MLX does no bounds checking, so a bias on an id past the model's logit
     width is undefined behavior. Route strays to the same discarded scratch
     slot the penalty processors use.
+
+    The bias is vocab-invariant across the whole generation (the sparse
+    token -> bias dict never changes token to token), so the dense mask built
+    from it is computed once per vocab size seen and cached, rather than
+    rebuilt from scratch on every generated token.
     """
-    state = {"safe": None, "values": None, "vocab": None}
+    import mlx.core as mx
+
+    state = {"vocab": None, "mask": None}
 
     def _processor(tokens, logits):
-        import mlx.core as mx
-
         vocab = logits.shape[-1]
         if state["vocab"] != vocab:
             pairs = [(int(t), float(v)) for t, v in logit_bias.items()]
-            state["safe"] = mx.array(
+            safe = mx.array(
                 [t if 0 <= t < vocab else vocab for t, _ in pairs], dtype = mx.int32
             )
-            state["values"] = mx.array([v for _, v in pairs], dtype = mx.float32)
+            values = mx.array([v for _, v in pairs], dtype = mx.float32)
+            full_mask = mx.zeros((vocab + 1,), dtype = mx.float32).at[safe].add(values)
+            state["mask"] = full_mask[:vocab].astype(logits.dtype)
             state["vocab"] = vocab
-        mask = mx.zeros((vocab + 1,), dtype = mx.float32).at[state["safe"]].add(state["values"])
-        return logits + mask[:vocab].astype(logits.dtype)
+        return logits + state["mask"]
 
     return _processor
 
@@ -2993,6 +3020,30 @@ class MLXInferenceBackend:
         # <think> prefix on every native-protocol snapshot just as the normal
         # decoding path does below.
         normalized_output = think_prefix
+        # Non-native-channel path: an incremental streaming detokenizer instead of
+        # re-decoding the full token history every generated token (which made total
+        # streaming decode work quadratic in response length). Special ids are kept
+        # out of the fed tokens, not filtered from the decoded text, so this matches
+        # tokenizer.decode(token_ids, skip_special_tokens=True) exactly -- HF fast
+        # tokenizers filter special ids before generating text, the same order here.
+        # Falls back to the old full re-decode when the tokenizer exposes no
+        # streaming detokenizer (only test doubles today; every real mlx_lm/
+        # mlx_vlm TokenizerWrapper has one).
+        #
+        # BPE/SPM streaming detokenizers trim a leading space the moment their
+        # own accumulated text is still empty (word-boundary cleanup), which a
+        # full re-decode of the same ids does not do; verified against mlx_lm's
+        # own tokenizer_utils by comparing both against real vocabularies.
+        # `leading_prefix` restores that one space, decoding only the single
+        # first kept token to learn it -- one extra O(1) decode per generation,
+        # not per token.
+        stream_detokenizer = None
+        special_ids = frozenset()
+        leading_prefix = ""
+        first_kept_token_seen = False
+        if not preserve_native_channels:
+            stream_detokenizer = getattr(self._tokenizer, "detokenizer", None)
+            special_ids = frozenset(getattr(self._tokenizer, "all_special_ids", None) or ())
         with self._generation_lock, _temporary_mlx_adapter_state(self._model, _adapter_state):
             (
                 gen_prompt,
@@ -3045,10 +3096,31 @@ class MLXInferenceBackend:
                         if delta:
                             normalized_output += delta
                             yield normalized_output
+                    elif stream_detokenizer is not None:
+                        # Feed only the new token: the streaming detokenizer holds
+                        # its own state and revises the tail of `.text` itself when
+                        # an incomplete multi-byte sequence completes, the same
+                        # correction a full re-decode used to provide, without
+                        # rescanning every earlier token to get it.
+                        if response.token not in special_ids:
+                            if not first_kept_token_seen:
+                                first_kept_token_seen = True
+                                first_full = self._tokenizer.decode(
+                                    [response.token], skip_special_tokens = True
+                                )
+                                stripped = first_full.lstrip(" ")
+                                if len(stripped) < len(first_full):
+                                    leading_prefix = first_full[: len(first_full) - len(stripped)]
+                            stream_detokenizer.add_token(response.token)
+                        sampled = leading_prefix + stream_detokenizer.text
+                        if not sequences:
+                            yield think_prefix + sampled
+                        else:
+                            cut, stopped = _mlx_stop_cut(sampled, sequences)
                     else:
-                        # Re-decoding every id rebuilds rather than extends, so an
-                        # invalid byte sequence can revise characters already shown.
-                        # Predates stop handling and affects plain replies too.
+                        # No streaming detokenizer available on this tokenizer
+                        # (only test doubles today): fall back to the original
+                        # full re-decode every step.
                         sampled = self._tokenizer.decode(
                             token_ids,
                             skip_special_tokens = True,
@@ -3067,6 +3139,12 @@ class MLXInferenceBackend:
 
                     if cancel_event and cancel_event.is_set():
                         break
+                if stream_detokenizer is not None:
+                    # Flush whatever the detokenizer is still holding back (a
+                    # trailing word buffer or an incomplete multi-byte tail), so
+                    # `sampled` below matches a full decode of every kept token.
+                    stream_detokenizer.finalize()
+                    sampled = leading_prefix + stream_detokenizer.text
                 if prompt_cache is not None and prompt_tokens is not None:
                     history = self._prompt_cache_history
                     if history is not None:
