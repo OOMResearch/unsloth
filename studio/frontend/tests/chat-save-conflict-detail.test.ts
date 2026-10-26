@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-// saveChatMessage turns a protected 409 into a typed error so the autosave can tell "stop"
-// from "retry". A manual edit rethrows to the user, so the server's wording must survive.
-
 import assert from "node:assert/strict";
 import test from "node:test";
 
 import { loadWithStubs } from "./helpers/module-stubs.ts";
+import { skillLoadCardEvent } from "../src/features/chat/api/skill-load-event.ts";
 
 type Module = {
   saveChatMessage: (
@@ -21,7 +19,6 @@ type Module = {
   ) => Error & { threadId: string; messageId: string };
 };
 
-/** Minimal Response double: records how many times the body was consumed. */
 function jsonResponse(status: number, body: unknown, kind: string | null = "protected") {
   let reads = 0;
   return {
@@ -47,6 +44,11 @@ function harness(response: ReturnType<typeof jsonResponse>) {
   const module = loadWithStubs<Module>(
     new URL("../src/features/chat/api/chat-api.ts", import.meta.url),
     {
+      "./skill-load-event": { skillLoadCardEvent },
+      "./thread-read-cache.ts": loadWithStubs(
+        new URL("../src/features/chat/api/thread-read-cache.ts", import.meta.url),
+        {},
+      ),
       "@/features/auth": {
         authFetch: async (url: string, init?: RequestInit) => {
           requests.push({ url, init });
@@ -63,14 +65,21 @@ function harness(response: ReturnType<typeof jsonResponse>) {
         notifyChatHistoryUpdated: () => {},
         isCoalescedHistoryEvent: () => false,
       },
+      "../utils/load-warning-toast": { showLoadWarning: () => {} },
+      "../lib/load-request": {},
       "./generation-length.ts": {},
       "./gguf-variants-request": {},
       "./padded-response": { assertCompletedPaddedBody: () => {} },
       "@/features/hf-auth": { prepareHfTokenForUse: async () => undefined },
+      "@/features/igpu-carveout": {
+        dismissCarveoutAdviceForModel: () => {},
+        showCarveoutAdvice: () => {},
+      },
       "@/features/hub/lib/abort-signals": {},
       "@/features/hub/lib/hub-token-header": { hubTokenHeader: () => ({}) },
       "@/features/hub/lib/network": { isHuggingFaceOffline: () => false },
       "@/features/native-intents/api": { consumeNativePathToken: () => undefined },
+      "@/features/settings/low-disk-check": { checkDiskSpace: () => Promise.resolve() },
       "@/lib/model-lifecycle-events": {},
     },
   );

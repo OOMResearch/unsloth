@@ -31,23 +31,20 @@ export function useAnimatedThemeToggle(duration = 400) {
   }, [])
 
   const toggleTheme = useCallback(async () => {
-    // One toggle per animation. Clicks during a slow view transition would
-    // otherwise queue up and land as invisible back-and-forth flips, so the
-    // theme looks stuck until an odd number of clicks gets through.
+    // One toggle per animation, or clicks mid-transition queue up as invisible flips.
     if (inFlightRef.current) return
+    const anchorRect = anchorRef.current?.getBoundingClientRect() ?? null
 
     const applyTheme = () => {
       flushSync(() => {
-        // Read the live class instead of React state, which can lag the DOM
-        // while a transition is being captured.
+        // Read the live class: React state can lag the DOM during a transition capture.
         const nextDark = !document.documentElement.classList.contains("dark")
         setIsDark(nextDark)
         setTheme(nextDark ? "dark" : "light")
       })
     }
 
-    // Skip the view transition (its clip-path runs via the Web Animations API,
-    // which CSS force-reduced-motion cannot reach) when reduced motion is set.
+    // Reduced motion cannot reach the view transition's Web Animations clip-path, so skip it.
     if (!document.startViewTransition || prefersReducedMotion()) {
       applyTheme()
       return
@@ -58,9 +55,8 @@ export function useAnimatedThemeToggle(duration = 400) {
       const transition = document.startViewTransition(applyTheme)
       await transition.ready
 
-      const anchor = anchorRef.current
-      if (anchor) {
-        const { top, left, width, height } = anchor.getBoundingClientRect()
+      if (anchorRect) {
+        const { top, left, width, height } = anchorRect
         const x = left + width / 2
         const y = top + height / 2
         const maxRadius = Math.hypot(

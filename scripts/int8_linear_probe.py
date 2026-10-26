@@ -14,7 +14,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "studio" / "backend"))
 
-# (label, transformer_class, base_repo)
 MODELS = [
     ("flux.1-dev", "FluxTransformer2DModel", "black-forest-labs/FLUX.1-dev"),
     ("qwen-image", "QwenImageTransformer2DModel", "Qwen/Qwen-Image"),
@@ -62,7 +61,6 @@ def main() -> int:
                 tag.append("NAME")
             if tag:
                 sus.append((n, m.in_features, m.out_features, ",".join(tag)))
-        # distinct fqn shapes, block indices collapsed to {i}
         import re
 
         seen = {}
@@ -73,7 +71,6 @@ def main() -> int:
         print(f"  SUSPECT (M=1 risk) distinct patterns:")
         for (key, i, o, tag), cnt in sorted(seen.items()):
             print(f"    [{cnt:>3}x] {key:55s} {i:>6}->{o:<6} [{tag}]")
-        # a few non-suspect names for contrast (the real FLOP linears)
         good = [
             n
             for n, m in selected

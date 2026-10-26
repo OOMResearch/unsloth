@@ -11,7 +11,10 @@ import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Any, Optional
 
+from loggers import get_logger
+
 from hub.utils.dataset_processed_cache import (
+    UnsafeDatasetCachePathError,
     mark_app_processed_dataset_cache_complete,
     normalized_commit_hash,
     prepare_app_processed_dataset_cache,
@@ -24,6 +27,7 @@ from hub.utils.hf_cache_state import (
 )
 from utils.paths.path_utils import drop_appledouble_metadata, is_appledouble_metadata
 
+logger = get_logger(__name__)
 
 TRAINING_DATA_EXTS = (".parquet", ".json", ".jsonl", ".csv")
 
@@ -57,8 +61,7 @@ def hf_datasets_cache_roots() -> list[Path]:
         seen.add(resolved)
         roots.append(resolved)
 
-    # Keep this stdlib-only: training validates cached datasets before activating a Transformers
-    # sidecar, and importing datasets here would cache the base huggingface_hub module first.
+    # Stdlib-only: importing datasets here would cache base huggingface_hub before the sidecar.
     env_cache = os.environ.get("HF_DATASETS_CACHE")
     if env_cache:
         add(Path(env_cache))
@@ -278,7 +281,9 @@ def resolved_dataset_snapshot_file(snapshot: str | Path, source_path: str) -> Op
     except (OSError, RuntimeError, ValueError):
         return None
     if not resolved.is_file() or not (
-        resolved.is_relative_to(snapshot_path) or resolved.is_relative_to(repo_dir / "blobs")
+        resolved.is_relative_to(snapshot_path)
+        or resolved.is_relative_to(repo_dir / "blobs")
+        or resolved.is_relative_to(repo_dir.parent / "blobs")
     ):
         return None
     try:
@@ -557,7 +562,17 @@ def load_cached_hf_dataset(
         )
     dataset = load_dataset(**kwargs)
     if app_cache is not None:
-        mark_app_processed_dataset_cache_complete(app_cache)
+        # Advisory flag: a purged entry, read-only home or full disk must not discard a loaded dataset.
+        try:
+            mark_app_processed_dataset_cache_complete(app_cache)
+        except UnsafeDatasetCachePathError:
+            raise
+        except (OSError, RuntimeError, ValueError):
+            logger.warning(
+                "Could not record processed dataset cache completion for %s",
+                repo_id,
+                exc_info = True,
+            )
     return dataset
 
 
@@ -599,3 +614,39 @@ def cached_dataset_candidates(
         )
 
     return sorted(files, key = score)
+
+
+def dataset_cache_can_answer(repo_id: str) -> bool:
+    """Counts both the prepared datasets cache, which streaming loads use, and the hub snapshot."""
+    if not repo_id:
+        return False
+    try:
+        if latest_processed_dataset_cache_path(repo_id) is not None:
+            return True
+        return latest_cached_dataset_snapshot(repo_id) is not None
+    except Exception:
+        # Never let the guard's own failure open the path it guards.
+        return True
+
+
+def refuse_unauthorized_dataset_preview(
+    hf_token,
+    dataset_name: str,
+    *,
+    offline: bool = False,
+) -> None:
+    """Raises 404 for a cached preview the caller cannot reach, since datasets ignores the credential."""
+    from fastapi import HTTPException
+    from hub.utils.hf_tokens import cached_read_refused
+
+    if cached_read_refused(
+        hf_token,
+        repo_id = dataset_name,
+        repo_type = "dataset",
+        is_cached = lambda: dataset_cache_can_answer(dataset_name),
+        offline = offline,
+    ):
+        raise HTTPException(
+            status_code = 404,
+            detail = "Dataset preview is not available without Hub authorization.",
+        )

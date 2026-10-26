@@ -23,6 +23,8 @@ from typing import Optional
 
 from loggers import get_logger
 from utils.paths import storage_roots
+from hub.services.models import account_access
+from utils.account_context import current_account_id, is_owner_context
 from utils.security.remote_code_scan import CRITICAL, SCAN_RULES_VERSION
 
 logger = get_logger(__name__)
@@ -48,7 +50,9 @@ def cache_disabled() -> bool:
 
 
 def _store_path():
-    return storage_roots.studio_root() / "security" / "remote_code_approvals.json"
+    if is_owner_context():
+        return storage_roots.studio_root() / "security" / "remote_code_approvals.json"
+    return storage_roots.account_path("security/remote_code_approvals.json")
 
 
 def _env_offline() -> bool:
@@ -71,8 +75,7 @@ def _load() -> dict:
     try:
         with open(_store_path(), encoding = "utf-8-sig") as f:
             data = json.load(f)
-        # Validate the shape, not just the version: a hand-edited ``subjects`` that is not a dict would
-        # crash lookup/record instead of failing safe.
+        # Validate the shape too: a hand-edited non-dict ``subjects`` must fail safe, not crash.
         if (
             isinstance(data, dict)
             and data.get("version") == _SCHEMA_VERSION
@@ -109,11 +112,7 @@ def _save(data: dict) -> None:
 
 @contextlib.contextmanager
 def _file_lock():
-    """Best-effort cross-process exclusive lock over the store. Inference/export/training
-    record approvals from separate subprocesses, so the in-process RLock is not enough: two
-    processes could each read the same JSON and clobber the other's entry on ``os.replace``.
-    Holding this around the read-modify-write serializes them. Degrades to a no-op if OS
-    locking is unavailable (the consequence is only an occasional extra prompt)."""
+    """Cross-process lock around the read-modify-write, since two processes could clobber an entry written by the other; a no-op when OS locking is unavailable."""
     path = _store_path()
     try:
         storage_roots.ensure_dir(path.parent)
@@ -148,6 +147,8 @@ def _file_lock():
 def lookup(subject: str, target_key: str) -> Optional[StoredApproval]:
     """The stored approval for (subject, target_key), or None. A CRITICAL entry (e.g. a
     hand-edited store) is refused so it can never seed an approval."""
+    if account_access.managed_account():
+        subject = current_account_id()
     if not subject or cache_disabled():
         return None
     with _lock:
@@ -176,6 +177,8 @@ def record(
     scanner_version: int = SCANNER_VERSION,
 ) -> None:
     """Persist a user's explicit approval. CRITICAL is never stored."""
+    if account_access.managed_account():
+        subject = current_account_id()
     if not subject or not fingerprint or cache_disabled() or max_severity == CRITICAL:
         return
     with _lock, _file_lock():
@@ -196,6 +199,8 @@ def record(
 
 def forget(subject: str, target_key: str) -> None:
     """Drop an approval (e.g. the user declined / discarded the download)."""
+    if account_access.managed_account():
+        subject = current_account_id()
     if not subject:
         return
     with _lock, _file_lock():
@@ -215,11 +220,10 @@ def clear() -> None:
 
 
 def resolve_commit_sha(target: str, hf_token: Optional[str] = None) -> Optional[str]:
-    """Current HF commit SHA for *target*, or None (local path / offline / error). Resolved
-    fresh every call: the default branch is mutable, so a cached SHA could mask a moved repo
-    and reuse stale consent. None falls back to the authoritative fingerprint (never fail-open).
-    """
+    """Not cached: a moved branch would reuse stale consent. None means fall back, never fail open."""
+    hf_token = account_access.account_hf_token(hf_token)
     from utils.paths import is_local_path
+
     try:
         if is_local_path(target) or _env_offline():
             return None

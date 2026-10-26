@@ -1,11 +1,8 @@
 # Copyright 2023-present Daniel Han-Chen & the Unsloth team. All rights reserved.
-#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-#
 #     http://www.apache.org/licenses/LICENSE-2.0
-#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -55,8 +52,7 @@ try:
     if _moe_path not in sys.path:
         sys.path.insert(0, _moe_path)
 
-    # Import first to apply the TMA compatibility shim, which patches triton.language for both old and
-    # new TMA API names.
+    # Import first to apply the TMA API compatibility shim to triton.language.
     import grouped_gemm  # noqa: F401 - triggers TMA compatibility shim
 
     from grouped_gemm.interface import grouped_gemm
@@ -318,7 +314,7 @@ def Glm4MoeLiteDecoderLayer_fast_forward(
         hidden_states = residual + hidden_states
     else:
         residual = hidden_states
-        hidden_states = fast_rms_layernorm(self.input_layernorm, hidden_states)
+        hidden_states = fast_rms_layernorm(self.input_layernorm, hidden_states, reuse_grad = True)
         hidden_states, _ = self.self_attn(
             hidden_states = hidden_states,
             attention_mask = attention_mask,
@@ -332,7 +328,9 @@ def Glm4MoeLiteDecoderLayer_fast_forward(
         hidden_states = residual + hidden_states
 
         residual = hidden_states
-        hidden_states = fast_rms_layernorm(self.post_attention_layernorm, hidden_states)
+        hidden_states = fast_rms_layernorm(
+            self.post_attention_layernorm, hidden_states, reuse_grad = True
+        )
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -369,8 +367,7 @@ class FastGLM47Model(FastLlamaModel):
             Glm4MoeLiteNaiveMoe.forward = Glm4MoeLiteNaiveMoe_fast_forward
             Glm4MoeLiteMoE.forward = Glm4MoeLiteMoE_fast_forward
 
-        # Attention/rope/decoder/model forwards are NOT patched: GLM4 uses MLA with different projection
-        # names and lacks extend_rope_embedding, so the Llama-compatible infrastructure does not apply.
+        # GLM4 uses MLA and lacks extend_rope_embedding, so Llama attention patches do not apply.
 
         return
 

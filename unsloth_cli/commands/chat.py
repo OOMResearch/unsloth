@@ -2,6 +2,7 @@
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import sys
+from types import SimpleNamespace
 from typing import List, Optional
 
 import typer
@@ -20,6 +21,7 @@ from unsloth_cli._inference import (
     raise_on_streamed_error,
     render_columns,
     resolve_model_config,
+    server_load_opts,
     stream_markdown,
     visible_text,
 )
@@ -77,23 +79,27 @@ def _get_base_load_in_4bit(model_config) -> bool:
         with open(adapter_cfg_path, encoding = "utf-8") as f:
             adapter_cfg = json.load(f)
 
+        trained_in_4bit = adapter_cfg.get("unsloth_load_in_4bit")
+        if isinstance(trained_in_4bit, bool):
+            return trained_in_4bit
         training_method = adapter_cfg.get("unsloth_training_method")
         if training_method == "lora":
             return False
-        elif training_method == "qlora":
+        if training_method == "qlora":
             return True
-        elif not training_method:
-            if model_config.base_model and "-bnb-4bit" not in model_config.base_model.lower():
-                return False
-            return True
+        if (
+            not training_method
+            and model_config.base_model
+            and "-bnb-4bit" not in model_config.base_model.lower()
+        ):
+            return False
         return True
     except Exception:
         return True
 
 
 def _compare_needs_second_model() -> bool:
-    # MLX cannot toggle the adapter off, so compare loads the base separately; probe MLX quietly since
-    # detect_hardware() prints into the chat and imports torch.
+    # MLX cannot toggle the adapter off; probe quietly since detect_hardware() prints and imports torch.
     try:
         from studio.backend.utils.hardware import hardware as hw
 
@@ -158,17 +164,31 @@ def _pick_model(console) -> str:
 
 
 def chat(
+    ctx: typer.Context,
     model: Optional[str] = typer.Argument(
         None, help = "HF model id or local path. Omit to pick one of your local models."
     ),
     hf_token: Optional[str] = typer.Option(
         None, "--hf-token", envvar = "HF_TOKEN", help = "Hugging Face token if needed."
     ),
-    temperature: float = typer.Option(0.7, "--temperature"),
-    top_p: float = typer.Option(0.9, "--top-p"),
-    top_k: int = typer.Option(40, "--top-k"),
-    max_new_tokens: int = typer.Option(512, "--max-new-tokens"),
-    repetition_penalty: float = typer.Option(1.1, "--repetition-penalty"),
+    temperature: Optional[float] = typer.Option(
+        None, "--temperature", help = "Unset uses the model's recommended value."
+    ),
+    top_p: Optional[float] = typer.Option(
+        None, "--top-p", help = "Unset uses the model's recommended value."
+    ),
+    top_k: Optional[int] = typer.Option(
+        None, "--top-k", help = "Unset uses the model's recommended value."
+    ),
+    max_new_tokens: Optional[int] = typer.Option(
+        None,
+        "--max-new-tokens",
+        help = "Cap on generated tokens. Unset lets a reply use whatever the "
+        "model's context window leaves free after the conversation.",
+    ),
+    repetition_penalty: Optional[float] = typer.Option(
+        None, "--repetition-penalty", help = "Unset leaves it off (1.0)."
+    ),
     system_prompt: str = typer.Option(
         "", "--system-prompt", help = "Optional system prompt for the conversation."
     ),
@@ -179,7 +199,12 @@ def chat(
         "and MLX, and 2048 on the transformers backend. A value that differs from a "
         "running Unsloth server's reloads the model.",
     ),
-    load_in_4bit: bool = typer.Option(True, "--load-in-4bit/--no-load-in-4bit"),
+    load_in_4bit: bool = typer.Option(
+        True,
+        "--load-in-4bit/--no-load-in-4bit",
+        help = "Load the model in 4-bit. Left unset, a running Unsloth server that already "
+        "has this model loaded keeps its precision.",
+    ),
     tensor_parallel: bool = typer.Option(
         False,
         "--tensor-parallel/--no-tensor-parallel",
@@ -260,9 +285,32 @@ def chat(
             raise typer.Exit(code = 1)
         model = _pick_model(console)
 
-    # Resolve first so --compare can be rejected before the slow load.
-    with quiet_if_nonzero_mlx_rank():
-        model_config = resolve_model_config(model, hf_token = hf_token)
+    from unsloth_cli._npu import npu_model_path, npu_needs_studio_message
+
+    # An NPU model runs inside Unsloth Studio, never in this process: no HF config to resolve.
+    npu_path = npu_model_path(model)
+    if npu_path:
+        model = npu_path
+        model_config = SimpleNamespace(
+            display_name = npu_path.split(":", 1)[1],
+            is_gguf = False,
+            is_lora = False,
+            path = None,
+            base_model = None,
+            gguf_variant = None,
+        )
+        if no_server or is_mlx_distributed:
+            if should_print:
+                err.print(
+                    npu_needs_studio_message(npu_path, no_server = True),
+                    style = "red",
+                    markup = False,
+                )
+            raise typer.Exit(code = 1)
+    else:
+        # Resolve first so --compare can be rejected before the slow load.
+        with quiet_if_nonzero_mlx_rank():
+            model_config = resolve_model_config(model, hf_token = hf_token)
     compare_blocked = _compare_blocked_reason(model_config)
     if is_mlx_distributed:
         compare_blocked = (
@@ -288,9 +336,19 @@ def chat(
 
     # Prefer a running Unsloth server: instant starts, model shared with the UI.
     chat_backend = (
-        None if (no_server or is_mlx_distributed) else connect_studio_server(model, **load_opts)
+        None
+        if (no_server or is_mlx_distributed)
+        else connect_studio_server(model, **server_load_opts(ctx, load_opts))
     )
     server_mode = chat_backend is not None
+    if npu_path and not server_mode:
+        if should_print:
+            err.print(
+                npu_needs_studio_message(npu_path, no_server = False),
+                style = "red",
+                markup = False,
+            )
+        raise typer.Exit(code = 1)
     if server_mode and should_print:
         console.print(
             "(Unsloth server connected — model stays warm after /exit)",
@@ -300,6 +358,15 @@ def chat(
         chat_backend = load_chat_backend(model, model_config = model_config, **load_opts)
 
     name = model_config.display_name or model
+    # Name the quant the server kept, not the local pick (a local dir's display name is a file stem).
+    kept = getattr(chat_backend, "gguf_variant", None) if server_mode else None
+    picked = getattr(model_config, "gguf_variant", None)
+    if kept and kept != picked:
+        if picked:
+            base = name.removesuffix(f" ({picked})")
+        else:
+            base = model.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+        name = f"{base} ({kept})"
     show_thinking = think
     compare_mode = compare
     messages = []
@@ -465,8 +532,22 @@ def chat(
                     raise typer.Exit(code = 1)
                 continue
 
+            if should_print and getattr(chat_backend, "reply_hit_token_limit", False):
+                hint = (
+                    "raise or omit --max-new-tokens"
+                    if max_new_tokens is not None
+                    else "/reset to clear the history, or reload with a larger --max-seq-length"
+                )
+                console.print(
+                    f"(reply stopped at the token limit — {hint})",
+                    style = "bright_black",
+                )
+
             messages.append(
-                {"role": "assistant", "content": visible_text(answer, show_thinking = False)}
+                {
+                    "role": "assistant",
+                    "content": visible_text(answer, show_thinking = False, final = True),
+                }
             )
     finally:
         chat_backend.close()

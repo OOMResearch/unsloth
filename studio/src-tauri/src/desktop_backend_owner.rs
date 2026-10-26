@@ -14,8 +14,7 @@ static TEST_METADATA: std::sync::Mutex<Option<DesktopBackendMetadata>> =
 
 pub(crate) const OWNER_TOKEN_ENV: &str = "UNSLOTH_STUDIO_DESKTOP_OWNER_TOKEN";
 pub(crate) const OWNER_KIND_ENV: &str = "UNSLOTH_STUDIO_DESKTOP_OWNER_KIND";
-// The app's own pid, so the backend can watch the exact owner process instead
-// of sampling getppid (racy under a subreaper when the app dies mid-startup).
+// Lets the backend watch the exact owner; getppid is racy under a subreaper.
 pub(crate) const OWNER_PID_ENV: &str = "UNSLOTH_STUDIO_DESKTOP_OWNER_PID";
 pub(crate) const OWNER_KIND_TAURI: &str = "tauri";
 
@@ -54,6 +53,11 @@ struct DesktopBackendMetadata {
     studio_root_id: String,
     started_at_ms: u64,
     updated_at_ms: u64,
+    // The endpoints the backend was launched with, for an adopter's CSP. Absent in older files.
+    #[serde(default)]
+    hf_endpoint: Option<String>,
+    #[serde(default)]
+    hf_datasets_server: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79,7 +83,6 @@ pub(crate) struct VerifiedOwnedBackend {
     pub backend_pid: u32,
     pub generation: u64,
     pub readiness: OwnedBackendReadiness,
-    pub backend_version: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -92,17 +95,10 @@ pub(crate) enum OwnedBackendProbe {
     Verified(VerifiedOwnedBackend),
 }
 
-/// `NotVerified` reason for a port that answered the probe in full and named an owner that is
-/// not this app's.
-///
-/// Kept apart from `owned_backend_not_found`, which also covers a port that said nothing at
-/// all. The health watchdog needs the difference: silence from a port an Unsloth backend just
-/// answered on is a stall and earns the wide busy budget, while a complete answer carrying a
-/// different root id, a different token or no desktop owner at all is proof that the backend
-/// this app adopted is gone and something else has the port.
+/// A port answered in full but named another owner. Unlike `owned_backend_not_found` (which
+/// includes silence), this proves the adopted backend is gone, so the watchdog skips the busy budget.
 pub(crate) const OWNED_BACKEND_OWNER_MISMATCH: &str = "owned_backend_owner_mismatch";
 
-/// Whether a failed probe answered with a different owner rather than falling silent.
 pub(crate) fn probe_saw_a_different_owner(probe: &OwnedBackendProbe) -> bool {
     matches!(
         probe,
@@ -127,7 +123,6 @@ struct HealthDesktopOwner {
 struct HealthResponse {
     version: Option<String>,
     native_path_leases_supported: Option<bool>,
-    torch_warm_in_progress: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -158,6 +153,30 @@ struct TokenResponse {
     access_token: String,
 }
 
+/// Multi-account answer: the secret proved ownership, but no token is issued until sign-in.
+#[derive(Deserialize)]
+struct MultiLoginRequired {
+    login_required: bool,
+    login_mode: String,
+}
+
+enum ProbeCredential {
+    Bearer(String),
+    DesktopSecret(String),
+}
+
+fn probe_credential(body: &[u8], secret: &str) -> Result<ProbeCredential, String> {
+    if let Ok(tokens) = serde_json::from_slice::<TokenResponse>(body) {
+        return Ok(ProbeCredential::Bearer(tokens.access_token));
+    }
+    match serde_json::from_slice::<MultiLoginRequired>(body) {
+        Ok(multi) if multi.login_required && multi.login_mode == "multi" => {
+            Ok(ProbeCredential::DesktopSecret(secret.to_string()))
+        }
+        _ => Err("desktop_auth_token_response_invalid".to_string()),
+    }
+}
+
 pub(crate) fn desktop_candidate_ports() -> std::ops::RangeInclusive<u16> {
     DESKTOP_PORT_START..=DESKTOP_PORT_END
 }
@@ -175,14 +194,13 @@ pub(crate) fn parse_studio_root_id(value: &str) -> Option<String> {
 }
 
 pub(crate) fn managed_studio_root_id_path(home: &Path) -> PathBuf {
-    home.join(".unsloth")
-        .join("studio")
+    crate::studio_home::studio_root_for_home(home)
         .join("share")
         .join("studio_install_id")
 }
 
 fn managed_run_dir(home: &Path) -> PathBuf {
-    home.join(".unsloth").join("studio").join("run")
+    crate::studio_home::studio_root_for_home(home).join("run")
 }
 
 fn metadata_path_for_home(home: &Path) -> PathBuf {
@@ -190,8 +208,7 @@ fn metadata_path_for_home(home: &Path) -> PathBuf {
 }
 
 fn auth_secret_path_for_home(home: &Path) -> PathBuf {
-    home.join(".unsloth")
-        .join("studio")
+    crate::studio_home::studio_root_for_home(home)
         .join("auth")
         .join(".desktop_secret")
 }
@@ -209,8 +226,7 @@ pub(crate) fn read_expected_studio_root_id() -> Option<String> {
     parse_studio_root_id(&raw)
 }
 
-/// Returns the managed Unsloth root ID, creating it when absent.
-/// Desktop installs skip the installer step that normally creates it.
+/// Creates the id when absent: desktop installs skip the installer step that normally does.
 pub(crate) fn ensure_managed_studio_root_id() -> Result<String, String> {
     #[cfg(test)]
     if let Ok(guard) = TEST_EXPECTED_STUDIO_ROOT_ID.lock() {
@@ -228,7 +244,6 @@ pub(crate) fn ensure_managed_studio_root_id() -> Result<String, String> {
     })
 }
 
-/// Repairs a missing ID only when a managed install already exists.
 pub(crate) fn ensure_installed_studio_root_id() -> Result<Option<String>, String> {
     let path = managed_studio_root_id_path(&home_dir_or_error()?);
     ensure_studio_root_id_at(&path, crate::process::find_unsloth_binary().is_some())
@@ -259,9 +274,8 @@ fn ensure_studio_root_id_at_with_blank_observer(
         return Ok(None);
     }
 
-    // Reading an existing id needs no lock: it is published atomically, so an
-    // unlocked read only ever sees a complete id. Locking first would make a
-    // read-only or full share/ block startup even when the id is right there.
+    // No lock for an existing id: it is published atomically, and locking would let a read-only
+    // share/ block startup.
     if let Some(existing) = read_studio_root_id_file(path)? {
         set_private_dir_permissions(parent);
         return Ok(Some(existing));
@@ -279,7 +293,6 @@ fn ensure_studio_root_id_at_with_blank_observer(
     if !create_when_missing {
         return Ok(None);
     }
-    // Remove interrupted blank writes under the install lock.
     if matches!(std::fs::read_to_string(path), Ok(raw) if is_blank_studio_root_id(&raw)) {
         after_blank_observed();
         match std::fs::remove_file(path) {
@@ -297,7 +310,6 @@ fn ensure_studio_root_id_at_with_blank_observer(
     if let Some(created) = create_studio_root_id_file(path)? {
         return Ok(Some(created));
     }
-    // Adopt the ID created by a concurrent caller.
     match read_studio_root_id_file(path)? {
         Some(winner) => Ok(Some(winner)),
         None => Err(format!(
@@ -330,11 +342,8 @@ fn is_blank_studio_root_id(raw: &str) -> bool {
     raw.trim().is_empty()
 }
 
-// create_studio_root_id_file hard-links the temp file onto the real path and then
-// removes the temp name, so for the width of that unlink there are two names for one
-// file. Windows denies an open of EITHER name while a delete is pending, with
-// ERROR_ACCESS_DENIED rather than a sharing violation, so a concurrent reader is turned
-// away from a file that is intact on both sides of the window.
+// During publish's hard-link + unlink, Windows denies opening either name (ERROR_ACCESS_DENIED)
+// though the file is intact, so retry.
 const STUDIO_ROOT_ID_READ_ATTEMPTS: usize = 5;
 const STUDIO_ROOT_ID_READ_BACKOFF: Duration = Duration::from_millis(20);
 
@@ -383,8 +392,7 @@ fn read_studio_root_id_file(path: &Path) -> Result<Option<String>, String> {
     if is_blank_studio_root_id(&raw) {
         return Ok(None);
     }
-    // Never rewrite malformed IDs because a running backend may still report
-    // the previous value.
+    // Never rewrite a malformed id: a running backend may still report it.
     parse_studio_root_id(&raw).map(Some).ok_or_else(|| {
         format!(
             "the desktop ownership id at {} is not 64 lowercase hex characters; delete that file and reopen Unsloth",
@@ -399,7 +407,6 @@ fn create_studio_root_id_file(path: &Path) -> Result<Option<String>, String> {
         .parent()
         .ok_or_else(|| format!("desktop ownership id path {} has no parent", path.display()))?;
     let id = hex_bytes(&rand::random::<[u8; STUDIO_INSTALL_ID_BYTES]>());
-    // Unique temp names isolate concurrent publishers.
     let tmp = parent.join(format!(".studio_install_id.{}.tmp", &id[..16]));
     let claimed = claim_private_file(&tmp, path, id.as_bytes());
     let _ = std::fs::remove_file(&tmp);
@@ -446,6 +453,27 @@ fn metadata_path() -> Option<PathBuf> {
     dirs::home_dir().map(|home| metadata_path_for_home(&home))
 }
 
+fn non_empty_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Endpoints recorded by whoever started the running backend, for this process's CSP. Best effort.
+pub(crate) fn recorded_hf_endpoints() -> Vec<String> {
+    let Some(path) = metadata_path() else {
+        return Vec::new();
+    };
+    let Ok(Some(metadata)) = read_metadata(&path) else {
+        return Vec::new();
+    };
+    [metadata.hf_endpoint, metadata.hf_datasets_server]
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
 pub(crate) fn token_sha256(token: &str) -> String {
     hex_bytes(&Sha256::digest(token.as_bytes()))
 }
@@ -478,7 +506,6 @@ pub(crate) fn new_pending_owner() -> Result<PendingBackendOwner, String> {
     })
 }
 
-/// Applies the identity required for ownership and parent-watchdog tracking.
 pub(crate) fn apply_owner_env(cmd: &mut std::process::Command, pending: &PendingBackendOwner) {
     cmd.env(OWNER_TOKEN_ENV, pending.token.as_str());
     cmd.env(OWNER_KIND_ENV, OWNER_KIND_TAURI);
@@ -506,6 +533,8 @@ pub(crate) fn activate_owner(
         studio_root_id: pending.studio_root_id,
         started_at_ms: now,
         updated_at_ms: now,
+        hf_endpoint: non_empty_env("HF_ENDPOINT"),
+        hf_datasets_server: non_empty_env("HF_DATASETS_SERVER"),
     };
     let state = BackendOwnerState { path, metadata };
     state.write().map_err(|error| {
@@ -604,8 +633,7 @@ fn write_private_file(path: &Path, body: &[u8]) -> Result<(), String> {
         Ok(())
     }
 
-    // Flush here too, so a crash right after publishing cannot leave a
-    // zero-length id behind. Permissions come from the user profile ACL.
+    // Flush so a crash after publishing cannot leave a zero-length id. ACL comes from the profile.
     #[cfg(not(unix))]
     {
         let mut file = std::fs::File::create(path).map_err(|e| e.to_string())?;
@@ -745,6 +773,8 @@ pub(crate) fn install_test_owner(root_id: &str, token: &str) {
         studio_root_id: root_id.to_string(),
         started_at_ms: 1,
         updated_at_ms: 1,
+        hf_endpoint: None,
+        hf_datasets_server: None,
     };
     *TEST_EXPECTED_STUDIO_ROOT_ID.lock().unwrap() = Some(root_id.to_string());
     *TEST_METADATA.lock().unwrap() = Some(metadata);
@@ -765,6 +795,8 @@ pub(crate) fn test_owner_state(root_id: &str, token: &str, port: u16) -> Backend
         studio_root_id: root_id.to_string(),
         started_at_ms: 1,
         updated_at_ms: 1,
+        hf_endpoint: None,
+        hf_datasets_server: None,
     };
     BackendOwnerState {
         path: std::env::temp_dir().join(format!(
@@ -827,6 +859,37 @@ fn ready_for_use_status(health: Option<&HealthResponse>) -> OwnedBackendReadines
     }
 }
 
+async fn health_ready_status(
+    port: u16,
+    credential: Option<&ProbeCredential>,
+) -> Result<OwnedBackendReadiness, String> {
+    match fetch_health(port, credential).await {
+        Ok(health) => {
+            let authenticated_version = health
+                .as_ref()
+                .and_then(|health| health.version.as_deref())
+                .filter(|version| !version.is_empty());
+            if credential.is_some() {
+                let Some(version) = authenticated_version else {
+                    return Err("desktop_auth_health_unverified".to_string());
+                };
+                if let Some(reason) = crate::preflight::backend_version_stale_reason(Some(version))
+                {
+                    return if reason == "desktop_backend_version_too_old" {
+                        Ok(OwnedBackendReadiness::Stale { reason })
+                    } else {
+                        Err(reason)
+                    };
+                }
+                return Ok(ready_for_use_status(health.as_ref()));
+            }
+            Ok(ready_for_use_status(health.as_ref()))
+        }
+        Err(reason) if credential.is_some() => Err(reason),
+        Err(reason) => Ok(OwnedBackendReadiness::Stale { reason }),
+    }
+}
+
 async fn fetch_liveness(
     port: u16,
     timeout: Duration,
@@ -865,15 +928,19 @@ fn fetch_liveness_blocking(port: u16) -> Result<Option<DesktopLiveness>, String>
 }
 async fn fetch_health(
     port: u16,
-    access_token: Option<&str>,
+    credential: Option<&ProbeCredential>,
 ) -> Result<Option<HealthResponse>, String> {
     let client = crate::loopback_http::client(LOCAL_HTTP_TIMEOUT).map_err(|e| e.to_string())?;
     let mut request = client.get(format!("http://127.0.0.1:{port}/api/health"));
-    if let Some(access_token) = access_token {
-        request = request.bearer_auth(access_token);
+    match credential {
+        Some(ProbeCredential::Bearer(token)) => request = request.bearer_auth(token),
+        Some(ProbeCredential::DesktopSecret(secret)) => {
+            request = request.header("X-Desktop-Secret", secret)
+        }
+        None => {}
     }
     let response = request.send().await.map_err(|e| e.to_string())?;
-    if access_token.is_some()
+    if credential.is_some()
         && matches!(
             response.status(),
             reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
@@ -909,7 +976,7 @@ async fn desktop_login_route_compatible(port: u16, timeout: Duration) -> bool {
     }
 }
 
-async fn desktop_secret_login(port: u16, secret: &str) -> Result<String, String> {
+async fn desktop_secret_login(port: u16, secret: &str) -> Result<ProbeCredential, String> {
     let client = crate::loopback_http::client(LOCAL_HTTP_TIMEOUT).map_err(|e| e.to_string())?;
     let response = client
         .post(format!("http://127.0.0.1:{port}/api/auth/desktop-login"))
@@ -925,11 +992,11 @@ async fn desktop_secret_login(port: u16, secret: &str) -> Result<String, String>
             response.status()
         ))
     } else {
-        response
-            .json::<TokenResponse>()
+        let body = response
+            .bytes()
             .await
-            .map(|tokens| tokens.access_token)
-            .map_err(|_| "desktop_auth_token_response_invalid".to_string())
+            .map_err(|_| "desktop_auth_secret_probe_failed".to_string())?;
+        probe_credential(&body, secret)
     }
 }
 
@@ -937,34 +1004,8 @@ async fn authenticated_health_ready_status(
     port: u16,
     secret: &str,
 ) -> Result<OwnedBackendReadiness, String> {
-    authenticated_health_ready(port, secret)
-        .await
-        .map(|(readiness, _, _)| readiness)
-}
-
-async fn authenticated_health_ready(
-    port: u16,
-    secret: &str,
-) -> Result<(OwnedBackendReadiness, String, bool), String> {
-    let access_token = desktop_secret_login(port, secret).await?;
-    let health = fetch_health(port, Some(&access_token))
-        .await?
-        .ok_or_else(|| "desktop_auth_health_unverified".to_string())?;
-    let version = health
-        .version
-        .as_deref()
-        .filter(|version| !version.is_empty())
-        .ok_or_else(|| "desktop_auth_health_unverified".to_string())?;
-    if let Some(reason) = crate::preflight::backend_version_stale_reason(Some(version)) {
-        if reason != "desktop_backend_version_too_old" {
-            return Err(reason);
-        }
-    }
-    Ok((
-        ready_for_use_status(Some(&health)),
-        version.to_string(),
-        health.torch_warm_in_progress.unwrap_or(false),
-    ))
+    let credential = desktop_secret_login(port, secret).await?;
+    health_ready_status(port, Some(&credential)).await
 }
 
 pub(crate) async fn probe_owned_backend_state(
@@ -976,43 +1017,20 @@ pub(crate) async fn probe_owned_backend_state(
         .await
 }
 
-/// As above, but with an explicit per-request budget.
-///
-/// The health watchdog needs this. Its probes have to survive the multi-second GIL stalls
-/// the backend's warm thread causes while it imports the ML stack, and at the default 2s
-/// every request here times out during exactly the stall the watchdog is meant to tolerate,
-/// so the backend reads as unverified and gets cleared.
+/// With an explicit per-request budget: the watchdog's probes must survive multi-second GIL
+/// stalls during ML imports, which the default 2s does not.
 pub(crate) async fn probe_owned_backend_state_with_timeout(
     owner: BackendOwnerState,
     port: Option<u16>,
     require_desktop_secret: bool,
     timeout: Duration,
 ) -> OwnedBackendProbe {
-    probe_owned_backend_state_with_warmup(owner, port, require_desktop_secret, timeout)
-        .await
-        .0
-}
-
-pub(crate) async fn probe_owned_backend_state_for_staged_activation(
-    owner: BackendOwnerState,
-    port: Option<u16>,
-) -> (OwnedBackendProbe, bool) {
-    probe_owned_backend_state_with_warmup(owner, port, true, LOCAL_HTTP_TIMEOUT).await
-}
-
-async fn probe_owned_backend_state_with_warmup(
-    owner: BackendOwnerState,
-    port: Option<u16>,
-    require_desktop_secret: bool,
-    timeout: Duration,
-) -> (OwnedBackendProbe, bool) {
     let ports: Vec<u16> = match port {
         Some(port) => vec![port],
         None => desktop_candidate_ports().collect(),
     };
     let mut verified = Vec::new();
-    // Set only by a complete, parsed answer that names someone else. A transport error or a
-    // non-success status leaves it alone, so silence never reads as a takeover.
+    // Set only by a complete parsed answer naming someone else, so silence never reads as a takeover.
     let mut answered_with_a_different_owner = false;
     for port in ports {
         let liveness = match fetch_liveness(port, timeout).await {
@@ -1031,73 +1049,57 @@ async fn probe_owned_backend_state_with_warmup(
             continue;
         }
         if let Some(reason) = lifecycle_control_block_reason(&liveness) {
-            return (OwnedBackendProbe::Unmanageable { port, reason }, false);
+            return OwnedBackendProbe::Unmanageable { port, reason };
         }
         if !desktop_login_route_compatible(port, timeout).await {
-            return (
-                OwnedBackendProbe::Unmanageable {
-                    port,
-                    reason: "desktop_login_probe_failed".to_string(),
-                },
-                false,
-            );
+            return OwnedBackendProbe::Unmanageable {
+                port,
+                reason: "desktop_login_probe_failed".to_string(),
+            };
         }
-        let (readiness, backend_version, torch_warm_in_progress) = if require_desktop_secret {
+        let readiness = if require_desktop_secret {
             let secret = match read_desktop_secret() {
                 Ok(Some(secret)) => secret,
                 Ok(None) => {
-                    return (
-                        OwnedBackendProbe::Unmanageable {
-                            port,
-                            reason: "desktop_auth_secret_missing".to_string(),
-                        },
-                        false,
-                    )
+                    return OwnedBackendProbe::Unmanageable {
+                        port,
+                        reason: "desktop_auth_secret_missing".to_string(),
+                    }
                 }
-                Err(reason) => return (OwnedBackendProbe::Unmanageable { port, reason }, false),
+                Err(reason) => return OwnedBackendProbe::Unmanageable { port, reason },
             };
-            match authenticated_health_ready(port, &secret).await {
-                Ok((readiness, version, torch_warm_in_progress)) => {
-                    (readiness, Some(version), torch_warm_in_progress)
-                }
-                Err(reason) => return (OwnedBackendProbe::Unmanageable { port, reason }, false),
+            match authenticated_health_ready_status(port, &secret).await {
+                Ok(readiness) => readiness,
+                Err(reason) => return OwnedBackendProbe::Unmanageable { port, reason },
             }
         } else {
-            // Spawned backends were launched from the already-probed managed
-            // install. Adopted backends pass `true` on their initial probe;
-            // later watchdog checks only need ownership and liveness.
-            (OwnedBackendReadiness::Ready, None, false)
+            // Spawned backends come from the probed install; later watchdog checks need only
+            // ownership and liveness.
+            OwnedBackendReadiness::Ready
         };
-        verified.push((port, readiness, backend_version, torch_warm_in_progress));
+        verified.push((port, readiness));
     }
 
     if verified.len() != 1 {
-        return (
-            OwnedBackendProbe::NotVerified {
-                reason: if !verified.is_empty() {
-                    "owned_backend_ambiguous".to_string()
-                } else if answered_with_a_different_owner {
-                    OWNED_BACKEND_OWNER_MISMATCH.to_string()
-                } else {
-                    "owned_backend_not_found".to_string()
-                },
+        return OwnedBackendProbe::NotVerified {
+            reason: if !verified.is_empty() {
+                "owned_backend_ambiguous".to_string()
+            } else if answered_with_a_different_owner {
+                OWNED_BACKEND_OWNER_MISMATCH.to_string()
+            } else {
+                "owned_backend_not_found".to_string()
             },
-            false,
-        );
+        };
     }
 
-    let (port, readiness, backend_version, torch_warm_in_progress) = verified.remove(0);
-    (
-        OwnedBackendProbe::Verified(VerifiedOwnedBackend {
-            backend_pid: owner.backend_pid(),
-            generation: owner.generation(),
-            owner,
-            port,
-            readiness,
-            backend_version,
-        }),
-        torch_warm_in_progress,
-    )
+    let (port, readiness) = verified.remove(0);
+    OwnedBackendProbe::Verified(VerifiedOwnedBackend {
+        backend_pid: owner.backend_pid(),
+        generation: owner.generation(),
+        owner,
+        port,
+        readiness,
+    })
 }
 
 #[allow(dead_code)]
@@ -1152,12 +1154,8 @@ async fn probe_verified_owned_backend_at_path_with_expected(
     Ok(probe_owned_backend_state(owner, port, true).await)
 }
 
-/// False only when the pid is provably gone.
-///
-/// A pid we cannot resolve counts as running: on Windows an OpenProcess that
-/// fails for anything but a bad pid usually means the process is there and
-/// owned by somebody else, and every caller here treats "still running" as the
-/// safe answer.
+/// False only when the pid is provably gone. An unresolvable pid counts as running (on Windows
+/// OpenProcess failing usually means another owner); callers treat running as the safe answer.
 pub(crate) fn pid_is_not_dead(pid: u32) -> bool {
     process_liveness(pid) != PreviousAppPidStatus::Dead
 }
@@ -1236,15 +1234,19 @@ pub(crate) fn exact_port_http_shutdown_blocking(port: u16) -> Result<(), String>
     if !(200..300).contains(&login.status) {
         return Err(format!("desktop login returned HTTP {}", login.status));
     }
-    let tokens = serde_json::from_slice::<TokenResponse>(&login.body)
-        .map_err(|e| format!("desktop login response invalid: {e}"))?;
-    let shutdown = http_request_blocking(
-        port,
-        "POST",
-        "/api/shutdown",
-        &[format!("Authorization: Bearer {}", tokens.access_token)],
-        &[],
-    )?;
+    let (path, header) = match probe_credential(&login.body, &secret)
+        .map_err(|e| format!("desktop login response invalid: {e}"))?
+    {
+        ProbeCredential::Bearer(token) => {
+            ("/api/shutdown", format!("Authorization: Bearer {token}"))
+        }
+        // Multi-account install: no session was minted, so the secret stops the backend.
+        ProbeCredential::DesktopSecret(secret) => (
+            "/api/desktop/shutdown",
+            format!("X-Desktop-Secret: {secret}"),
+        ),
+    };
+    let shutdown = http_request_blocking(port, "POST", path, &[header], &[])?;
     if (200..300).contains(&shutdown.status) {
         Ok(())
     } else {
@@ -1397,6 +1399,8 @@ mod tests {
             studio_root_id: ROOT_ID.to_string(),
             started_at_ms: 1,
             updated_at_ms: 1,
+            hf_endpoint: None,
+            hf_datasets_server: None,
         }
     }
 
@@ -1444,15 +1448,12 @@ mod tests {
         ])
         .await;
 
-        let (readiness, version, torch_warm_in_progress) =
-            authenticated_health_ready(port, "desktop-test-secret")
-                .await
-                .unwrap();
+        let readiness = authenticated_health_ready_status(port, "desktop-test-secret")
+            .await
+            .unwrap();
         server.await.unwrap();
 
         assert!(matches!(readiness, OwnedBackendReadiness::Ready));
-        assert_eq!(version, "2026.8.4");
-        assert!(!torch_warm_in_progress);
         let seen = seen.lock().unwrap();
         assert!(seen[0].contains(r#""secret":"desktop-test-secret""#));
         assert!(seen[1]
@@ -1461,25 +1462,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authenticated_health_reports_torch_warm_in_progress() {
-        let (port, _, server) = http_sequence_server(vec![
-            ("200 OK", r#"{"access_token":"test-access-token"}"#),
+    async fn authenticated_health_uses_the_secret_when_login_mints_no_session() {
+        let (port, seen, server) = http_sequence_server(vec![
+            ("200 OK", r#"{"login_required":true,"login_mode":"multi"}"#),
             (
                 "200 OK",
-                r#"{"version":"2026.8.4","native_path_leases_supported":true,"torch_warm_in_progress":true}"#,
+                r#"{"version":"2026.8.4","native_path_leases_supported":true}"#,
             ),
         ])
         .await;
 
-        let (readiness, version, torch_warm_in_progress) =
-            authenticated_health_ready(port, "desktop-test-secret")
-                .await
-                .unwrap();
+        let readiness = authenticated_health_ready_status(port, "desktop-test-secret")
+            .await
+            .unwrap();
         server.await.unwrap();
 
         assert!(matches!(readiness, OwnedBackendReadiness::Ready));
-        assert_eq!(version, "2026.8.4");
-        assert!(torch_warm_in_progress);
+        let seen = seen.lock().unwrap();
+        let health = seen[1].to_ascii_lowercase();
+        assert!(health.contains("x-desktop-secret: desktop-test-secret"));
+        assert!(!health.contains("authorization:"));
+    }
+
+    #[test]
+    fn a_login_body_without_a_token_or_multi_marker_is_invalid() {
+        assert_eq!(
+            probe_credential(br#"{"login_required":true,"login_mode":"single"}"#, "s")
+                .err()
+                .as_deref(),
+            Some("desktop_auth_token_response_invalid")
+        );
+        assert_eq!(
+            probe_credential(b"{}", "s").err().as_deref(),
+            Some("desktop_auth_token_response_invalid")
+        );
+        assert!(matches!(
+            probe_credential(br#"{"access_token":"t"}"#, "s"),
+            Ok(ProbeCredential::Bearer(token)) if token == "t"
+        ));
     }
 
     #[tokio::test]
@@ -1628,9 +1648,8 @@ mod tests {
         }
     }
 
-    /// A backend that answers the ownership probe's first request and then goes quiet, the
-    /// way a saturated one does. The later connections are parked, not closed: closing them
-    /// would answer with a reset, which is a different failure entirely.
+    /// Answers the first request then goes quiet. Later connections are parked, not closed (a reset
+    /// would be a different failure).
     async fn owned_backend_that_stalls_after_the_first_request() -> u16 {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
@@ -1668,15 +1687,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_stall_after_the_first_request_is_indistinguishable_from_a_foreign_port() {
-        // Why the health watchdog cannot ask this probe whether a failure was a stall: the
-        // liveness GET succeeds and verifies ownership, then the desktop-login POST runs out
-        // of budget, and the answer that comes back carries no trace of which it was. The
-        // watchdog has to classify the failure from its own read instead, which is what
-        // `commands::adopted_failure_is_a_stall` does. Only the opposite case is decidable
-        // here, and is reported as `OWNED_BACKEND_OWNER_MISMATCH`: a port that answered in
-        // full for somebody else did not fall silent, so it is not a stall.
+        // The probe cannot tell a stall from other failures, so the watchdog classifies its own
+        // read (`commands::adopted_failure_is_a_stall`). Only a full answer from another owner is
+        // decidable here.
         let port = owned_backend_that_stalls_after_the_first_request().await;
-        // The probe never touches the file, so nothing has to exist on disk for this.
         let owner = BackendOwnerState::from_metadata(
             std::env::temp_dir().join("unsloth-stall-after-first-request.json"),
             metadata(std::process::id(), Some(port)),
@@ -1703,19 +1717,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_port_taken_over_by_another_backend_is_reported_as_an_owner_mismatch() {
-        // The other half of the classification above. A backend the app adopted can exit and
-        // have its port rebound by the next Unsloth backend the user starts, which answers
-        // the watchdog's pre-probe exactly as the old one did. The probe gets a complete
-        // reply here, not silence, so it must say so: the watchdog reads this to keep the
-        // dead adopted backend on the normal three-strike budget instead of the busy one.
-        //
-        // A backend started outside the app omits `desktop_owner` entirely (main.py only
-        // emits the key when one is loaded), and a second app instance sends a different
-        // token hash. Both are takeovers.
+        // A rebound port answers the pre-probe in full, so the probe must report the mismatch (the
+        // watchdog then keeps the normal strike budget). No `desktop_owner` key or a different token
+        // hash are both takeovers.
         for body in [
-            // Same install, so the root id matches; no desktop owner at all.
             r#"{"status":"alive","service":"Unsloth UI Backend","studio_root_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","supports_desktop_auth":true,"supports_desktop_backend_ownership":true}"#,
-            // A desktop-owned backend, but not the one this app is holding.
             r#"{"status":"alive","service":"Unsloth UI Backend","studio_root_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","supports_desktop_auth":true,"supports_desktop_backend_ownership":true,"desktop_owner":{"kind":"tauri","token_sha256":"0000000000000000000000000000000000000000000000000000000000000000"}}"#,
         ] {
             let (port, _, server) = http_sequence_server(vec![("200 OK", body)]).await;
@@ -1742,8 +1748,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_port_that_says_nothing_is_not_reported_as_an_owner_mismatch() {
-        // The guard on the above: a closed port and a stalled one both fail to verify, and
-        // neither is evidence that someone else took the port. Only a parsed answer is.
+        // A closed or stalled port is not evidence of a takeover; only a parsed answer is.
         let port = closed_port();
         let owner = BackendOwnerState::from_metadata(
             std::env::temp_dir().join("unsloth-silent-port.json"),
@@ -1763,10 +1768,7 @@ mod tests {
 
     #[test]
     fn legacy_manageability_backend_stays_lifecycle_controllable() {
-        // A backend from the previous app version reports manageability 1.
-        // studio_install_ok is CLI-side, not part of this backend's HTTP
-        // contract: blocking makes preflight answer ExternalConflict and never
-        // adopt a process the root id and token already prove is ours.
+        // studio_install_ok is CLI-side, so a manageability-1 backend must still be adoptable.
         assert_eq!(lifecycle_control_block_reason(&owned_liveness(1)), None);
         assert_eq!(
             lifecycle_control_block_reason(&owned_liveness(
@@ -1775,7 +1777,6 @@ mod tests {
             None
         );
 
-        // The bits a live backend really must carry are still enforced.
         let mut no_ownership = owned_liveness(1);
         no_ownership.supports_desktop_backend_ownership = Some(false);
         assert_eq!(
@@ -1854,7 +1855,6 @@ mod tests {
         assert!(is_valid_studio_root_id(&created));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), created);
 
-        // A second call must return the same id, not mint a new one.
         assert_eq!(
             ensure_studio_root_id_at(&path, true).unwrap(),
             Some(created.clone())
@@ -1879,7 +1879,6 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(dir_mode & 0o777, 0o700);
-        // The temp file used to publish the id must not be left behind.
         let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
@@ -1904,14 +1903,12 @@ mod tests {
 
         let error = ensure_studio_root_id_at(&path, true).unwrap_err();
         assert!(error.contains(&path.display().to_string()), "{error}");
-        // A backend may still be reporting the id this file used to hold.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "not-a-root-id");
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
 
-    // Injected reader, not a real race: the window is one unlink wide, so a test that
-    // raced for it would pass on any machine that never entered it.
+    // Injected reader, not a real race: the window is one unlink wide.
     fn denial() -> std::io::Error {
         std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Access is denied.")
     }
@@ -1934,8 +1931,6 @@ mod tests {
 
     #[test]
     fn a_denial_that_never_clears_is_still_reported() {
-        // Bounded: a genuinely unreadable file must not become a hang or a silent
-        // success, and the last error is what the caller sees.
         let mut seen = 0;
         let error = read_studio_root_id_to_string_with(Path::new("id"), |_| {
             seen += 1;
@@ -1948,8 +1943,6 @@ mod tests {
 
     #[test]
     fn a_missing_id_is_answered_without_waiting() {
-        // A first start has no id file; retrying would add backoff to every cold
-        // launch for the same answer.
         let mut seen = 0;
         let error = read_studio_root_id_to_string_with(Path::new("id"), |_| {
             seen += 1;
@@ -1974,7 +1967,6 @@ mod tests {
 
     #[test]
     fn blank_studio_root_id_is_replaced_like_a_missing_one() {
-        // Blank IDs are interrupted writes and must not block later starts.
         for blank in ["", "\n"] {
             let path = temp_root_id_path("blank");
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -2007,7 +1999,6 @@ mod tests {
         });
         blank_seen_rx.recv().unwrap();
 
-        // The second caller must wait until blank-file recovery completes.
         let contender = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -2048,11 +2039,10 @@ mod tests {
 
     #[test]
     fn existing_studio_root_id_is_read_without_the_install_lock() {
-        // A read-only or full share/ must not stop a usable id from being read.
         let path = temp_root_id_path("unlockable");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, ROOT_ID).unwrap();
-        // Make the lock file impossible to open.
+        // A directory at the lock path makes the lock file impossible to open.
         std::fs::create_dir_all(path.parent().unwrap().join(STUDIO_INSTALL_ID_LOCK_FILE)).unwrap();
 
         assert_eq!(
@@ -2088,7 +2078,6 @@ mod tests {
         for id in &ids {
             assert_eq!(id, &persisted);
         }
-        // Filter by name so an unrelated file in share/ cannot fail this test.
         let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
@@ -2154,7 +2143,6 @@ mod tests {
             env.get(OWNER_KIND_ENV).map(String::as_str),
             Some(OWNER_KIND_TAURI)
         );
-        // The backend arms its parent watchdog only when it knows the owner pid.
         assert_eq!(
             env.get(OWNER_PID_ENV).map(String::as_str),
             Some(std::process::id().to_string().as_str())

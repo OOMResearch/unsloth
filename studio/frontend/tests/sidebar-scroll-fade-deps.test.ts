@@ -2,44 +2,28 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-// onScroll never fires for a list that is not scrolling, so the bottom fade is
-// only re-measured when this effect re-runs. Every input that can add or remove
-// a row has to be in its deps, and a missing one is invisible: the fade just
-// stays wrong until an unrelated scroll or resize.
+import { readSrcAsync } from "./helpers/kit.ts";
 
-test("the bottom fade re-measures on every row-count input", async () => {
-  const source = await readFile(
-    new URL("../src/components/app-sidebar.tsx", import.meta.url),
-    "utf8",
-  );
-  const effect =
-    /Recompute bottom-fade on mount[\s\S]*?\}, \[([\s\S]*?)\n  \]\);/.exec(
-      source,
-    );
-  assert.ok(effect, "could not find the bottom-fade effect");
-  const deps = effect[1];
+// onScroll never fires for a still list and rows change without rendering AppSidebar.
 
-  for (const dep of [
-    // Each list that renders rows into the scroller.
-    "recentChatItems.length",
-    "pinnedChatItems.length",
-    "projectChatRowCount",
-    "visibleProjectRecords.length",
-    "runItems.length",
-    // Disclosures, which hide and reveal whole sections.
-    "chatOpen",
-    "runsOpen",
-    "pinnedOpen",
-    "projectsOpen",
-    // Regrouping, which can empty or fill the Projects section outright.
-    "organizeBy",
-  ]) {
-    assert.ok(
-      deps.includes(dep),
-      `${dep} is missing from the bottom-fade deps, so the fade goes stale when it changes`,
-    );
-  }
+test("the bottom fade re-measures off the list's size, not its row inputs", async () => {
+  const source = await readSrcAsync("components/app-sidebar.tsx");
+  assert.equal(/Recompute bottom-fade on mount/.test(source), false);
+  assert.equal(/window\.addEventListener\("resize"/.test(source), false);
+  assert.match(source, /observer\.observe\(el\);/);
+  assert.match(source, /for \(const section of el\.children\) observer\.observe\(section\);/);
+  assert.match(source, /sections\.observe\(el, \{ childList: true \}\);/);
+  // Unobserve leaving sections so the observer does not hold detached subtrees.
+  assert.match(source, /if \(node instanceof Element\) observer\.unobserve\(node\);/);
+  assert.match(source, /if \(node instanceof Element\) observer\.observe\(node\);/);
+  assert.match(source, /observer\.observe\(node\);\s*\}\s*\}\s*syncFade\(el\);/);
+  // Measured on attach from both ends, since the footer mounts after the scroller.
+  assert.match(source, /measureScrollRail\(el\);\s*syncFade\(el\);/);
+  assert.match(source, /if \(node && scrollRef\.current\) syncFade\(scrollRef\.current\);/);
+  // React never owns the attribute, so a render cannot reset it.
+  assert.match(source, /ref=\{attachFade\}/);
+  assert.match(source, /"opacity-0 data-\[visible=true\]:opacity-100"/);
+  assert.equal(/data-visible=/.test(source), false);
 });

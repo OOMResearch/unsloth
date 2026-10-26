@@ -2,13 +2,12 @@ from tqdm import tqdm
 import torch
 import pandas as pd
 
-# DEVICE_TYPE_TORCH, not DEVICE_TYPE: the latter can be "hip"/"mlx", which .to() rejects.
+# DEVICE_TYPE can be "hip"/"mlx", which .to() rejects.
 from unsloth.device_type import DEVICE_TYPE_TORCH
 
 model_comparison_results = {}
 
 
-# Per-example perplexity, sliding window for examples longer than 512 tokens.
 def ppl_model(model, tokenizer, dataset):
     nlls = []
     max_length = 2048
@@ -36,9 +35,6 @@ def ppl_model(model, tokenizer, dataset):
     return ppl
 
 
-# ----------- Reporting helpers ----------- #
-
-
 def add_to_comparison(model_name, ppl):
     """Record a model's perplexity in the comparison tracker."""
     model_comparison_results[model_name] = {"ppl": ppl}
@@ -56,7 +52,6 @@ def print_model_comparison():
         {
             "Model": list(model_comparison_results.keys()),
             "Perplexity": [
-                # Tensors to CPU float if needed.
                 results["ppl"].cpu().item() if torch.is_tensor(results["ppl"]) else results["ppl"]
                 for results in model_comparison_results.values()
             ],

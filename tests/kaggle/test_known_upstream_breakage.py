@@ -1,26 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""A confirmed upstream bug must not block a leg, and must not outlive itself.
-
-Batched greedy generation on `unsloth/gemma-4-E2B-it` and `unsloth/Qwen3.5-2B`
-disagrees at sizes 2, 4 and 8 with real left padding and demonstrably distinct
-prompt lengths, on both repeats, on a current stack. It is filed as unsloth
-#9708 and it is not this repo's to fix. Leaving it as a hard failure means
-those two legs put a red in front of every PR for a bug no reader can act on,
-which is how a check gets switched off.
-
-So the entry is a STRICT expectation rather than a mute, and the difference is
-the whole point of this file. A model listed as broken that starts AGREEING
-FAILS, with a message saying to delete the entry. An excuse that can only ever
-excuse is indistinguishable from deleted coverage, and it outlives the bug it
-was written for by years.
-
-Everything else stays live for those models. The padding side, the distinct
-lengths, the empty-output check and the batch-size floor are what make the
-disagreement a real finding rather than an unpadded batch, and none of them is
-touched by the entry.
-"""
+"""Known-broken entries are strict: a model that starts agreeing fails, so the excuse expires."""
 
 from __future__ import annotations
 
@@ -65,8 +46,9 @@ def test_a_listed_model_does_not_fail_on_the_known_disagreement():
 
 
 def test_a_listed_model_that_starts_AGREEING_fails():
-    """The strict half, and the reason this is not a mute. The day #9708 is
-    fixed, CI says so instead of carrying a stale excuse."""
+    """The strict half, and the reason this is not a mute. Agreement in bf16
+    means a kernel or the stack changed, and CI says so instead of carrying a
+    stale expectation."""
     agreeing = _record(agrees = {"2": True, "4": True, "8": True})
     broken = batched_generation_failures(agreeing, "unsloth/Qwen3.5-2B")
     assert broken, "a fixed upstream bug must turn the leg red"
@@ -81,6 +63,7 @@ def test_a_listed_model_still_fails_every_other_rule():
         ({"padding_side_after": "right"}, "padding_side_after"),
         ({"distinct_lengths": 1}, "nothing was ever padded"),
         ({"empty_outputs": [3]}, "generated nothing at all"),
+        ({"empty_batched_outputs": {"8": [2]}}, "inside the batch"),
         ({"singles": ["x"] * 2}, "largest batch was never actually formed"),
     ):
         broken = batched_generation_failures(_record(**over), "unsloth/Qwen3.5-2B")

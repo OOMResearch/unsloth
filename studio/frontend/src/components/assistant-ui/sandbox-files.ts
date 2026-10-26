@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-/** One file a tool call created in the chat's sandbox. */
 export type SandboxFile = {
   name: string;
   size: number | null;
@@ -9,8 +8,34 @@ export type SandboxFile = {
 
 const FILES_MARKER = "\n__FILES__:";
 
-/** The tools that emit the file envelope. Nothing else's output is an envelope. */
-export const SANDBOX_FILE_TOOLS = new Set(["python", "terminal"]);
+/** The tools that run code in the sandbox. Their result is always wrapped: the session is the only record of where it ran. */
+export const SANDBOX_RUN_TOOLS = new Set(["python", "terminal"]);
+
+/**
+ * The chat tools that render on the image or video model loaded in Unsloth. They
+ * write their output into the sandbox and answer with the file envelope. Keep in step
+ * with MEDIA_CHAT_TOOLS in studio/backend/core/inference/media_chat_tools.py.
+ */
+export const MEDIA_CHAT_TOOLS: ReadonlySet<string> = new Set(["generate_image", "generate_video"]);
+
+/** The tools that emit the file envelope; edit_file only for a file it created. Nothing else's output is an envelope. */
+export const SANDBOX_FILE_TOOLS = new Set([
+  ...SANDBOX_RUN_TOOLS,
+  "edit_file",
+  ...MEDIA_CHAT_TOOLS,
+]);
+
+/**
+ * The tools that emit the image envelope: the sandbox ones, and the provider's hosted
+ * code execution, which attaches its plots the same way. The backend keeps a
+ * well-formed `__IMAGES__` line from any other tool as content the model reads, so
+ * the card has to keep it too, or the user sees less than the model was given.
+ */
+export const IMAGE_SENTINEL_TOOLS = new Set([
+  ...SANDBOX_RUN_TOOLS,
+  "code_execution",
+  "generate_image",
+]);
 
 function isSandboxFile(entry: unknown): entry is SandboxFile {
   if (typeof entry !== "object" || entry === null) return false;
@@ -22,12 +47,7 @@ function isSandboxFile(entry: unknown): entry is SandboxFile {
   );
 }
 
-/**
- * Split a tool result into its visible text and the files the call created.
- *
- * `__FILES__` sits ahead of `__IMAGES__` because older clients slice from that
- * marker to the end. An unparseable payload leaves the text untouched.
- */
+/** `__FILES__` sits ahead of `__IMAGES__` because older clients slice from that marker on. */
 export function extractCreatedFiles(raw: string): {
   text: string;
   files: SandboxFile[];
@@ -40,8 +60,7 @@ export function extractCreatedFiles(raw: string): {
   const end = nextMarker === -1 ? raw.length : nextMarker;
   try {
     const parsed: unknown = JSON.parse(raw.slice(payloadStart, end));
-    // Every entry, not just the array: a tool printing `__FILES__:[null]` would
-    // otherwise have its output eaten and throw while rendering file.name.
+    // Check every entry: `__FILES__:[null]` would otherwise throw while rendering file.name.
     if (!Array.isArray(parsed) || !parsed.every(isSandboxFile)) {
       return { text: raw, files: [] };
     }
@@ -51,7 +70,6 @@ export function extractCreatedFiles(raw: string): {
   }
 }
 
-/** ``files`` as the cards need it: absent, or entries with a usable name. */
 export function isSandboxFileList(val: unknown): boolean {
   if (val === undefined || val === null) return true;
   if (!Array.isArray(val)) return false;
@@ -63,10 +81,6 @@ export function isSandboxFileList(val: unknown): boolean {
   );
 }
 
-/**
- * A python/terminal result carrying the chat's sandbox context alongside the
- * text the model actually saw.
- */
 export function isSandboxToolResult(
   val: unknown,
 ): val is { text: string; sessionId: string } {
@@ -77,45 +91,47 @@ export function isSandboxToolResult(
     images?: unknown;
     files?: unknown;
   };
-  // images too: it is always in Unsloth's own wrapper, and a tool result that
-  // merely has text and sessionId is someone else's, whose other fields would
-  // be dropped on export.
+  // Requires Unsloth's own wrapper fields; a result with only text and sessionId is someone else's.
   return (
     typeof v.text === "string" &&
     typeof v.sessionId === "string" &&
     Array.isArray(v.images) &&
-    // Persisted content can carry anything: the cards map over this and read
-    // name off each entry, so anything else takes the whole chat view down.
+    // Persisted content can carry anything; a bad entry would take the whole chat view down.
     isSandboxFileList(v.files)
   );
+}
+
+/** Whether a sandbox tool call's card shows a created-files row. */
+export function hasCreatedFiles(toolName: unknown, result: unknown): boolean {
+  if (typeof toolName !== "string" || !SANDBOX_FILE_TOOLS.has(toolName)) return false;
+  if (!isSandboxToolResult(result)) return false;
+  const { files } = result as { files?: unknown[] | null };
+  return Array.isArray(files) && files.length > 0;
 }
 
 /** Ids a path segment can carry: ASGI decodes %2F before it matches a route. */
 const PATH_SAFE_SESSION = /^[A-Za-z0-9_-]{1,64}$/;
 
-/** Where this session's files live, as the routes expect to be asked. */
+/** Shared with model-written markdown links, which carry this prefix back. */
+export const SANDBOX_ROUTE_PREFIX = "/api/inference/sandbox/";
+
 export function sandboxRoutePrefix(sessionId: string): {
   prefix: string;
   query: string;
 } {
   if (PATH_SAFE_SESSION.test(sessionId)) {
     return {
-      prefix: `/api/inference/sandbox/${encodeURIComponent(sessionId)}`,
+      prefix: `${SANDBOX_ROUTE_PREFIX}${encodeURIComponent(sessionId)}`,
       query: "",
     };
   }
-  // An API client can pick anything; carry it where it survives the round trip.
   return {
     prefix: "/api/inference/sandbox/_",
     query: `?session=${encodeURIComponent(sessionId)}`,
   };
 }
 
-/**
- * The sandbox a chat's tool calls run in. Threads inside a project share the
- * project's workspace, so their files land in one place instead of one folder
- * per thread.
- */
+/** Threads inside a project share the project's workspace. */
 export function sandboxSessionIdFor(
   threadId: string | undefined,
   projectId: string | null | undefined,
@@ -123,13 +139,136 @@ export function sandboxSessionIdFor(
   return projectId ? `project-${projectId}` : threadId;
 }
 
+/**
+ * Mirrors `_SANDBOX_MEDIA_TYPES` in `backend/routes/inference.py`. `.svg` is absent on purpose:
+ * an inline model-named SVG would be same-origin script execution.
+ */
+export const SANDBOX_INLINE_IMAGE_EXTS = new Set([
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".gif",
+  ".webp",
+  ".bmp",
+  ".avif",
+]);
+
+/** Somebody else's URL: `data:`/`blob:` render as they are, `http(s)` is blocked by the sanitizer. */
+const HAS_SCHEME_RE = /^[a-zA-Z][a-zA-Z0-9+\-.]*:/;
+const PROTOCOL_RELATIVE_RE = /^[/\\]{2}/;
+
+/** A stray `%` must not throw on every render; also decodes download names from the route path. */
+export function decodeSegment(segment: string): string {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
+}
+
+/**
+ * The sandbox file a model-written `src` points at, or null. Bare relative paths count; one
+ * carrying `..` stays raw so it cannot fetch another chat's file or route.
+ */
+export function sandboxFileForSrc(src: string): string | null {
+  const file = sandboxPathForSrc(src);
+  if (file === null) return null;
+  const name = file.slice(file.lastIndexOf("/") + 1);
+  const ext = name.slice(name.lastIndexOf(".")).toLowerCase();
+  return SANDBOX_INLINE_IMAGE_EXTS.has(ext) ? file : null;
+}
+
+// What a one-segment link must end in to be a file, since `example.tech` is a site.
+const LINK_FILE_EXTS = new Set(
+  ("csv tsv json jsonl txt md markdown html htm pdf png jpg jpeg gif webp svg bmp py ipynb js ts sh " +
+    "yaml yml toml xml log xlsx xls docx doc pptx odt ods zip tar gz parquet wav mp3 mp4 webm mov").split(" "),
+);
+// A first segment shaped like a domain (`docs.museum/report.pdf`, `пример.рф`) or an IPv4 address, not a folder.
+const HOST_SEGMENT_RE = /^(?:(?:[\p{L}\p{N}-]+\.)+(?:\p{L}{2,}|xn--[a-z\d-]+)|\d{1,3}(?:\.\d{1,3}){3})(?::\d+)?$/iu;
+
+/** Sandbox file a markdown link targets (`outputs/report.csv`); needs an extension, so `#intro` stays a link. */
+export function sandboxFileForHref(href: string): string | null {
+  const trimmed = href.trim();
+  if (trimmed.startsWith("#") || /^www\./i.test(trimmed)) return null;
+  const file = sandboxPathForSrc(href);
+  const ext = file && /[^/]\.([A-Za-z0-9]{1,8})$/.exec(file)?.[1]?.toLowerCase();
+  if (!file || !ext) return null;
+  const [first, ...rest] = file.split("/");
+  if (rest.length === 0) return LINK_FILE_EXTS.has(ext) ? file : null;
+  return HOST_SEGMENT_RE.test(first ?? "") ? null : file;
+}
+
+function sandboxPathForSrc(src: string): string | null {
+  const trimmed = src.trim();
+  if (!trimmed || HAS_SCHEME_RE.test(trimmed) || PROTOCOL_RELATIVE_RE.test(trimmed)) {
+    return null;
+  }
+  const path = trimmed.split("?")[0].split("#")[0];
+  if (path.startsWith("/") && !path.startsWith(SANDBOX_ROUTE_PREFIX)) {
+    return null;
+  }
+  const segments = path.startsWith(SANDBOX_ROUTE_PREFIX)
+    ? // The recorded sid is not part of the file path; sandboxSessionInSrc reads it back out.
+      path.slice(SANDBOX_ROUTE_PREFIX.length).split("/").slice(1)
+    : path.split("/");
+  // Decode FIRST, then judge: `%2e%2e` is `..`, and a dot segment escapes the caller's scope.
+  const decoded = segments.map(decodeSegment);
+  // Encoded separators must not become new path segments after this check.
+  if (decoded.some((segment) => segment === ".." || /[/\\]/.test(segment))) {
+    return null;
+  }
+  const parts = decoded.filter((segment) => segment !== ".");
+  return parts.length > 0 ? parts.join("/") : null;
+}
+
+export function sandboxSessionInSrc(src: string): string | null {
+  const trimmed = src.trim();
+  if (!trimmed || HAS_SCHEME_RE.test(trimmed) || PROTOCOL_RELATIVE_RE.test(trimmed)) {
+    return null;
+  }
+  const [path, ...query] = trimmed.split("#")[0].split("?");
+  if (!path.startsWith(SANDBOX_ROUTE_PREFIX)) return null;
+  const segment = path.slice(SANDBOX_ROUTE_PREFIX.length).split("/")[0] ?? "";
+  // `sandboxRoutePrefix` carries a not-path-safe id in the query under `_`; mirror it back out.
+  if (query.length > 0) {
+    const session = new URLSearchParams(query.join("?")).get("session");
+    if (session) return session;
+  }
+  return segment ? decodeSegment(segment) : null;
+}
+
+/**
+ * The session the src RECORDS wins: files stay where they were written when a chat moves
+ * between projects. Only a path that records nothing falls back to the chat's current scope.
+ */
+export function markdownSandboxImageSrc(
+  src: string,
+  ctx: { threadId: string | undefined; projectId: string | null | undefined },
+): string | null {
+  const file = sandboxFileForSrc(src);
+  if (file === null) return null;
+  const sessionId =
+    sandboxSessionInSrc(src) ?? sandboxSessionIdFor(ctx.threadId, ctx.projectId);
+  return sessionId ? sandboxFilePath(sessionId, file) : null;
+}
+
 export function sandboxFilePath(sessionId: string, filename: string): string {
-  // Segment by segment: a file written to outputs/report.csv keeps a real "/"
-  // in the URL, which encodeURIComponent on the whole name would have escaped.
+  // Segment by segment so a real "/" survives; encodeURIComponent on the whole name escapes it.
   const path = filename
     .split("/")
     .map((segment) => encodeURIComponent(segment))
     .join("/");
   const { prefix, query } = sandboxRoutePrefix(sessionId);
   return `${prefix}/${path}${query}`;
+}
+
+/** Route URL for a link to a tool-written file (a bare relative path would be blocked); null otherwise. */
+export function markdownSandboxLinkHref(
+  href: string,
+  ctx: { threadId: string | undefined; projectId: string | null | undefined },
+): string | null {
+  const file = sandboxFileForHref(href);
+  if (file === null) return null;
+  const sessionId = sandboxSessionInSrc(href) ?? sandboxSessionIdFor(ctx.threadId, ctx.projectId);
+  return sessionId ? sandboxFilePath(sessionId, file) : null;
 }

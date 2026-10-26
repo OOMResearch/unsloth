@@ -1,14 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""POST /load resolves opaque ``ollama-manifest:`` inventory references.
-
-The read-only hub inventory scan returns Ollama rows whose load id is an
-``ollama-manifest:`` reference (hub/services/models/ollama.py); the load path
-owns the filesystem write that turns one into a loadable ``.gguf`` link. These
-tests pin that hand-off at ``_resolve_model_identifier_for_request``, which both
-the load and validate routes go through.
-"""
+"""Pins the ollama-manifest: load hand-off in _resolve_model_identifier_for_request."""
 
 from __future__ import annotations
 
@@ -89,6 +82,7 @@ def test_custom_folder_scan_preserves_ollama_rows(tmp_path):
 
 def test_registered_custom_ollama_ref_can_be_materialized(tmp_path, monkeypatch):
     from hub.services.models import ollama
+
     from hub.storage import scan_folders
 
     root = tmp_path / "registered-ollama"
@@ -131,10 +125,10 @@ def test_public_identity_keeps_the_manifest_ref():
 def test_retagged_manifest_replaces_one_hardlink_and_invalidates_loaded_identity(
     tmp_path, monkeypatch
 ):
+    from hub.services.models import ollama
     from types import SimpleNamespace
 
     from core.inference.llama_cpp import GgufLoadIntent, LlamaCppBackend
-    from hub.services.models import ollama
 
     root = tmp_path / "ollama-retagged"
     tag_file = _write_ollama_store(root)
@@ -308,9 +302,9 @@ def test_failed_main_retag_restores_the_previous_projector(tmp_path, monkeypatch
 
 
 def test_materialization_lease_blocks_a_concurrent_retag(tmp_path, monkeypatch):
-    import threading
-
     from hub.services.models import ollama
+
+    import threading
 
     root = tmp_path / "ollama-materialization-lease"
     tag_file = _write_ollama_store(root)
@@ -347,12 +341,13 @@ def test_materialization_lease_blocks_a_concurrent_retag(tmp_path, monkeypatch):
 
 
 def test_waiting_route_lease_does_not_starve_the_default_executor(tmp_path, monkeypatch):
+    from hub.services.models import ollama
+
     import asyncio
     import threading
     from concurrent.futures import ThreadPoolExecutor
     from contextlib import ExitStack
 
-    from hub.services.models import ollama
     from models.inference import ValidateModelRequest
     from routes import inference
 
@@ -430,10 +425,10 @@ def test_projector_removal_deletes_the_stale_link(tmp_path, monkeypatch):
 
 
 def test_projector_only_retag_invalidates_loaded_identity(tmp_path, monkeypatch):
+    from hub.services.models import ollama
     from types import SimpleNamespace
 
     from core.inference.llama_cpp import GgufLoadIntent, LlamaCppBackend
-    from hub.services.models import ollama
 
     root = tmp_path / "ollama-projector-retagged"
     tag_file = _write_ollama_store(
@@ -472,9 +467,10 @@ def test_projector_only_retag_invalidates_loaded_identity(tmp_path, monkeypatch)
 
 
 def test_ollama_intent_loads_the_link_but_keeps_the_manifest_identity(tmp_path, monkeypatch):
+    from models.inference import LoadRequest
+    from routes.inference import _resolve_model_identifier_for_request
     from types import SimpleNamespace
 
-    from models.inference import LoadRequest
     from routes.inference import (
         _active_gguf_intent,
         _LoadPlacement,
@@ -540,7 +536,6 @@ def test_ollama_intent_loads_the_link_but_keeps_the_manifest_identity(tmp_path, 
     assert active_intent.gguf_path == resolved
 
 
-# Modelfile metadata nearly every pulled model carries.
 _METADATA_LAYERS = (
     "application/vnd.ollama.image.params",
     "application/vnd.ollama.image.template",
@@ -554,7 +549,6 @@ _UNSUPPORTED_RUNTIME_LAYERS = (
     "application/vnd.ollama.image.future-runtime",
 )
 
-# Carried by a real manifest but dropped by the load without changing its output.
 _IGNORABLE_LAYERS = (
     "application/vnd.ollama.image.draft",
     "application/vnd.ollama.image.embed",
@@ -610,9 +604,8 @@ def test_a_normally_pulled_model_resolves_for_a_load(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("ignorable", _IGNORABLE_LAYERS)
 def test_an_ignorable_layer_does_not_hide_the_primary_model(tmp_path, monkeypatch, ignorable):
-    # Neither layer stops llama.cpp loading the model layer beside it, so neither is a
-    # reason to withhold the row: a draft model only accelerates speculative decoding,
-    # and ollama has ignored the embed layer since 0.1.2.
+    # Neither layer stops llama.cpp loading the model; ollama ignores embed since 0.1.2.
+
     from hub.services.models import ollama
 
     root = tmp_path / f"ollama-{ignorable.rpartition('.')[2]}"
@@ -628,8 +621,8 @@ def test_an_ignorable_layer_does_not_hide_the_primary_model(tmp_path, monkeypatc
 def test_one_unsupported_layer_still_withholds_beside_the_metadata(
     tmp_path, monkeypatch, unsupported
 ):
-    # Pins each unsupported type on its own. The withholding test above carries both at
-    # once, so admitting just one of them back into the loadable set would still pass it.
+    # Pin each unsupported type alone; the combined test would miss one being re-admitted.
+
     from hub.services.models import ollama
 
     root = tmp_path / f"ollama-{unsupported.rpartition('.')[2]}"

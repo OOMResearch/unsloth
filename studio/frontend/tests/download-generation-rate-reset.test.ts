@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-// A generation change means another backend owns the transfer, so the previous
-// one's samples describe a different run. Nothing else catches it: a restart
-// resumes from the same cache so the counter never goes backwards, and the
-// runtime holding the buffer is not recreated. The poll gap across the restart
-// then lands inside the measured span: 100 MB/s published 13 MB/s.
-
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -17,16 +10,12 @@ import {
   computeTransferStats,
 } from "../src/lib/transfer-stats.ts";
 
+import { readSrc } from "./helpers/kit.ts";
+
 const MB = 1e6;
 
 test("a generation change clears the rate samples before the next one is taken", () => {
-  const source = readFileSync(
-    new URL(
-      "../src/features/hub/download-manager/poll-loop.ts",
-      import.meta.url,
-    ),
-    "utf8",
-  );
+  const source = readSrc("features/hub/download-manager/poll-loop.ts");
   const clear = source.indexOf(
     "rt.speedSamples.length = 0",
     source.indexOf("generationChanged) {"),
@@ -55,9 +44,6 @@ test("a restart does not make the resumed transfer look slow", () => {
       bytes = t * 100 * MB;
       poll(t, bytes, false);
     }
-    // The backend restarts. 12s without a successful poll, which is inside the
-    // 30s degraded-poll reset, so nothing else clears the buffer. It resumes at
-    // the same byte count and the same speed.
     const after: number[] = [];
     for (let t = 73; t <= 84; t += 1) {
       poll(t, bytes + (t - 73) * 100 * MB, t === 73);

@@ -1,15 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""Unit tests for the /v1/containers CRUD client methods.
-
-Covers:
-- list / create / delete all send ``OpenAI-Beta: containers=v1``. Without
-  it, OpenAI silently no-ops the DELETE but still returns 200
-  ``{"deleted": true}``.
-- ``delete_openai_container`` raises when the body omits
-  ``{"deleted": true}``, even on a 2xx response.
-"""
+"""Tests for /v1/containers CRUD: every call must send OpenAI-Beta: containers=v1, or DELETE no-ops."""
 
 from __future__ import annotations
 
@@ -26,15 +18,16 @@ from core.inference import external_provider as ep_mod
 from core.inference.external_provider import ExternalProviderClient
 
 
+class ResolverReached(Exception):
+    pass
+
+
 def _drive(coro):
     return asyncio.new_event_loop().run_until_complete(coro)
 
 
 def _mock_http_client(monkeypatch, handler):
-    """Wire `handler` for the shared `_http_client` AND any per-call
-    `httpx.AsyncClient(...)`. delete_openai_container creates a fresh
-    AsyncClient (see external_provider.delete_openai_container), so we
-    must also intercept that constructor."""
+    """Mock the shared _http_client and AsyncClient, since delete_openai_container builds its own client."""
     transport = httpx.MockTransport(handler)
     monkeypatch.setattr(ep_mod, "_http_client", httpx.AsyncClient(transport = transport))
     real_async_client = httpx.AsyncClient
@@ -111,13 +104,9 @@ def test_delete_sends_openai_beta_header_and_accepts_confirmation(monkeypatch):
 
 
 def test_delete_raises_when_response_lacks_deleted_true(monkeypatch):
-    """OpenAI returns 200 ``{"deleted": true}`` even when the request is
-    silently rejected (e.g. before we sent OpenAI-Beta). Guard: when the
-    body omits ``deleted: true``, surface an error so the UI reports the
-    failure instead of false success."""
+    """A 200 without deleted: true must raise, since OpenAI returns 200 even when a DELETE is rejected."""
 
     def handler(request: httpx.Request) -> httpx.Response:
-        # 200 but no deleted flag — unexpected payload shape.
         return httpx.Response(200, json = {"id": "cntr_x", "object": "container"})
 
     _mock_http_client(monkeypatch, handler)
@@ -160,11 +149,8 @@ def test_delete_propagates_openai_4xx(monkeypatch):
 
 
 def test_external_chat_route_resolves_saved_provider_key(monkeypatch):
-    from routes import inference as inf_mod
     from models.inference import ChatCompletionRequest
-
-    class ResolverReached(Exception):
-        pass
+    from routes import inference as inf_mod
 
     monkeypatch.setattr(
         inf_mod.providers_db,
@@ -193,11 +179,8 @@ def test_external_chat_route_resolves_saved_provider_key(monkeypatch):
 
 
 def test_external_chat_api_keys_cannot_use_saved_provider_key(monkeypatch):
-    from routes import inference as inf_mod
     from models.inference import ChatCompletionRequest
-
-    class ResolverReached(Exception):
-        pass
+    from routes import inference as inf_mod
 
     monkeypatch.setattr(
         inf_mod.providers_db,
@@ -231,8 +214,8 @@ def test_external_chat_api_keys_cannot_use_saved_provider_key(monkeypatch):
 
 
 def test_external_chat_explicit_key_honors_edited_target(monkeypatch):
-    from routes import inference as inf_mod
     from models.inference import ChatCompletionRequest
+    from routes import inference as inf_mod
 
     class ClientReached(Exception):
         pass
@@ -270,12 +253,13 @@ def test_external_chat_explicit_key_honors_edited_target(monkeypatch):
         "provider_type": "custom",
         "base_url": "https://new.example/v1",
         "api_key": "replacement-key",
+        "api_type": "chat_completions",
     }
 
 
 def test_container_client_explicit_key_honors_request_target(monkeypatch):
-    from routes import inference as inf_mod
     from models.inference import OpenAIContainerRequest
+    from routes import inference as inf_mod
 
     monkeypatch.setattr(
         inf_mod.providers_db,
@@ -303,8 +287,8 @@ def test_container_client_explicit_key_honors_request_target(monkeypatch):
 
 
 def test_container_client_uses_saved_provider_key(monkeypatch):
-    from routes import inference as inf_mod
     from models.inference import OpenAIContainerRequest
+    from routes import inference as inf_mod
 
     calls: list[tuple[str | None, str | None, bool]] = []
 
@@ -345,11 +329,8 @@ def test_container_client_uses_saved_provider_key(monkeypatch):
 
 
 def test_container_route_blocks_saved_keys_for_internal_api_key(monkeypatch):
-    from routes import inference as inf_mod
     from models.inference import OpenAIContainerRequest
-
-    class ResolverReached(Exception):
-        pass
+    from routes import inference as inf_mod
 
     def fake_resolve(_body, *, allow_saved_key):
         raise ResolverReached(allow_saved_key)
@@ -372,8 +353,8 @@ def test_container_route_blocks_saved_keys_for_internal_api_key(monkeypatch):
 
 
 def test_container_client_rejects_openai_lookalike_host(monkeypatch):
-    from routes import inference as inf_mod
     from models.inference import OpenAIContainerRequest
+    from routes import inference as inf_mod
 
     monkeypatch.setattr(
         inf_mod.providers_db,
@@ -398,8 +379,8 @@ def test_list_route_filters_expired_containers(monkeypatch):
     """OpenAI keeps containers in /v1/containers with status="expired"
     after their idle TTL passes — unusable but still listed. The list
     route must drop them so the picker shows only usable containers."""
-    from routes import inference as inf_mod
     from models.inference import OpenAIContainerRequest
+    from routes import inference as inf_mod
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -429,5 +410,5 @@ def test_list_route_filters_expired_containers(monkeypatch):
     response = _drive(inf_mod.list_openai_containers(body, request, current_subject = "u"))
     ids = [c.id for c in response.containers]
     assert "cntr_active" in ids
-    assert "cntr_unknown" in ids  # missing status is treated as usable
+    assert "cntr_unknown" in ids
     assert "cntr_dead" not in ids

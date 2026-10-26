@@ -1,15 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""Parent-side training event-pump resilience.
-
-The pump is the only writer of the progress state /progress, /status, /metrics
-and DB history read. If it died while the worker ran, the run would continue while
-the UI froze -- the "training runs but no progress shows" symptom. These tests pin
-two guards: a bad event/queue error can't kill the pump, and a dead pump is
-detected and restarted (even after worker exit) so terminal events still finalize.
-Fakes only; no GPU, network, or subprocess.
-"""
+"""A bad event must not kill the progress pump; a dead pump must restart to finalize the run."""
 
 from __future__ import annotations
 
@@ -24,12 +16,24 @@ from pathlib import Path
 
 import pytest
 
+
+def _shared_setup_1(monkeypatch):
+    b = TrainingBackend()
+    finalized: dict = {}
+    monkeypatch.setattr(b, "_ensure_db_run_created", lambda: None)
+    monkeypatch.setattr(b, "_finalize_run_in_db", lambda **kw: finalized.update(kw))
+
+    b._proc = _FakeProc(alive = False)
+    b._event_queue = _IdleQueue()
+    b._progress.is_training = True
+    return b, finalized
+
+
 _BACKEND_DIR = str(Path(__file__).resolve().parent.parent)
 if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
 
-# Stub the heavy module-level imports of core/training/training.py so it imports under
-# CPU-only/no-network, then restore them (see the restore loop below).
+# Stub heavy imports of core/training/training.py, then restore them below.
 _SAVED: dict = {}
 
 
@@ -46,21 +50,28 @@ _hw = _types.ModuleType("utils.hardware")
 _hw.get_device = lambda: _types.SimpleNamespace(value = "cpu")
 _hw.prepare_gpu_selection = lambda *a, **k: (None, None)
 _stub("utils.hardware", _hw)
+
+
+def _stub_run_without_native_path_secret(*args, **kwargs):
+    # Not a lambda: the spawn pickles this target on Windows.
+    return None
+
+
 _npl = _types.ModuleType("utils.native_path_leases")
 _npl.native_path_secret_removed_for_child_start = lambda: contextlib.nullcontext()
-_npl.run_without_native_path_secret = lambda fn: fn
+_npl.run_without_native_path_secret = _stub_run_without_native_path_secret
 _stub("utils.native_path_leases", _npl)
 _pth = _types.ModuleType("utils.paths")
+_pth.__path__ = [str(Path(_BACKEND_DIR) / "utils" / "paths")]
+_pth.__package__ = "utils.paths"
 _pth.is_local_path = lambda *a, **k: False
 _pth.outputs_root = lambda *a, **k: "/tmp/outputs"
 _stub("utils.paths", _pth)
 
-# Was core.training.training already imported? Only evict it below if we created it.
 _TRAINING_PRE_IMPORTED = "core.training.training" in sys.modules
 
 from core.training.training import TrainingBackend
 
-# Restore every stubbed module so this file never pollutes the shared session.
 for _name in (
     "loggers",
     "structlog",
@@ -74,8 +85,7 @@ for _name in (
     else:
         sys.modules[_name] = _prev
 
-# training imported its helpers while the stubs were active, binding them to stubs. If we
-# created the cached module, evict it (and its parent) so a later test re-imports the real one.
+# training bound helpers to the stubs; evict it so later tests import the real one.
 if not _TRAINING_PRE_IMPORTED:
     sys.modules.pop("core.training.training", None)
     sys.modules.pop("core.training", None)
@@ -150,9 +160,6 @@ def _wait_until(predicate, timeout = 5.0):
     return predicate()
 
 
-# Guarantee 1: a single bad event/queue error cannot kill the pump.
-
-
 def test_pump_survives_handler_exception_and_keeps_processing(monkeypatch):
     b = TrainingBackend()
     _silence_db(monkeypatch, b)
@@ -180,7 +187,7 @@ def test_pump_survives_handler_exception_and_keeps_processing(monkeypatch):
         assert pump.is_alive(), "pump thread must survive handler exceptions"
         assert b._pump_running is True
     finally:
-        proc._alive = False  # let the loop reach its clean exit
+        proc._alive = False
         pump.join(timeout = 5)
 
     assert not pump.is_alive()
@@ -195,7 +202,6 @@ def test_read_queue_narrow_contract():
         def get(self, *a, **k):
             raise self.exc
 
-    # Expected closed/broken-queue signals read as "no event".
     for exc in (queue.Empty(), EOFError(), OSError(), ValueError()):
         assert TrainingBackend._read_queue(_Q(exc), 0.01) is None
 
@@ -205,7 +211,6 @@ def test_read_queue_narrow_contract():
 
 
 def test_pump_survives_queue_read_exception_and_recovers(monkeypatch):
-    # An unexpected _read_queue error must hit the pump's outer guard (log + backoff), not kill it.
     b = TrainingBackend()
     _silence_db(monkeypatch, b)
     handled: list = []
@@ -243,7 +248,6 @@ def test_pump_survives_queue_read_exception_and_recovers(monkeypatch):
 
 
 def test_pump_finalizes_when_drain_queue_raises_unexpected_error(monkeypatch):
-    # Worker has exited; the final drain hits an unexpected error, but the run must still finalize.
     b = TrainingBackend()
     finalized: dict = {}
     monkeypatch.setattr(b, "_ensure_db_run_created", lambda: None)
@@ -260,17 +264,18 @@ def test_pump_finalizes_when_drain_queue_raises_unexpected_error(monkeypatch):
     b._event_queue = _BadDrainQueue()
     b._progress.is_training = True
 
-    b._pump_loop()  # returns once it sees the dead worker
+    b._pump_loop()
 
     assert b._progress.is_training is False
-    assert b._progress.error == "Training process exited unexpectedly"
+    assert b._progress.error.startswith("Training process exited unexpectedly")
+    assert "pid=4321" in b._progress.error
+    assert "exitcode=unknown" in b._progress.error
     assert finalized.get("status") == "error"
     assert b._pump_running is False
     assert b.is_training_active() is False
 
 
 def test_pump_finalizes_when_read_keeps_raising_on_dead_worker(monkeypatch):
-    # If an escaped error keeps raising after worker exit, the loop must still finalize, not spin.
     b = TrainingBackend()
     finalized: dict = {}
     monkeypatch.setattr(b, "_ensure_db_run_created", lambda: None)
@@ -297,15 +302,7 @@ def test_pump_finalizes_when_read_keeps_raising_on_dead_worker(monkeypatch):
 
 
 def test_interrupted_cancel_clears_in_memory_output_dir(monkeypatch):
-    # Stop-without-save interrupted before its complete event: /status must not serve the cleared output_dir.
-    b = TrainingBackend()
-    finalized: dict = {}
-    monkeypatch.setattr(b, "_ensure_db_run_created", lambda: None)
-    monkeypatch.setattr(b, "_finalize_run_in_db", lambda **kw: finalized.update(kw))
-
-    b._proc = _FakeProc(alive = False)
-    b._event_queue = _IdleQueue()
-    b._progress.is_training = True
+    b, finalized = _shared_setup_1(monkeypatch)
     b._should_stop = True
     b._cancel_requested = True
     b._output_dir = "/out/x"
@@ -319,14 +316,7 @@ def test_interrupted_cancel_clears_in_memory_output_dir(monkeypatch):
 
 
 def test_worker_exit_reuses_terminal_stop_save_error(monkeypatch):
-    b = TrainingBackend()
-    finalized: dict = {}
-    monkeypatch.setattr(b, "_ensure_db_run_created", lambda: None)
-    monkeypatch.setattr(b, "_finalize_run_in_db", lambda **kw: finalized.update(kw))
-
-    b._proc = _FakeProc(alive = False)
-    b._event_queue = _IdleQueue()
-    b._progress.is_training = True
+    b, finalized = _shared_setup_1(monkeypatch)
     b._should_stop = True
     b._cancel_requested = False
     b._output_dir = "/out/x"
@@ -350,15 +340,7 @@ def test_worker_exit_reuses_terminal_stop_save_error(monkeypatch):
 
 
 def test_dead_worker_crash_preserves_output_dir(monkeypatch):
-    # A crash (no stop requested) after output_dir was emitted must keep the dir: checkpoints may exist.
-    b = TrainingBackend()
-    finalized: dict = {}
-    monkeypatch.setattr(b, "_ensure_db_run_created", lambda: None)
-    monkeypatch.setattr(b, "_finalize_run_in_db", lambda **kw: finalized.update(kw))
-
-    b._proc = _FakeProc(alive = False)
-    b._event_queue = _IdleQueue()
-    b._progress.is_training = True
+    b, finalized = _shared_setup_1(monkeypatch)
     b._output_dir = "/out/x"
 
     b._pump_loop()
@@ -369,8 +351,7 @@ def test_dead_worker_crash_preserves_output_dir(monkeypatch):
 
 
 def test_start_training_clears_stale_pump_running_flag():
-    # A prior pump that died abnormally leaves _pump_running True. The next start_training must
-    # clear it during reset so the watchdog can't treat the fresh setup as a crash and duplicate.
+    # A dead pump leaves _pump_running True; start_training must reset it.
     b = TrainingBackend()
     b._pump_running = True
     b._pump_thread = None
@@ -383,15 +364,12 @@ def test_start_training_clears_stale_pump_running_flag():
     assert b._pump_running is False
 
 
-# Guarantee 2: a pump that dies while the worker runs is detected + restarted.
-
-
 def test_ensure_pump_alive_restarts_crashed_pump(monkeypatch):
     b = TrainingBackend()
     _silence_db(monkeypatch, b)
     b._proc = _FakeProc(alive = True)
     b._event_queue = _IdleQueue()
-    b._pump_running = True  # a pump started, then died abnormally
+    b._pump_running = True
     dead = _dead_thread()
     b._pump_thread = dead
 
@@ -422,8 +400,7 @@ def test_ensure_pump_alive_noop_when_pump_alive():
 
 
 def test_ensure_pump_alive_revives_crashed_pump_after_worker_exit(monkeypatch):
-    # True _pump_running + dead thread = a crash (the loop clears the flag on intended exits). The
-    # queue may still hold terminal events, so the pump must restart to drain and finalize.
+    # True flag + dead thread = crash; restart to drain terminal events.
     b = TrainingBackend()
     _silence_db(monkeypatch, b)
     b._proc = _FakeProc(alive = False)
@@ -442,7 +419,6 @@ def test_ensure_pump_alive_revives_crashed_pump_after_worker_exit(monkeypatch):
 
 
 def test_ensure_pump_alive_noop_during_setup():
-    # _pump_running is False between state-reset and the first pump running; no rogue pump may spawn.
     b = TrainingBackend()
     b._proc = _FakeProc(alive = True)
     b._event_queue = _IdleQueue()
@@ -461,7 +437,6 @@ def test_is_training_active_revives_dead_pump(monkeypatch):
     dead = _dead_thread()
     b._pump_thread = dead
 
-    # The per-second status poll both reports activity and heals the dead pump as a side effect.
     assert b.is_training_active() is True
     try:
         assert b._pump_thread is not dead
@@ -469,9 +444,6 @@ def test_is_training_active_revives_dead_pump(monkeypatch):
     finally:
         b._proc._alive = False
         b._pump_thread.join(timeout = 5)
-
-
-# Guarantee 3: the DB run row exists before the pump consumes any event.
 
 
 def _stub_spawn(monkeypatch):
@@ -494,8 +466,7 @@ def _stub_spawn(monkeypatch):
         def Process(self, **k):
             return _SpawnProc()
 
-    # _CTX / prepare_gpu_selection resolve from the module globals; patch the function's own
-    # globals so this module's eviction of core.training.training can't hand us a different copy.
+    # Patch the function's own globals; this module evicts core.training.training.
     monkeypatch.setitem(g, "_CTX", _Ctx())
     monkeypatch.setitem(g, "prepare_gpu_selection", lambda *a, **k: (None, None))
 
@@ -506,6 +477,11 @@ def _stub_spawn(monkeypatch):
 
     pl = _types.ModuleType("utils.process_lifetime")
     pl.adopt_pid = lambda pid: None
+    pl.forget_pid = lambda pid: None
+    pl.terminate_pid = lambda *args, **kwargs: None
+    pl.child_popen_kwargs = lambda *args, **kwargs: {}
+    # The spawn reads the shutdown latch; answer "not shutting down".
+    pl.is_process_shutting_down = lambda: False
     monkeypatch.setitem(sys.modules, "utils.process_lifetime", pl)
 
     worker = _types.ModuleType("core.training.worker")
@@ -514,8 +490,7 @@ def _stub_spawn(monkeypatch):
 
 
 def test_db_run_created_before_pump_consumes_events(monkeypatch):
-    # A fast terminal worker must not race the pump into creating the DB row. The create sleep
-    # widens the window so the ordering is observed, not luck.
+    # The create sleep widens the race window so the ordering is observed, not luck.
     b = TrainingBackend()
     _stub_spawn(monkeypatch)
 
@@ -536,7 +511,6 @@ def test_db_run_created_before_pump_consumes_events(monkeypatch):
     if b._pump_thread is not None:
         b._pump_thread.join(timeout = 2.0)
 
-    # The pump observed an already-created run; it would be False if started before the eager create.
     assert seen["db_created"] is True
 
 
@@ -548,7 +522,6 @@ def test_startup_flag_reports_training_active_before_proc():
 
 
 def test_before_spawn_runs_inside_active_window(monkeypatch):
-    # The VRAM-freeing hook must run while training already counts as active, else an STT load races it.
     b = TrainingBackend()
     _stub_spawn(monkeypatch)
     monkeypatch.setattr(b, "_ensure_db_run_created", lambda: None)
@@ -564,6 +537,5 @@ def test_before_spawn_runs_inside_active_window(monkeypatch):
         b._pump_thread.join(timeout = 2.0)
 
     assert active_during_free["value"] is True
-    # The transient flag clears, but the live proc keeps training active.
     assert b._spawn_in_progress is False
     assert b.is_training_active() is True

@@ -7,8 +7,6 @@ from __future__ import annotations
 
 import os
 import re
-import sys
-import tempfile
 import threading
 from collections import OrderedDict
 from pathlib import Path
@@ -16,104 +14,55 @@ from typing import Optional
 
 from loggers import get_logger
 from utils.paths import path_utils as _path_utils
-from utils.paths.path_utils import wsl_automount_root
 
-# One policy, defined in utils.paths.storage_roots: the copy that used to live here drifted, and a
-# BOM'd settings.json was honoured by one side and dropped by the other (#9748).
+# One policy in utils.paths.storage_roots; a local copy drifted before.
 from utils.paths.storage_roots import (
+    hermes_model_dirs,
+    studio_root,
+    cache_root,
+    assets_root,
+    datasets_root,
+    dataset_uploads_root,
+    recipe_datasets_root,
+    outputs_root,
+    exports_root,
+    tmp_root,
+    ensure_dir,
+    legacy_hf_cache_dir,
+    hf_default_cache_dir,
     lmstudio_model_dirs,
     ollama_model_dirs,
+    omlx_model_dirs,
     well_known_model_dirs,
 )
 
 logger = get_logger(__name__)
 
 # Re-export shim: marks them used so the import-hoist safety net does not flag them.
-_REEXPORTED = (lmstudio_model_dirs, ollama_model_dirs, well_known_model_dirs)
-
-
-def _infer_studio_home_from_venv() -> Optional[Path]:
-    try:
-        prefix = Path(sys.prefix).resolve()
-    except (OSError, ValueError):
-        return None
-    if prefix.name != "unsloth_studio":
-        return None
-    candidate = prefix.parent
-    shim_name = "unsloth.exe" if os.name == "nt" else "unsloth"
-    try:
-        if (candidate / "share" / "studio.conf").is_file() or (
-            candidate / "bin" / shim_name
-        ).is_file():
-            return candidate
-    except OSError:
-        return None
-    return None
-
-
-def studio_root() -> Path:
-    override = (os.environ.get("UNSLOTH_STUDIO_HOME") or "").strip()
-    if not override:
-        override = (os.environ.get("STUDIO_HOME") or "").strip()
-    if override:
-        try:
-            return Path(override).expanduser().resolve()
-        except (OSError, ValueError):
-            return Path(override).expanduser()
-    inferred = _infer_studio_home_from_venv()
-    if inferred is not None:
-        return inferred
-    return Path.home() / ".unsloth" / "studio"
-
-
-def cache_root() -> Path:
-    return studio_root() / "cache"
-
-
-def assets_root() -> Path:
-    return studio_root() / "assets"
-
-
-def datasets_root() -> Path:
-    return assets_root() / "datasets"
-
-
-def dataset_uploads_root() -> Path:
-    return datasets_root() / "uploads"
-
-
-def recipe_datasets_root() -> Path:
-    return datasets_root() / "recipes"
-
-
-def outputs_root() -> Path:
-    return studio_root() / "outputs"
-
-
-def exports_root() -> Path:
-    return studio_root() / "exports"
-
-
-def tmp_root() -> Path:
-    return Path(tempfile.gettempdir()) / "unsloth-studio"
-
-
-def ensure_dir(path: Path) -> Path:
-    path.mkdir(parents = True, exist_ok = True)
-    return path
-
-
-def legacy_hf_cache_dir() -> Path:
-    return cache_root() / "huggingface" / "hub"
-
-
-def hf_default_cache_dir() -> Path:
-    return Path.home() / ".cache" / "huggingface" / "hub"
+_REEXPORTED = (
+    hermes_model_dirs,
+    lmstudio_model_dirs,
+    ollama_model_dirs,
+    omlx_model_dirs,
+    well_known_model_dirs,
+    studio_root,
+    cache_root,
+    assets_root,
+    datasets_root,
+    dataset_uploads_root,
+    recipe_datasets_root,
+    outputs_root,
+    exports_root,
+    tmp_root,
+    ensure_dir,
+    legacy_hf_cache_dir,
+    hf_default_cache_dir,
+)
 
 
 # normalize_path reads these at call time and tests set them, so they stay attributes of this module.
 _IS_WSL = _path_utils._IS_WSL
-_WSL_AUTOMOUNT_ROOT = wsl_automount_root()
+_WSL_AUTOMOUNT_ROOT = _path_utils._WSL_AUTOMOUNT_ROOT
 
 
 def normalize_path(path: str) -> str:
@@ -164,8 +113,7 @@ def is_valid_repo_id(repo_id: str) -> bool:
     segments = repo_id.split("/")
     if len(segments) not in (1, 2):
         return False
-    # Match huggingface_hub.validate_repo_id: the 96-char limit applies per segment, not to the whole
-    # "namespace/repo_name" string.
+    # Like validate_repo_id: the 96-char limit is per segment.
     return all(
         segment not in ("", ".", "..")
         and len(segment) <= _MAX_REPO_ID_LENGTH
@@ -179,12 +127,7 @@ _MAX_GGUF_VARIANT_LENGTH = 512
 
 
 def is_valid_gguf_variant(variant: str) -> bool:
-    """Validate Hub GGUF variant keys.
-
-    Known quant labels are short tokens (``Q4_K_M``), but unknown GGUF layouts
-    use a snapshot-relative key derived from the filename and may contain
-    slashes or spaces.
-    """
+    """Unknown GGUF layouts use snapshot-relative keys, which may hold slashes or spaces."""
     if not variant or variant != variant.strip():
         return False
     if len(variant) > _MAX_GGUF_VARIANT_LENGTH:
@@ -195,8 +138,7 @@ def is_valid_gguf_variant(variant: str) -> bool:
     return all(segment not in ("", ".", "..") for segment in normalized.split("/"))
 
 
-# Per-process memo for resolve_cached_repo_id_case. Bounded LRU so a long-lived process cannot
-# grow it without limit; evicted cold entries simply recompute.
+# Bounded LRU memo for resolve_cached_repo_id_case so long-lived processes cannot grow it unbounded.
 _CACHE_CASE_RESOLUTION_MEMO_MAX = 512
 _CACHE_CASE_RESOLUTION_MEMO: "OrderedDict[tuple[str, str], str]" = OrderedDict()
 _CACHE_CASE_RESOLUTION_LOCK = threading.Lock()
@@ -268,13 +210,7 @@ def _assert_contained(resolved: Path, root: Path) -> None:
 
 
 def path_is_same_or_child(path: Path, root: Path) -> bool:
-    """True when *path* is *root* or lives beneath it.
-
-    Compares real (symlink-resolved, case-normalized) paths so the check holds
-    through symlinks and on case-insensitive filesystems, where a plain
-    ``Path.is_relative_to`` would miss a casing-only match. Returns False on any
-    resolution error rather than raising.
-    """
+    """Compares normcased realpaths so symlinks and case-only matches count; any error returns False."""
     try:
         path_real = os.path.normcase(os.path.realpath(str(path)))
         root_real = os.path.normcase(os.path.realpath(str(root)))
@@ -287,8 +223,7 @@ def resolve_dataset_path(path_value: str) -> Path:
     raw = str(path_value or "").strip()
     if "\x00" in raw:
         raise ValueError("dataset path may not contain null bytes")
-    # Normalize first so Windows/UNC and backslash paths resolve like the rest of the Hub path layer,
-    # and a backslashed ".." is caught by the traversal guard below.
+    # Normalize first so a backslashed ".." is caught by the traversal guard below.
     normalized = normalize_path(raw)
     path = Path(normalized).expanduser()
     if ".." in path.parts:
@@ -331,12 +266,7 @@ def resolve_cached_repo_id_case(
     use_memo: bool = True,
     repo_type: str = "model",
 ) -> str:
-    """Resolve repo_id to the exact casing already present in local HF cache.
-
-    Prefers the requested casing, but if a case-variant already exists in
-    local HF cache, reuses that exact cached spelling so we don't trigger
-    a duplicate download.
-    """
+    """Reuses the cached spelling when a case-variant exists, to avoid a duplicate download."""
     if not model_name or "/" not in model_name:
         return model_name
 
@@ -374,8 +304,7 @@ def resolve_cached_repo_id_case(
                     continue
                 if entry.name.lower() != expected_lower:
                     continue
-                # The lowercased full-name match already proves the prefix matches; a case-sensitive startswith
-                # would reject a mixed-case imported dir such as Models--Org--Repo.
+                # Lowercased full-name match proves the prefix; case-sensitive startswith rejects Models--Org--Repo.
                 repo_part = entry.name[len(prefix) :]
                 if not repo_part:
                     continue
@@ -407,6 +336,7 @@ __all__ = [
     "lmstudio_model_dirs",
     "normalize_path",
     "ollama_model_dirs",
+    "omlx_model_dirs",
     "outputs_root",
     "path_is_same_or_child",
     "recipe_datasets_root",

@@ -2,10 +2,9 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-import { registerBundlerResolver } from "./helpers/kit.ts";
+import { readSrcAsync, registerBundlerResolver } from "./helpers/kit.ts";
 
 registerBundlerResolver();
 
@@ -40,7 +39,6 @@ test("the permission hint names the screen that fixes it", () => {
     scanFolderStatusCopy("permission_denied", WINDOWS)!.hint,
     /Controlled Folder Access/,
   );
-  // No screen worth naming on Linux, so the hint stays generic.
   assert.match(
     scanFolderStatusCopy("permission_denied", LINUX)!.hint,
     /permissions/i,
@@ -59,7 +57,6 @@ test("a partial folder does not claim the whole folder is blocked", () => {
   assert.ok(copy);
   assert.match(copy.title, /some models/i);
   assert.doesNotMatch(copy.title, /not allowed/i);
-  // Same fix, so the same hint.
   assert.match(copy.hint, /Files and Folders/);
 });
 
@@ -70,24 +67,16 @@ test("an unreadable folder points at the drive", () => {
 });
 
 test("the model picker renders the status on its folder rows too", async () => {
-  const source = await readFile(
-    new URL(
-      "../src/features/model-picker/components/model-selector/pickers.tsx",
-      import.meta.url,
-    ),
-    "utf8",
+  const source = await readSrcAsync(
+    "features/model-picker/components/model-selector/pickers.tsx",
   );
   assert.match(source, /scanFolderStatusCopy\(f\.status\)/);
   assert.match(source, /\{problem\.title\}/);
 });
 
 test("the folders dialog renders the status on the row", async () => {
-  const source = await readFile(
-    new URL(
-      "../src/features/hub/catalog/on-device-folders-dialog.tsx",
-      import.meta.url,
-    ),
-    "utf8",
+  const source = await readSrcAsync(
+    "features/hub/catalog/on-device-folders-dialog.tsx",
   );
   assert.match(source, /scanFolderStatusCopy\(folder\.status\)/);
   assert.match(source, /\{problem\.title\}\. \{problem\.hint\}/);

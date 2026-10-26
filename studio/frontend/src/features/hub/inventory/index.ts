@@ -15,7 +15,10 @@ export {
   listCachedGguf,
   listCachedModels,
   deleteCachedDataset,
+  DELETABLE_LOCAL_SOURCES,
   deleteCachedModel,
+  deleteLocalModel,
+  revealLocalModel,
   fetchDeleteImpact,
   fetchOrphanCompanions,
   invalidateGgufVariantsCache,
@@ -48,7 +51,6 @@ export {
   localSourceLabel,
   normalizeCapabilities,
   normalizeModelFormat,
-  normalizeRuntime,
 } from "./view-models";
 export {
   epochMillisecondsToSeconds,

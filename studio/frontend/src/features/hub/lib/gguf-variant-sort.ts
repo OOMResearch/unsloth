@@ -23,9 +23,7 @@ type GgufVariantTransfer = Pick<
   "download_size_bytes" | "size_bytes" | "download_remaining_bytes" | "partial"
 >;
 
-/** What starting this variant now would transfer. On a partial that is the
- * remainder the backend measured; everywhere else it is the full size. An
- * unmeasured partial falls back to the total, the costlier of the two. */
+/** On a partial, the measured remainder; unmeasured falls back to the total. */
 export function ggufVariantTransferBytes(variant: GgufVariantTransfer): number {
   const total = ggufVariantDownloadSizeBytes(variant);
   if (!variant.partial) return total;
@@ -33,9 +31,7 @@ export function ggufVariantTransferBytes(variant: GgufVariantTransfer): number {
   return typeof remaining === "number" && remaining >= 0 ? remaining : total;
 }
 
-/** Labelled form of the above. A partial says what is LEFT: the full size there
- * reads as "this downloads all over again", which is only true for a one-file
- * quant. */
+/** A partial says what is left. */
 export function ggufVariantTransferLabel(variant: GgufVariantTransfer): string {
   const label = formatBytes(ggufVariantTransferBytes(variant));
   return variant.partial ? `${label} left` : label;
@@ -52,6 +48,7 @@ export function ggufVariantFitRank(
       return 1;
     case "partial":
     case "ram":
+    case "streamed":
       return 2;
     default:
       return 3;
@@ -92,17 +89,61 @@ export function sortDownloadableGgufVariants(
 export function sortLocalGgufVariants(
   variants: readonly GgufVariantDetail[],
   options: GgufFitInput & {
-    activeGgufVariant?: string | null;
     defaultVariant?: string | null;
   },
 ): GgufVariantDetail[] {
+  const defaultVariant = options.defaultVariant?.trim();
   return [...variants].sort((a, b) => {
-    const aActive = ggufVariantsMatch(a.quant, options.activeGgufVariant);
-    const bActive = ggufVariantsMatch(b.quant, options.activeGgufVariant);
-    if (aActive !== bActive) return aActive ? -1 : 1;
-    const aDefault = ggufVariantsMatch(a.quant, options.defaultVariant);
-    const bDefault = ggufVariantsMatch(b.quant, options.defaultVariant);
-    if (aDefault !== bDefault) return aDefault ? -1 : 1;
+    if (defaultVariant) {
+      const aDefault = ggufVariantsMatch(a.quant, defaultVariant);
+      const bDefault = ggufVariantsMatch(b.quant, defaultVariant);
+      if (aDefault !== bDefault) return aDefault ? -1 : 1;
+    }
     return compareGgufVariantFitAndSize(a, b, options);
   });
+}
+
+export function resolveLocalGgufVariant<T extends { quant: string }>(
+  variants: readonly T[] | null | undefined,
+  options: {
+    selectedVariant?: string | null;
+    activeVariant?: string | null;
+    defaultVariant?: string | null;
+  },
+): T | null {
+  if (!variants || variants.length === 0) {
+    return null;
+  }
+  for (const candidate of [
+    options.selectedVariant,
+    options.activeVariant,
+    options.defaultVariant,
+  ]) {
+    if (!candidate?.trim()) {
+      continue;
+    }
+    const match = variants.find((variant) =>
+      ggufVariantsMatch(variant.quant, candidate),
+    );
+    if (match) {
+      return match;
+    }
+  }
+  return variants[0] ?? null;
+}
+
+// The memory bar loads the cached file, so an update's merged row (published
+// lookup table, cached size) would mix two revisions; read the cached row.
+export function localGgufMemoryBarVariant<T extends { quant: string }>(
+  selected: (T & { update_available?: boolean }) | null,
+  localVariants: readonly T[] | null | undefined,
+): T | null {
+  if (!selected?.update_available) {
+    return selected;
+  }
+  return (
+    localVariants?.find((variant) =>
+      ggufVariantsMatch(variant.quant, selected.quant),
+    ) ?? selected
+  );
 }

@@ -1,17 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""Regression tests for the offline GGUF cache fallback path (#5505).
-
-When ``huggingface.co`` is unreachable but the repo is cached, three failures
-hit: ``list_gguf_variants`` 500'd (empty dropdown), ``detect_gguf_model_remote``
-returned None (GGUF-only repo misrouted), and ``_download_gguf`` synthesised a
-name absent from cache. Follow-ups: the cache filter matches the snapshot-relative
-path (subdir layouts findable), and DNS auto-detect scopes ``HF_HUB_OFFLINE`` to
-one load so a transient hiccup can't pin the singleton offline.
-
-No GPU, no network, no subprocess. Linux/macOS/Windows compatible.
-"""
+"""Offline, a cached GGUF repo must still list variants, detect as GGUF, and download."""
 
 from __future__ import annotations
 
@@ -32,8 +22,6 @@ if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
 
 
-# Stub heavy/unavailable external deps before importing the modules under
-# test (same pattern as other studio backend tests).
 def _module_available(name: str) -> bool:
     """True if the real module can be imported. Probed rather than imported: these stubs
     land in sys.modules for the whole session, so an empty one breaks anything imported
@@ -52,7 +40,6 @@ if not _module_available("loggers"):
 if not _module_available("structlog"):
     sys.modules.setdefault("structlog", _types.ModuleType("structlog"))
 
-# Prefer real httpx if installed (CI installs it). Stub only as fallback.
 try:
     import httpx  # noqa: F401
 except ImportError:
@@ -102,16 +89,26 @@ from core.inference.llama_cpp import (
 from utils.models.model_config import (
     _detect_gguf_from_hf_cache,
     _extract_quant_label,
+    _hub_model_info,
     _iter_hf_cache_snapshots,
     _list_gguf_variants_from_hf_cache,
     detect_gguf_model_remote,
     list_gguf_variants,
+    shared_hub_model_info,
 )
+import utils.models.model_config as mc
 
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
+def fail_download(*_args, **_kwargs):
+    raise AssertionError("should reuse the cached GGUF instead of downloading")
+
+
+def boom(*a, **k):
+    raise OSError("network down")
+
+
+def boom_list(*a, **k):
+    raise OSError("offline")
 
 
 def _build_cache(
@@ -224,6 +221,8 @@ class TestGgufVariantFileResolution:
         assert _gguf_files_for_variant(files, "") == ["model-Q4_K_M.gguf"]
 
     def test_remote_listing_skips_big_endian_quant_sibling(self, monkeypatch, clean_offline_env):
+        from utils.models.model_config import list_gguf_variants
+
         siblings = [
             _types.SimpleNamespace(rfilename = "model-Q4_K_M-be.gguf", size = 100),
             _types.SimpleNamespace(rfilename = "model-Q4_K_M.gguf", size = 10),
@@ -289,7 +288,6 @@ class TestGgufVariantFileResolution:
     def test_download_reuses_older_snapshot_when_current_ref_snapshot_is_partial(
         self, monkeypatch, hf_cache
     ):
-        # Keep coverage for offline reuse; online reuse is tested separately.
         monkeypatch.setenv("HF_HUB_OFFLINE", "1")
         backend = LlamaCppBackend()
         repo = "unsloth/vision-GGUF"
@@ -313,9 +311,6 @@ class TestGgufVariantFileResolution:
         ):
             return [_types.SimpleNamespace(path = path, size = 4) for path in paths if path]
 
-        def fail_download(*_args, **_kwargs):
-            raise AssertionError("should reuse the cached GGUF instead of downloading")
-
         with (
             patch(
                 "huggingface_hub.list_repo_files",
@@ -335,7 +330,6 @@ class TestGgufVariantFileResolution:
     def test_download_reuses_cached_gguf_when_lowercase_partial_cache_shadows_it(
         self, monkeypatch, hf_cache
     ):
-        # Keep coverage for case-insensitive offline cache lookup.
         monkeypatch.setenv("HF_HUB_OFFLINE", "1")
         backend = LlamaCppBackend()
         canonical_repo = "unsloth/gemma-4-E2B-it-GGUF"
@@ -373,9 +367,6 @@ class TestGgufVariantFileResolution:
             seen_repos.append(repo_id)
             return str(snap / filename) if repo_id == canonical_repo else None
 
-        def fail_download(*_args, **_kwargs):
-            raise AssertionError("should reuse the cached GGUF instead of downloading")
-
         with (
             patch("huggingface_hub.list_repo_files", fake_list_repo_files),
             patch("huggingface_hub.get_paths_info", fake_get_paths_info),
@@ -391,7 +382,6 @@ class TestGgufVariantFileResolution:
         assert seen_repos
 
     def test_download_online_reuses_complete_cached_snapshot(self, monkeypatch, hf_cache):
-        # Loads reuse complete cached models across repo revisions.
         monkeypatch.delenv("HF_HUB_OFFLINE", raising = False)
         backend = LlamaCppBackend()
         repo = "unsloth/vision-GGUF"
@@ -412,10 +402,7 @@ class TestGgufVariantFileResolution:
         assert out == str(snap / "model-UD-Q4_K_XL.gguf")
 
     def test_download_reuses_older_snapshot_when_offline_env_is_true(self, monkeypatch, hf_cache):
-        # HF_HUB_OFFLINE accepts truthy spellings beyond "1" (true/yes/on); the offline
-        # cache reuse must trigger for those too, otherwise the earlier Hub calls run
-        # offline while this branch still attempts hf_hub_download and the cached GGUF
-        # cannot load.
+        # Truthy HF_HUB_OFFLINE spellings must trigger cache reuse too, or hf_hub_download runs.
         monkeypatch.setenv("HF_HUB_OFFLINE", "true")
         backend = LlamaCppBackend()
         repo = "unsloth/vision-GGUF"
@@ -427,9 +414,6 @@ class TestGgufVariantFileResolution:
             token = None,
         ):
             return [_types.SimpleNamespace(path = p, size = 4) for p in paths if p]
-
-        def fail_download(*_args, **_kwargs):
-            raise AssertionError("should reuse the cached GGUF instead of downloading")
 
         with (
             patch("huggingface_hub.list_repo_files", lambda *_a, **_k: ["model-UD-Q4_K_XL.gguf"]),
@@ -444,16 +428,12 @@ class TestGgufVariantFileResolution:
     def test_download_companion_resolves_from_case_variant_snapshot_offline(
         self, monkeypatch, hf_cache
     ):
-        # Offline, resolve_cached_repo_id_case can keep a partial lower-case spelling,
-        # so the companion (mmproj) must resolve from whichever case-variant snapshot
-        # actually holds it rather than being dropped by an hf_hub_download on the
-        # wrong casing.
+        # Offline casing may keep a partial lowercase dir; mmproj must come from whichever has it.
         monkeypatch.setenv("HF_HUB_OFFLINE", "1")
         backend = LlamaCppBackend()
         canonical_repo = "unsloth/gemma-4-E2B-it-GGUF"
         requested_repo = "unsloth/gemma-4-e2b-it-gguf"
         snap = _build_cache(hf_cache, canonical_repo, {"mmproj-F16.gguf": 4}, snapshot_sha = "a" * 40)
-        # A partial lower-case dir exists so casing resolution keeps the requested spelling.
         _build_cache(hf_cache, requested_repo, {"config.json": 1}, snapshot_sha = "b" * 40)
 
         _offline_exc = type("OfflineModeIsEnabled", (Exception,), {})
@@ -551,10 +531,7 @@ class TestGgufVariantFileResolution:
         assert out == "/fake/org/repo/model-Q4_K_M-00001-of-00002.GGUF"
 
     def test_download_refetches_split_gguf_when_shards_span_snapshots(self, monkeypatch, hf_cache):
-        # The cached main shard lives in an older snapshot; its sibling shard is only
-        # in a newer, separate snapshot. Reusing the main shard alone would leave
-        # llama.cpp unable to resolve the sibling, so the whole set must be re-fetched
-        # together (co-located) rather than served split across snapshot dirs.
+        # Sibling shard only in a newer snapshot: refetch the set so llama.cpp finds it co-located.
         backend = LlamaCppBackend()
         repo = "org/split"
         files = [
@@ -602,11 +579,6 @@ def _siblings(items: dict[str, int]):
     )
 
 
-# ---------------------------------------------------------------------------
-# _iter_hf_cache_snapshots
-# ---------------------------------------------------------------------------
-
-
 class TestIterHfCacheSnapshots:
     def test_returns_empty_when_cache_dir_missing(self, monkeypatch):
         monkeypatch.setattr(hf_constants, "HF_HUB_CACHE", "/no/such/dir")
@@ -616,7 +588,6 @@ class TestIterHfCacheSnapshots:
         assert list(_iter_hf_cache_snapshots("unsloth/not-here")) == []
 
     def test_returns_empty_when_snapshots_dir_missing(self, hf_cache):
-        # Repo dir exists but no snapshots/ inside.
         (hf_cache / "models--unsloth--bare").mkdir()
         assert list(_iter_hf_cache_snapshots("unsloth/bare")) == []
 
@@ -645,14 +616,8 @@ class TestIterHfCacheSnapshots:
 
     def test_repo_id_match_is_case_insensitive(self, hf_cache):
         _build_cache(hf_cache, "unsloth/Foo-GGUF", {"Foo-Q4_K_M.gguf": 1})
-        # Lookup with different org/name casing still resolves
         out = list(_iter_hf_cache_snapshots("UNSLOTH/foo-gguf"))
         assert len(out) == 1
-
-
-# ---------------------------------------------------------------------------
-# _list_gguf_variants_from_hf_cache / list_gguf_variants
-# ---------------------------------------------------------------------------
 
 
 class TestListGgufVariantsFromCache:
@@ -677,8 +642,7 @@ class TestListGgufVariantsFromCache:
 
 class TestCachedColocatedSplitMain:
     def test_prefers_older_complete_snapshot_over_newer_partial(self, hf_cache):
-        # Newer snapshot has only shard 1; older snapshot has the complete set. The
-        # complete older snapshot must win so the split GGUF can load co-located.
+        # The complete older snapshot must win so the split GGUF loads co-located.
         shard1 = "m-00001-of-00002.gguf"
         shard2 = "m-00002-of-00002.gguf"
         old = _build_cache(
@@ -709,8 +673,6 @@ class TestResolveRepoIdCasing:
             "utils.paths.resolve_cached_repo_id_case",
             lambda repo: "unsloth/Gemma-4-GGUF" if repo.lower() == "unsloth/gemma-4-gguf" else repo,
         )
-        # A companion download passed the resolved id reads the same cache entry
-        # as the main GGUF instead of missing it under the requested casing.
         assert _resolve_repo_id_casing("unsloth/gemma-4-gguf") == "unsloth/Gemma-4-GGUF"
 
     def test_passthrough_on_resolver_error(self, monkeypatch):
@@ -721,9 +683,7 @@ class TestResolveRepoIdCasing:
         assert _resolve_repo_id_casing("unsloth/gemma-4-gguf") == "unsloth/gemma-4-gguf"
 
     def test_companion_only_newer_snapshot_does_not_shadow_real_variants(self, hf_cache):
-        # A newer snapshot holds only a vision projector fetched on demand,
-        # while the quant files live in an older snapshot. The newer snapshot
-        # must not shadow the real variants; the vision flag carries over.
+        # A newer mmproj-only snapshot must not shadow older quant variants.
         old = _build_cache(
             hf_cache,
             "unsloth/vision-GGUF",
@@ -746,8 +706,6 @@ class TestResolveRepoIdCasing:
         assert has_vision is True
 
     def test_companion_only_cache_returns_empty_variants_with_vision(self, hf_cache):
-        # Only a vision projector is cached anywhere: report the vision flag
-        # with an empty variant list rather than None.
         _build_cache(hf_cache, "unsloth/vision-GGUF", {"mmproj-vision-F16.gguf": 10})
         out = _list_gguf_variants_from_hf_cache("unsloth/vision-GGUF")
         assert out is not None
@@ -758,6 +716,8 @@ class TestResolveRepoIdCasing:
 
 class TestListGgufVariantsOffline:
     def test_offline_env_short_circuits_api(self, hf_cache, clean_offline_env, monkeypatch):
+        from utils.models.model_config import list_gguf_variants
+
         _build_cache(hf_cache, "unsloth/a", {"a-UD-Q4_K_XL.gguf": 1})
         monkeypatch.setenv("HF_HUB_OFFLINE", "1")
 
@@ -773,6 +733,8 @@ class TestListGgufVariantsOffline:
     def test_offline_cache_miss_does_not_call_api(
         self, hf_cache, clean_offline_env, monkeypatch, offline_variable
     ):
+        from utils.models.model_config import list_gguf_variants
+
         monkeypatch.setenv(offline_variable, "yes")
 
         def boom(*_args, **_kwargs):
@@ -785,10 +747,9 @@ class TestListGgufVariantsOffline:
         assert has_vision is False
 
     def test_api_exception_falls_back_to_cache(self, hf_cache, clean_offline_env):
-        _build_cache(hf_cache, "unsloth/a", {"a-Q4_K_M.gguf": 1})
+        from utils.models.model_config import list_gguf_variants
 
-        def boom(*a, **k):
-            raise OSError("network down")
+        _build_cache(hf_cache, "unsloth/a", {"a-Q4_K_M.gguf": 1})
 
         with patch("huggingface_hub.model_info", boom):
             variants, _has = list_gguf_variants("unsloth/a")
@@ -796,15 +757,14 @@ class TestListGgufVariantsOffline:
         assert variants[0].quant == "Q4_K_M"
 
     def test_api_exception_with_no_cache_reraises(self, hf_cache, clean_offline_env):
-        def boom(*a, **k):
-            raise OSError("network down")
-
+        from utils.models.model_config import list_gguf_variants
         with patch("huggingface_hub.model_info", boom):
             with pytest.raises(OSError, match = "network down"):
                 list_gguf_variants("unsloth/never-cached")
 
     def test_online_path_unaffected(self, hf_cache, clean_offline_env):
-        # When the API succeeds, cache is not consulted.
+        from utils.models.model_config import list_gguf_variants
+
         api_payload = _siblings({"a-UD-Q4_K_XL.gguf": 5, "a-Q2_K.gguf": 3})
 
         def hf_info(*a, **k):
@@ -813,11 +773,6 @@ class TestListGgufVariantsOffline:
         with patch("huggingface_hub.model_info", hf_info):
             variants, _has = list_gguf_variants("unsloth/a")
         assert sorted(v.quant for v in variants) == ["Q2_K", "UD-Q4_K_XL"]
-
-
-# ---------------------------------------------------------------------------
-# _detect_gguf_from_hf_cache / detect_gguf_model_remote
-# ---------------------------------------------------------------------------
 
 
 class TestDetectGgufFromCache:
@@ -892,7 +847,6 @@ class TestDetectGgufModelRemoteOffline:
         def boom(*a, **k):
             raise OSError("hub down")
 
-        # Patch time.sleep so the 1s/2s/4s backoff doesn't slow the test.
         with (
             patch("huggingface_hub.model_info", boom),
             patch("time.sleep", lambda *_: None),
@@ -912,7 +866,6 @@ class TestDetectGgufModelRemoteOffline:
         assert detect_gguf_model_remote("unsloth/a") is None
 
     def test_repository_not_found_does_not_consult_cache(self, hf_cache, clean_offline_env):
-        # Cache has a file but the API says the repo is gone.
         _build_cache(hf_cache, "unsloth/a", {"a-Q4_K_M.gguf": 1})
 
         class RepositoryNotFoundError(Exception):
@@ -923,13 +876,241 @@ class TestDetectGgufModelRemoteOffline:
 
         with patch("huggingface_hub.model_info", gone):
             out = detect_gguf_model_remote("unsloth/a")
-        # Early-return semantics preserved: 404 wins over a stale cache.
         assert out is None
 
 
-# ---------------------------------------------------------------------------
-# _probe_dns_dead / _hf_offline_if_unreachable
-# ---------------------------------------------------------------------------
+class TestSharedHubModelInfo:
+    """Probes share one model-info read per request, scoped not cached, so a 404 beats a stale cache."""
+
+    @pytest.fixture(autouse = True)
+    def hub(self, monkeypatch):
+        """A fake hub whose every response identifies the call that produced it."""
+        monkeypatch.setattr(mc, "_env_offline", lambda: False)
+        state = _types.SimpleNamespace(calls = [], raises = None, siblings = ("model.safetensors",))
+
+        def _fake(repo_id, **kwargs):
+            state.calls.append(
+                (repo_id, kwargs.get("token"), kwargs.get("files_metadata"), kwargs.get("timeout"))
+            )
+            if state.raises is not None:
+                raise state.raises
+            return _types.SimpleNamespace(
+                served_for = (repo_id, kwargs.get("token")),
+                tags = ["sentence-transformers"],
+                pipeline_tag = "feature-extraction",
+                siblings = [
+                    _types.SimpleNamespace(
+                        rfilename = name, size = 7 if kwargs.get("files_metadata") else None
+                    )
+                    for name in state.siblings
+                ],
+            )
+
+        monkeypatch.setitem(
+            sys.modules, "huggingface_hub", _types.SimpleNamespace(model_info = _fake)
+        )
+        return state
+
+    def test_sharing_lasts_exactly_one_scope(self, hub):
+        with shared_hub_model_info():
+            first = _hub_model_info("org/repo", "tok")
+            assert _hub_model_info("org/repo", "tok") is first
+        with shared_hub_model_info():
+            _hub_model_info("org/repo", "tok")
+        _hub_model_info("org/repo", "tok")
+        _hub_model_info("org/repo", "tok")
+
+        assert len(hub.calls) == 4
+
+    def test_the_key_separates_by_repo_and_token(self, hub):
+        with shared_hub_model_info():
+            # ``None`` grants the ambient credential and ``False`` denies every credential.
+            served = {
+                repr(token): _hub_model_info(repo, token).served_for
+                for repo in ("org/one", "org/two")
+                for token in ("alice-token", None, False)
+            }
+
+        assert served[repr(False)] == ("org/two", False)
+        assert len(hub.calls) == 6
+        assert len({(r, t) for r, t, _fm, _to in hub.calls}) == 6
+
+    def test_a_sized_response_answers_a_plain_read(self, hub):
+        with shared_hub_model_info():
+            sized = _hub_model_info("org/repo", "tok", files_metadata = True)
+            assert _hub_model_info("org/repo", "tok") is sized
+
+        assert sized.siblings[0].size == 7
+        assert [fm for _r, _t, fm, _to in hub.calls] == [True]
+
+    def test_an_unscoped_read_asks_only_for_what_it_was_given(self, hub):
+        assert _hub_model_info("org/repo", "tok").siblings[0].size is None
+        assert _hub_model_info("org/repo", "tok", files_metadata = True).siblings[0].size == 7
+        assert [fm for _r, _t, fm, _to in hub.calls] == [False, True]
+
+    def test_failures_and_offline_reads_are_never_shared(self, hub, monkeypatch):
+        hub.raises = ConnectionError("hub down")
+        with shared_hub_model_info():
+            for _ in range(3):
+                with pytest.raises(ConnectionError):
+                    _hub_model_info("org/repo", "tok")
+        assert len(hub.calls) == 3
+
+        hub.raises = None
+        with shared_hub_model_info():
+            _hub_model_info("org/repo", "tok")
+            monkeypatch.setattr(mc, "_env_offline", lambda: True)
+            _hub_model_info("org/repo", "tok")
+
+        assert len(hub.calls) == 5
+
+    def test_the_plain_probes_share_one_read(self, hub, monkeypatch):
+        """The embedding probe also bounds the shared read, so a DNS-dead session fails fast."""
+        hub.siblings = ("adapter_config.json",)
+        monkeypatch.setattr(mc, "hf_env_offline", lambda: False, raising = False)
+        mc._embedding_detection_cache.clear()
+
+        with shared_hub_model_info():
+            assert mc.is_embedding_model("org/repo", hf_token = "tok") is True
+            assert detect_gguf_model_remote("org/repo", hf_token = "tok") is None
+            info = _hub_model_info("org/repo", "tok")
+
+        assert "adapter_config.json" in [s.rfilename for s in info.siblings]
+        assert [to for _r, _t, _fm, to in hub.calls] == [mc._HUB_MODEL_INFO_TIMEOUT]
+
+    def test_every_read_is_bounded(self, hub):
+        """The response is shared, so the first reader decides the bound the rest inherit:
+        an unbounded first read would leave the whole request able to hang."""
+        with shared_hub_model_info():
+            _hub_model_info("org/repo", "tok")
+        _hub_model_info("org/other", "tok")
+        _hub_model_info("org/other", "tok", timeout = 3.0)
+
+        assert [to for _r, _t, _fm, to in hub.calls] == [
+            mc._HUB_MODEL_INFO_TIMEOUT,
+            mc._HUB_MODEL_INFO_TIMEOUT,
+            3.0,
+        ]
+
+    def test_remote_lora_detection_reuses_the_shared_read(self, hub, tmp_path):
+        hub.siblings = ("adapter_config.json",)
+        adapter = tmp_path / "adapter_config.json"
+        adapter.write_text('{"base_model_name_or_path": "org/base"}', encoding = "utf-8")
+        sys.modules["huggingface_hub"].hf_hub_download = lambda *a, **k: str(adapter)
+
+        with shared_hub_model_info():
+            _hub_model_info("org/repo", "tok")
+            cfg = mc.ModelConfig.from_identifier("org/repo", hf_token = "tok")
+
+        # Assert the classification too: the count alone passes without sibling-based detection.
+        assert cfg is not None and cfg.is_lora is True and cfg.base_model == "org/base"
+        assert len(hub.calls) == 1
+
+    def test_variant_listing_shares_its_sized_read(self, hub):
+        """A GGUF listing asks for sizes, and the probes after it read the same response."""
+        from utils.models.model_config import list_gguf_variants
+
+        hub.siblings = ("a-Q4_K_M.gguf",)
+
+        with shared_hub_model_info():
+            variants, _ = list_gguf_variants("org/repo", hf_token = "tok")
+            shared = _hub_model_info("org/repo", "tok")
+
+        assert [v.size_bytes for v in variants] == [7]
+        assert shared.siblings[0].size == 7
+        assert [fm for _r, _t, fm, _to in hub.calls] == [True]
+
+    def test_one_request_entering_does_not_destroy_another_s_scope(self, hub):
+        """Scopes are per request: global state would give A the scope of B, which lacks A's credential."""
+        import threading
+
+        b_is_inside = threading.Event()
+        a_is_finished = threading.Event()
+        a_result: list = []
+        overlapped: list = []
+
+        def _request_a():
+            with shared_hub_model_info():
+                first = _hub_model_info("org/repo", "alice")
+                overlapped.append(b_is_inside.wait(timeout = 30))
+                a_result.append(_hub_model_info("org/repo", "alice") is first)
+                a_is_finished.set()
+
+        def _request_b():
+            with shared_hub_model_info():
+                _hub_model_info("org/repo", "bob")
+                b_is_inside.set()
+                overlapped.append(a_is_finished.wait(timeout = 30))
+
+        threads = [threading.Thread(target = _request_a), threading.Thread(target = _request_b)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout = 60)
+
+        assert [thread.is_alive() for thread in threads] == [False, False]
+        assert overlapped == [True, True]
+        assert a_result == [True]
+        assert sorted((r, t) for r, t, _fm, _to in hub.calls) == [
+            ("org/repo", "alice"),
+            ("org/repo", "bob"),
+        ]
+
+    def test_a_failed_request_leaves_no_scope_behind(self, hub):
+        with pytest.raises(RuntimeError):
+            with shared_hub_model_info():
+                _hub_model_info("org/repo", "tok")
+                raise RuntimeError("a probe blew up mid-request")
+
+        assert mc._hub_model_info_scope.get() is None
+        _hub_model_info("org/repo", "tok")
+        assert len(hub.calls) == 2
+
+    def test_the_config_route_opens_the_shared_read_and_the_pin(self, hub, monkeypatch):
+        """The endpoint is what establishes both request scopes, not the helpers below it."""
+        import utils.utils as uu
+
+        import asyncio
+
+        import routes.models as models_route
+
+        pinned_inside: list = []
+
+        def _embedding(model_name, hf_token = None):
+            pinned_inside.append(uu._hf_reachability_pin.get() is not None)
+            return _hub_model_info(model_name, hf_token).tags == ["sentence-transformers"]
+
+        def _from_identifier(
+            cls,
+            model_name,
+            hf_token = None,
+        ):
+            _hub_model_info(model_name, hf_token)
+            return _types.SimpleNamespace(is_lora = False, base_model = None)
+
+        monkeypatch.setattr(models_route, "is_local_path", lambda _: False)
+        monkeypatch.setattr(models_route, "resolve_cached_repo_id_case", lambda name: name)
+        monkeypatch.setattr(models_route, "load_model_defaults", lambda _: {})
+        monkeypatch.setattr(models_route, "is_vision_model", lambda *a, **k: False)
+        monkeypatch.setattr(models_route, "is_embedding_model", _embedding)
+        monkeypatch.setattr(mc, "detect_audio_type_checked", lambda *a, **k: (None, True))
+        monkeypatch.setattr(
+            models_route.ModelConfig, "from_identifier", classmethod(_from_identifier)
+        )
+        monkeypatch.setattr(models_route, "_get_max_position_embeddings", lambda _: 4096)
+        monkeypatch.setattr(models_route, "_get_model_size_bytes", lambda *a, **k: None)
+
+        result = asyncio.run(
+            models_route.get_model_config(
+                model_name = "org/model",
+                hf_token = None,
+                current_subject = "test-subject",
+            )
+        )
+
+        assert result.is_embedding is True
+        assert len(hub.calls) == 1
+        assert pinned_inside == [True]
 
 
 class _DnsState:
@@ -1023,7 +1204,6 @@ class TestHfOfflineIfUnreachable:
             assert did_set is True
             assert os.environ.get("HF_HUB_OFFLINE") == "1"
             assert os.environ.get("TRANSFORMERS_OFFLINE") == "1"
-        # P1 #2: env must be restored after the block
         assert "HF_HUB_OFFLINE" not in os.environ
         assert "TRANSFORMERS_OFFLINE" not in os.environ
 
@@ -1034,7 +1214,6 @@ class TestHfOfflineIfUnreachable:
             assert "HF_HUB_OFFLINE" not in os.environ
 
     def test_dns_ok_but_endpoint_unreachable_engages(self, dns, reachable, clean_offline_env):
-        # WAN down behind a live router: DNS answers, egress does not.
         dns.ok()
         reachable(True)
         with _hf_offline_if_unreachable() as did_set:
@@ -1050,12 +1229,10 @@ class TestHfOfflineIfUnreachable:
             assert "HF_HUB_OFFLINE" not in os.environ
 
     def test_dns_recovers_between_calls(self, dns, reachable, clean_offline_env):
-        # First call: DNS dead -> env set inside, cleared on exit.
         dns.fail()
         with _hf_offline_if_unreachable():
             pass
         assert "HF_HUB_OFFLINE" not in os.environ
-        # Second call: DNS healthy -> no env mutation.
         dns.ok()
         with _hf_offline_if_unreachable() as did_set:
             assert did_set is False
@@ -1064,13 +1241,11 @@ class TestHfOfflineIfUnreachable:
     def test_user_set_hf_hub_offline_is_preserved(
         self, dns, reachable, clean_offline_env, monkeypatch
     ):
-        # User explicitly set offline before launching Unsloth.
         monkeypatch.setenv("HF_HUB_OFFLINE", "1")
         dns.fail()
         with _hf_offline_if_unreachable() as did_set:
             assert did_set is False
             assert os.environ.get("HF_HUB_OFFLINE") == "1"
-        # Helper must not pop a variable it did not set.
         assert os.environ.get("HF_HUB_OFFLINE") == "1"
 
     def test_user_set_transformers_offline_is_preserved(
@@ -1081,9 +1256,7 @@ class TestHfOfflineIfUnreachable:
         with _hf_offline_if_unreachable():
             assert os.environ.get("HF_HUB_OFFLINE") == "1"
             assert os.environ.get("TRANSFORMERS_OFFLINE") == "1"
-        # HF_HUB_OFFLINE was set by helper -> removed.
         assert "HF_HUB_OFFLINE" not in os.environ
-        # TRANSFORMERS_OFFLINE pre-existed -> preserved.
         assert os.environ.get("TRANSFORMERS_OFFLINE") == "1"
 
     def test_exception_inside_block_still_restores_env(self, dns, reachable, clean_offline_env):
@@ -1091,7 +1264,6 @@ class TestHfOfflineIfUnreachable:
         with pytest.raises(RuntimeError, match = "boom"):
             with _hf_offline_if_unreachable():
                 raise RuntimeError("boom")
-        # Cleanup must happen on exception as well.
         assert "HF_HUB_OFFLINE" not in os.environ
         assert "TRANSFORMERS_OFFLINE" not in os.environ
 
@@ -1198,6 +1370,8 @@ class TestAllProxyIsHonoured:
         monkeypatch.setenv("HF_ENDPOINT", "https://huggingface.co")
 
     def test_all_proxy_alone_resolves(self, monkeypatch):
+        from utils.utils import hf_proxy_for_endpoint
+
         from utils.utils import hf_proxy_configured, hf_proxy_for_endpoint
 
         monkeypatch.setenv("ALL_PROXY", "http://proxy.internal:3128")
@@ -1245,9 +1419,9 @@ class TestAllProxyIsHonoured:
 
     def test_probe_opens_through_all_proxy(self, monkeypatch):
         """The HEAD probe must be issued through the proxy, not attempted directly."""
-        import urllib.request
-
         from utils.transformers_version import hf_endpoint_unreachable
+        import urllib.error
+        import urllib.request
 
         monkeypatch.setenv("ALL_PROXY", "http://proxy.internal:3128")
         seen = {}
@@ -1278,9 +1452,9 @@ class TestAllProxyIsHonoured:
         assert seen["proxies"] == {"https": "http://proxy.internal:3128"}
 
     def test_probe_forces_direct_opener_when_no_proxy_bypasses(self, monkeypatch):
-        import urllib.request
-
         from utils.transformers_version import hf_endpoint_unreachable
+        import urllib.error
+        import urllib.request
 
         monkeypatch.setenv("HF_ENDPOINT", "https://10.23.4.5")
         monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:3128")
@@ -1370,15 +1544,17 @@ class TestSlowLinkIsNotOffline:
         pass
 
     def _probe_raising(self, monkeypatch, exc):
+        from utils.transformers_version import hf_endpoint_unreachable
+        import urllib.error
         import urllib.request
 
         monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: (_ for _ in ()).throw(exc))
-        from utils.transformers_version import hf_endpoint_unreachable
 
         return hf_endpoint_unreachable
 
     def test_timeout_with_tcp_egress_is_reachable(self, monkeypatch):
         import urllib.error
+        import urllib.request
 
         probe = self._probe_raising(monkeypatch, urllib.error.URLError(TimeoutError("slow")))
         monkeypatch.setattr("utils.utils.hf_tcp_reachable", lambda *a, **k: True)
@@ -1386,6 +1562,7 @@ class TestSlowLinkIsNotOffline:
 
     def test_timeout_without_tcp_egress_is_offline(self, monkeypatch):
         import urllib.error
+        import urllib.request
 
         probe = self._probe_raising(monkeypatch, urllib.error.URLError(TimeoutError("dead")))
         monkeypatch.setattr("utils.utils.hf_tcp_reachable", lambda *a, **k: False)
@@ -1417,9 +1594,8 @@ class TestConcurrentGuardsHoldTheirOwnReference:
     def test_second_guard_engages_and_offline_survives_first_exit(
         self, monkeypatch, clean_offline_env
     ):
-        import threading
-
         import core.inference.llama_cpp as lc
+        import threading
 
         monkeypatch.setattr(lc, "_hf_unreachable", lambda: True)
 
@@ -1450,7 +1626,6 @@ class TestConcurrentGuardsHoldTheirOwnReference:
         assert seen.get("engaged") is True, "second guard no-opped instead of taking a reference"
         assert seen.get("offline_after_a_exit") is True
         assert seen.get("env_after_a_exit") == "1"
-        # Both windows closed -> fully restored.
         assert hf_constants.HF_HUB_OFFLINE is False
         assert "HF_HUB_OFFLINE" not in os.environ
 
@@ -1467,9 +1642,8 @@ class TestConcurrentGuardsHoldTheirOwnReference:
         self, monkeypatch, clean_offline_env
     ):
         """A guard that starts just before another sets the env must retain its window."""
-        import threading
-
         import core.inference.llama_cpp as lc
+        import threading
         import utils.utils as uu
 
         monkeypatch.setattr(lc, "_hf_unreachable", lambda: True)
@@ -1493,13 +1667,10 @@ class TestConcurrentGuardsHoldTheirOwnReference:
             return snapshot
 
         def stale_active_read():
-            # Old implementation: depth is read before the owner sets the env.
             return start_owner_after(original_active())
 
         def atomic_state_then_owner_enters():
-            # New implementation: ownership + env are one consistent snapshot. Even if
-            # another owner enters immediately after it, hf_env_offline catches that and
-            # this guard takes a reference instead of treating the env as user-owned.
+            # New: ownership + env are one snapshot, so a racing owner is seen as a reference.
             return start_owner_after(original_state())
 
         monkeypatch.setattr(uu, "force_hf_offline_active", stale_active_read)
@@ -1533,8 +1704,9 @@ class TestSpawnEnvironmentDoesNotInheritScopedOffline:
     def test_explicit_subprocess_environment_uses_pre_guard_values(
         self, monkeypatch, clean_offline_env, tmp_path
     ):
-        from utils.hf_cache_settings import HuggingFaceCachePaths
         from utils.utils import force_hf_offline
+
+        from utils.hf_cache_settings import HuggingFaceCachePaths
 
         paths = HuggingFaceCachePaths(tmp_path, tmp_path / "hub", tmp_path / "xet", "studio")
         with force_hf_offline():
@@ -1571,15 +1743,15 @@ class TestSpawnWindowKeepsTheParentOffline:
 
     def test_env_offline_still_true_inside_the_spawn_window(self, monkeypatch, clean_offline_env):
         from utils.hf_cache_settings import child_environment_for_spawn
+        from utils.utils import force_hf_offline
+
         from utils.transformers_version import _env_offline
         from utils.utils import force_hf_offline, hf_env_offline
 
         with force_hf_offline():
             assert _env_offline() is True and hf_env_offline() is True
             with child_environment_for_spawn({}):
-                # The child must inherit the user's own (online) intent ...
                 assert "HF_HUB_OFFLINE" not in os.environ
-                # ... while the parent's own gates stay closed.
                 assert _env_offline() is True
                 assert hf_env_offline() is True
             assert _env_offline() is True
@@ -1589,10 +1761,10 @@ class TestSpawnWindowKeepsTheParentOffline:
     ):
         """Guard on one thread, spawn window on a second, raw metadata read on a third.
         No request may leave the process."""
-        import threading
-
         from utils.hf_cache_settings import child_environment_for_spawn
         from utils.utils import force_hf_offline
+        import threading
+        import utils.transformers_version as tv
 
         from utils import transformers_version as tv
 
@@ -1644,6 +1816,7 @@ class TestProxyTimeoutIsNotExcused:
         pass
 
     def _probe_timing_out(self, monkeypatch):
+        from utils.transformers_version import hf_endpoint_unreachable
         import urllib.error
         import urllib.request
 
@@ -1652,14 +1825,12 @@ class TestProxyTimeoutIsNotExcused:
             "urlopen",
             lambda *a, **k: (_ for _ in ()).throw(urllib.error.URLError(TimeoutError("slow"))),
         )
-        from utils.transformers_version import hf_endpoint_unreachable
 
         return hf_endpoint_unreachable
 
     def test_timeout_through_a_proxy_stays_unreachable(self, monkeypatch):
         probe = self._probe_timing_out(monkeypatch)
         monkeypatch.setattr("utils.utils.hf_proxy_configured", lambda: True)
-        # Even if the proxy itself accepts TCP, the hub behind it may be blackholed.
         monkeypatch.setattr("utils.utils.hf_tcp_reachable", lambda *a, **k: True)
         assert probe(timeout = 1) is True
 
@@ -1692,18 +1863,18 @@ class TestEndpointNormalisation:
         assert hf_endpoint_url() == "https://huggingface.co"
 
     def test_probe_uses_the_same_normalised_url(self, monkeypatch):
-        seen: list = []
+        from utils.transformers_version import hf_endpoint_unreachable
+        import urllib.error
         import urllib.request
+
+        seen: list = []
 
         def _capture(req, *a, **k):
             seen.append(req.full_url)
             raise urllib.error.URLError("stop")
 
-        import urllib.error
-
         monkeypatch.setenv("HF_ENDPOINT", "   ")
         monkeypatch.setattr(urllib.request, "urlopen", _capture)
-        from utils.transformers_version import hf_endpoint_unreachable
 
         hf_endpoint_unreachable(timeout = 1)
         assert seen and seen[0].startswith("https://huggingface.co"), seen
@@ -1716,16 +1887,15 @@ class TestIpv6Endpoint:
         assert dns_host_dead("::1", timeout = 2.0) is False
 
     def test_unresolvable_host_still_dead(self, monkeypatch):
-        # Mock the resolver rather than trusting the runner's: an ISP or captive
-        # portal that hijacks NXDOMAIN resolves .invalid and would fail this test on
-        # a perfectly good build. Also saves a real 2s lookup per run.
+        # Mock the resolver: NXDOMAIN-hijacking resolvers would resolve .invalid.
+
+        from utils.utils import dns_host_dead
         import socket as _socket
 
         def _nxdomain(*a, **k):
             raise _socket.gaierror(-2, "Name or service not known")
 
         monkeypatch.setattr(_socket, "getaddrinfo", _nxdomain)
-        from utils.utils import dns_host_dead
 
         assert dns_host_dead("no-such-host.invalid", timeout = 2.0) is True
 
@@ -1735,9 +1905,8 @@ class TestCallWithDeadline:
     multiplies any nominal cap by the address count."""
 
     def test_a_stalled_call_raises_rather_than_waiting(self):
-        import time as _time
-
         from utils.utils import call_with_deadline
+        import time as _time
 
         started = _time.monotonic()
         with pytest.raises(TimeoutError):
@@ -1751,24 +1920,21 @@ class TestCallWithDeadline:
     def test_slow_but_finished_work_is_not_cut_off(self):
         """The bound is the deadline given, not a shorter internal one: a first download on
         a slow link must not be killed for being slow."""
-        import time as _time
-
         from utils.utils import call_with_deadline
+        import time as _time
 
         def _slow():
             _time.sleep(1.4)
             return "done"
 
-        # Longer than any plausible internal floor, so a deadline quietly clamped to a
-        # shorter one would cut this off.
         assert call_with_deadline(_slow, 5.0) == "done"
 
     def test_the_caller_s_log_context_follows_the_work(self):
         """Context is per-thread: without the copy, logging inside the call loses the
         request fields it carries when the same code runs inline."""
-        import contextvars
-
         from utils.utils import call_with_deadline
+
+        import contextvars
 
         request_id = contextvars.ContextVar("request_id")
         request_id.set("abc-123")
@@ -1805,7 +1971,7 @@ class TestGuardSkipsLocalPaths:
         called: list = []
         monkeypatch.setattr("utils.utils.hf_unreachable", lambda *a, **k: called.append(1) or True)
         with _hf_offline_if_unreachable_for(str(tmp_path / "model.gguf")) as engaged:
-            assert engaged is None  # nullcontext yields None
+            assert engaged is None
         assert called == [], "probed the hub for a local path"
 
     def test_remote_id_still_guarded(self, monkeypatch, clean_offline_env):
@@ -1824,29 +1990,31 @@ class TestGatewayErrorsAreNotConnectionFailures:
         pass
 
     def _probe_with(self, monkeypatch, exc):
+        from utils.transformers_version import hf_endpoint_unreachable
+        import urllib.error
         import urllib.request
 
         def _urlopen(*a, **k):
             raise exc
 
         monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
-        from utils.transformers_version import hf_endpoint_unreachable
 
         return hf_endpoint_unreachable
 
     @pytest.mark.parametrize("code", [502, 503, 504])
     def test_strict_mode_treats_gateway_error_as_reachable(self, monkeypatch, code):
         import urllib.error
+        import urllib.request
 
         exc = urllib.error.HTTPError("u", code, "err", {}, None)
         probe = self._probe_with(monkeypatch, exc)
         assert probe(timeout = 1, gateway_errors_offline = False) is False
-        # Default (scoped callers) keeps treating a downed hub as offline.
         assert probe(timeout = 1) is True
 
     @pytest.mark.parametrize("code", [401, 403, 404, 429])
     def test_other_http_errors_always_reachable(self, monkeypatch, code):
         import urllib.error
+        import urllib.request
 
         exc = urllib.error.HTTPError("u", code, "err", {}, None)
         probe = self._probe_with(monkeypatch, exc)
@@ -1890,9 +2058,7 @@ class TestHfUnreachableProbe:
 
         seen = {}
 
-        # **_kwargs so the sibling ambiguity flag does not turn this into a TypeError
-        # that the guard's fail-open would swallow. Both flags are asserted by
-        # TestSlowProxyDoesNotForceOffline.
+        # **_kwargs: a TypeError here would be swallowed by the guard's fail-open.
         def _probe(
             timeout,
             *,
@@ -1920,10 +2086,12 @@ class TestHfUnreachableProbe:
 
         calls: list = []
         self._patch_probe(monkeypatch, RuntimeError("boom"), calls)
-        # Fail open: a broken probe must not strand a working install offline.
         assert hf_unreachable() is False
 
     def test_reset_forces_reprobe(self, monkeypatch, clean_offline_env):
+        from utils.utils import hf_unreachable
+        from utils.utils import reset_hf_reachability_cache
+
         from utils.utils import hf_unreachable, reset_hf_reachability_cache
 
         calls: list = []
@@ -1940,10 +2108,9 @@ class TestHfUnreachableProbe:
         assert uu._HF_REACHABILITY_TTL_S <= 10.0
 
     def test_verdict_expires_so_a_disconnect_is_noticed(self, monkeypatch, clean_offline_env):
-        import time as _time
-
-        import utils.utils as uu
         from utils.utils import hf_unreachable
+        import time as _time
+        import utils.utils as uu
 
         monkeypatch.setattr(uu, "_HF_REACHABILITY_TTL_S", 0.2)
         verdict = {"value": False}
@@ -1952,8 +2119,8 @@ class TestHfUnreachableProbe:
             "hf_endpoint_unreachable",
             lambda *a, **k: verdict["value"],
         )
-        assert hf_unreachable() is False  # online during the download
-        verdict["value"] = True  # plug pulled
+        assert hf_unreachable() is False
+        verdict["value"] = True
         _time.sleep(0.3)
         assert hf_unreachable() is True
 
@@ -1973,7 +2140,6 @@ class TestExtractQuantLabelSubdir:
         assert _extract_quant_label("UD-Q4_K_XL/weight.gguf") == "UD-Q4_K_XL"
 
     def test_deeper_nesting_picks_nearest_quant_dir(self):
-        # Multiple matching parents: prefer the innermost (closest to the file).
         assert _extract_quant_label("models/MXFP4_MOE/foo.gguf") == "MXFP4_MOE"
 
 
@@ -1992,16 +2158,12 @@ class TestDownloadMmprojOfflineCacheFallback:
         )
         backend = LlamaCppBackend()
 
-        def boom_list(*a, **k):
-            raise OSError("offline")
-
         def fake_download(
             repo_id,
             filename,
             token = None,
             **kwargs,
         ):
-            # Echo back so the test can verify the cache-resolved filename
             return f"/fake/cache/{repo_id}/{filename}"
 
         with (
@@ -2028,9 +2190,6 @@ class TestDownloadMmprojOfflineCacheFallback:
             },
         )
         backend = LlamaCppBackend()
-
-        def boom_list(*a, **k):
-            raise OSError("offline")
 
         captured = {}
 
@@ -2063,9 +2222,6 @@ class TestDownloadMmprojOfflineCacheFallback:
             {"text-Q4_K_M.gguf": 1},
         )
         backend = LlamaCppBackend()
-
-        def boom_list(*a, **k):
-            raise OSError("offline")
 
         with patch("huggingface_hub.list_repo_files", boom_list):
             out = backend._download_mmproj(
@@ -2157,6 +2313,8 @@ class TestListLocalGgufVariantsSubdir:
         assert Path(out).name == "model-BF16-00001-of-00002.gguf"
 
     def test_lone_split_symlink_uses_colocated_target_shards(self, tmp_path):
+        from utils.models.model_config import _find_local_gguf_by_variant
+
         from utils.models.model_config import _find_local_gguf_by_variant, detect_gguf_model
 
         target_dir = tmp_path / "external" / "BF16"
@@ -2260,9 +2418,6 @@ class TestListGgufVariantsPermanentErrors:
 
         _build_cache(hf_cache, "u/transient-gguf", {"foo-Q4_K_M.gguf": 1})
 
-        def boom(*a, **k):
-            raise OSError("network down")
-
         with patch("huggingface_hub.model_info", boom):
             variants, _ = list_gguf_variants("u/transient-gguf")
         assert any(v.quant == "Q4_K_M" for v in variants)
@@ -2303,6 +2458,7 @@ class TestProbeDnsDeadNoGlobalTimeoutMutation:
 
     def test_default_timeout_unchanged_when_dns_up(self, monkeypatch):
         import socket as _socket
+
         from core.inference.llama_cpp import _probe_dns_dead
 
         prev = _socket.getdefaulttimeout()
@@ -2315,9 +2471,7 @@ class TestProbeDnsDeadNoGlobalTimeoutMutation:
             original_set(value)
 
         monkeypatch.setattr(_socket, "setdefaulttimeout", tracking_set)
-        # The probe resolves with getaddrinfo, not the IPv4-only gethostbyname, so
-        # patching the latter left this test doing a real lookup and never exercising
-        # the "DNS up" branch it is named for.
+        # The probe uses getaddrinfo, not gethostbyname; patch that or the test is vacuous.
         monkeypatch.setattr(
             _socket,
             "getaddrinfo",
@@ -2327,7 +2481,6 @@ class TestProbeDnsDeadNoGlobalTimeoutMutation:
         try:
             _probe_dns_dead("example.invalid", timeout = 0.5)
         finally:
-            # Restore exact state regardless of test-side mutation.
             original_set(prev)
 
         assert set_calls == [], (
@@ -2336,20 +2489,13 @@ class TestProbeDnsDeadNoGlobalTimeoutMutation:
         )
 
     def test_wedged_resolver_is_inconclusive_not_dead(self, monkeypatch):
-        """A missed deadline must not take the offline shortcut.
-
-        Slow-but-working DNS resolves past 2s, and this shortcut skips the fail-open
-        reachability probe, so calling it dead strands a working machine offline for a
-        whole job. A genuinely wedged resolver is still caught downstream, by the HEAD
-        probe hanging on the same lookup.
-        """
+        """A DNS lookup past its deadline is inconclusive, not dead; calling it dead skips the probe."""
         import socket as _socket
+        import threading
+
         from core.inference.llama_cpp import _probe_dns_dead
 
-        # Patch getaddrinfo, which is what the probe calls; patching gethostbyname made
-        # this pass vacuously off the real NXDOMAIN for .invalid.
         def wedged(*a, **k):
-            import threading
             threading.Event().wait()
 
         monkeypatch.setattr(_socket, "getaddrinfo", wedged)
@@ -2357,9 +2503,9 @@ class TestProbeDnsDeadNoGlobalTimeoutMutation:
 
     def test_slow_but_resolving_dns_is_not_dead(self, monkeypatch):
         """The case the deadline used to misread: an answer that arrives after it."""
+        from utils.utils import dns_host_dead
         import socket as _socket
         import time as _time
-        from utils.utils import dns_host_dead
 
         def slow(*a, **k):
             _time.sleep(0.3)
@@ -2370,8 +2516,8 @@ class TestProbeDnsDeadNoGlobalTimeoutMutation:
 
     def test_nxdomain_is_still_dead(self, monkeypatch):
         """The reported bug's shortcut must keep working: a real resolver error."""
-        import socket as _socket
         from utils.utils import dns_host_dead
+        import socket as _socket
 
         def nxdomain(*a, **k):
             raise _socket.gaierror("Name or service not known")
@@ -2487,32 +2633,36 @@ class TestProxyDetectionWithoutRequests:
         monkeypatch.setattr(builtins, "__import__", _fail)
 
     def test_env_proxy_still_found_without_requests(self, monkeypatch):
+        from utils.utils import hf_proxy_for_endpoint
+
         monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:3128")
         self._without_requests(monkeypatch)
-        from utils.utils import hf_proxy_for_endpoint
 
         assert hf_proxy_for_endpoint("https://huggingface.co") == "http://proxy.internal:3128"
 
     def test_all_proxy_still_found_without_requests(self, monkeypatch):
+        from utils.utils import hf_proxy_for_endpoint
+
         monkeypatch.setenv("ALL_PROXY", "http://proxy.internal:3128")
         self._without_requests(monkeypatch)
-        from utils.utils import hf_proxy_for_endpoint
 
         assert hf_proxy_for_endpoint("https://huggingface.co") == "http://proxy.internal:3128"
 
     def test_no_proxy_still_bypasses_without_requests(self, monkeypatch):
+        from utils.utils import hf_proxy_for_endpoint
+
         monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:3128")
         monkeypatch.setenv("NO_PROXY", "huggingface.co")
         self._without_requests(monkeypatch)
-        from utils.utils import hf_proxy_for_endpoint
 
         assert hf_proxy_for_endpoint("https://huggingface.co") is None
 
     def test_dns_shortcut_stands_down_without_requests(self, monkeypatch):
+        from utils.utils import hf_dns_dead
+
         monkeypatch.setenv("ALL_PROXY", "http://proxy.internal:3128")
         monkeypatch.setenv("HF_ENDPOINT", "https://does-not-resolve.invalid")
         self._without_requests(monkeypatch)
-        from utils.utils import hf_dns_dead
 
         assert hf_dns_dead(timeout = 1.0) is False
 
@@ -2535,6 +2685,8 @@ class TestSocksProxyIsNotEgressEvidence:
         assert hf_proxy_usable_by_urllib(None) is True
 
     def test_socks_proxy_reports_reachable(self, monkeypatch):
+        from utils.transformers_version import hf_endpoint_unreachable
+        import urllib.error
         import urllib.request
 
         monkeypatch.setenv("ALL_PROXY", "socks5://127.0.0.1:1080")
@@ -2544,7 +2696,6 @@ class TestSocksProxyIsNotEgressEvidence:
             raise AssertionError("must not attempt urlopen through a socks proxy")
 
         monkeypatch.setattr(urllib.request, "urlopen", _boom)
-        from utils.transformers_version import hf_endpoint_unreachable
 
         assert hf_endpoint_unreachable(1) is False
 
@@ -2559,6 +2710,8 @@ class TestProbeFailsOpenOnNonNetworkErrors:
 
     @pytest.mark.parametrize("exc", [ValueError("bad url"), TypeError("bad port"), MemoryError()])
     def test_non_socket_exception_is_inconclusive(self, monkeypatch, exc):
+        from utils.transformers_version import hf_endpoint_unreachable
+        import urllib.error
         import urllib.request
 
         monkeypatch.setenv("HF_ENDPOINT", "https://huggingface.co")
@@ -2567,13 +2720,13 @@ class TestProbeFailsOpenOnNonNetworkErrors:
             "urlopen",
             lambda *a, **k: (_ for _ in ()).throw(exc),
         )
-        from utils.transformers_version import hf_endpoint_unreachable
 
         assert hf_endpoint_unreachable(1) is False
 
     def test_client_side_urlerror_is_inconclusive(self, monkeypatch):
         """urllib reports client-side problems as URLError with a plain string reason
         ("no host given", "unknown url type"). That is not an answer about egress."""
+        from utils.transformers_version import hf_endpoint_unreachable
         import urllib.error
         import urllib.request
 
@@ -2583,14 +2736,15 @@ class TestProbeFailsOpenOnNonNetworkErrors:
             "urlopen",
             lambda *a, **k: (_ for _ in ()).throw(urllib.error.URLError("no host given")),
         )
-        from utils.transformers_version import hf_endpoint_unreachable
 
         assert hf_endpoint_unreachable(1) is False
 
     def test_socket_reason_urlerror_is_still_offline(self, monkeypatch):
-        import socket
+        from utils.transformers_version import hf_endpoint_unreachable
         import urllib.error
         import urllib.request
+
+        import socket
 
         monkeypatch.setenv("HF_ENDPOINT", "https://huggingface.co")
         monkeypatch.setattr(
@@ -2600,11 +2754,12 @@ class TestProbeFailsOpenOnNonNetworkErrors:
                 urllib.error.URLError(socket.gaierror(-2, "Name or service not known"))
             ),
         )
-        from utils.transformers_version import hf_endpoint_unreachable
 
         assert hf_endpoint_unreachable(1) is True
 
     def test_socket_error_is_still_offline(self, monkeypatch):
+        from utils.transformers_version import hf_endpoint_unreachable
+        import urllib.error
         import urllib.request
 
         monkeypatch.setenv("HF_ENDPOINT", "https://huggingface.co")
@@ -2613,7 +2768,6 @@ class TestProbeFailsOpenOnNonNetworkErrors:
             "urlopen",
             lambda *a, **k: (_ for _ in ()).throw(OSError("network unreachable")),
         )
-        from utils.transformers_version import hf_endpoint_unreachable
 
         assert hf_endpoint_unreachable(1) is True
 
@@ -2629,6 +2783,7 @@ class TestExplicitBaseEnvIsAlsoScrubbed:
 
     def test_explicit_base_loses_scoped_offline(self, monkeypatch, tmp_path):
         from utils.utils import force_hf_offline
+
         from utils.hf_cache_settings import get_hf_cache_paths
         from utils.native_path_leases import child_env_without_native_path_secret
 
@@ -2643,6 +2798,7 @@ class TestExplicitBaseEnvIsAlsoScrubbed:
 
     def test_user_set_offline_still_reaches_the_child(self, monkeypatch):
         from utils.utils import force_hf_offline
+
         from utils.hf_cache_settings import get_hf_cache_paths
 
         monkeypatch.setenv("HF_HUB_OFFLINE", "1")
@@ -2659,26 +2815,18 @@ class TestHttpsProxyDefaultPort:
         pass
 
     def test_https_proxy_defaults_to_443(self, monkeypatch):
-        monkeypatch.setenv("HTTPS_PROXY", "https://proxy.internal")
         from utils.utils import hf_connect_target
+        monkeypatch.setenv("HTTPS_PROXY", "https://proxy.internal")
         assert list(hf_connect_target("https://huggingface.co")) == ["proxy.internal", 443]
 
     def test_http_proxy_defaults_to_80(self, monkeypatch):
-        monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal")
         from utils.utils import hf_connect_target
+        monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal")
         assert list(hf_connect_target("https://huggingface.co")) == ["proxy.internal", 80]
 
 
 class TestMetadataReadsUseTheHubProxy:
-    """The reachability probe and the metadata reads must agree about egress.
-
-    urllib's default opener ignores ALL_PROXY: ``getproxies`` reports it under an ``all``
-    key, but ``ProxyHandler`` only ever dispatches ``<scheme>_open``. huggingface_hub 0.36
-    is built on requests, which does honour it. So on a proxy-only machine the probe
-    reported "online" through the proxy while every raw config.json / tokenizer_config.json
-    / adapter_config.json read went direct and silently failed, dropping the sidecar tier
-    decision back to name matching. Served by a real loopback proxy, not a mock.
-    """
+    """Probe and metadata reads must use one egress path: urllib ignores ALL_PROXY; requests uses it."""
 
     @pytest.fixture(autouse = True)
     def _no_ambient_proxy(self, clean_proxy_env, clean_offline_env):
@@ -2711,7 +2859,6 @@ class TestMetadataReadsUseTheHubProxy:
 
         srv = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
         _threading.Thread(target = srv.serve_forever, daemon = True).start()
-        # Proxy-only egress: the hub name never resolves locally (.invalid, RFC 2606).
         monkeypatch.setenv("HF_ENDPOINT", "http://hub.invalid")
         monkeypatch.setenv("ALL_PROXY", f"http://127.0.0.1:{srv.server_address[1]}")
         monkeypatch.setenv("HF_HOME", str(tmp_path))
@@ -2721,18 +2868,18 @@ class TestMetadataReadsUseTheHubProxy:
             srv.shutdown()
 
     def _clear_caches(self, monkeypatch):
+        import urllib.error
         import urllib.request
-
         import utils.transformers_version as tv
 
         monkeypatch.setattr(tv, "_config_json_cache", {})
         monkeypatch.setattr(tv, "_tokenizer_class_cache", {})
-        # urlopen builds its default opener once per process and caches it in _opener, so
-        # an earlier test's proxy env would otherwise decide this one's routing.
+        # urlopen caches its opener in _opener; reset so an earlier test's proxy env is not reused.
         monkeypatch.setattr(urllib.request, "_opener", None)
 
     def test_all_proxy_is_ignored_by_the_default_opener(self, monkeypatch):
         """Guards the premise: urllib alone would never use this proxy."""
+        import urllib.error
         import urllib.request
 
         monkeypatch.setenv("ALL_PROXY", "http://127.0.0.1:3128")
@@ -2818,12 +2965,7 @@ class TestMetadataReadsUseTheHubProxy:
 
 
 class TestSlowProxyDoesNotForceOffline:
-    """A functional-but-slow proxy is ambiguous, so the shared guard must fail open.
-
-    Otherwise an uncached load through a corporate proxy whose HEAD exceeds the probe
-    timeout is turned cache-only, and the hub client's longer request never runs. The
-    worker already passes proxy_timeouts_offline=False; the route guard must agree.
-    """
+    """A slow but working proxy must fail open, or an uncached load is forced cache-only."""
 
     @pytest.fixture(autouse = True)
     def _fresh(self, monkeypatch):
@@ -2835,22 +2977,23 @@ class TestSlowProxyDoesNotForceOffline:
         reset_hf_reachability_cache()
 
     def test_shared_guard_passes_both_ambiguity_flags_off(self, monkeypatch):
+        from utils.utils import hf_unreachable
+        import utils.transformers_version as tv
+
         seen = {}
 
         def _probe(timeout, **kwargs):
             seen.update(kwargs)
             return False
 
-        import utils.transformers_version as tv
-
         monkeypatch.setattr(tv, "hf_endpoint_unreachable", _probe)
-        from utils.utils import hf_unreachable
 
         assert hf_unreachable(timeout = 1) is False
         assert seen == {"gateway_errors_offline": False, "proxy_timeouts_offline": False}
 
     def test_slow_proxy_reads_reachable_not_offline(self, monkeypatch):
         """End to end through the real classifier: a clean timeout behind a proxy."""
+        from utils.utils import hf_unreachable
         import utils.transformers_version as tv
 
         monkeypatch.setenv("HF_ENDPOINT", "https://hub.example.test")
@@ -2866,27 +3009,19 @@ class TestSlowProxyDoesNotForceOffline:
                 raise TimeoutError("proxy is up, upstream is slow")
 
         monkeypatch.setattr(tv, "_hf_proxy_opener", lambda _url: _SlowOpener())
-        # Sanity: the same input IS offline with the flag on, so the flag is what moves it.
         assert tv.hf_endpoint_unreachable(1, proxy_timeouts_offline = True) is True
-
-        from utils.utils import hf_unreachable
 
         assert hf_unreachable(timeout = 1) is False
 
 
 class TestValidateGuardCoversMetadataPreflights:
-    """/validate resolves the config under the guard, then runs more remote reads.
-
-    Those preflights (upgrade check, trust-remote-code, sizing, training guard) each
-    fetch raw metadata, so leaving them outside the window just moves the stall.
-    """
+    """Every remote preflight on /validate must sit inside the offline guard window, or the stall moves."""
 
     def test_every_remote_preflight_on_validate_is_wrapped(self):
         """AST check: no bare await asyncio.to_thread(<remote preflight>, ...) remains."""
         import ast
         import pathlib
 
-        # Anchored on __file__: CI runs pytest from the repo root, not studio/backend.
         backend_root = pathlib.Path(__file__).resolve().parent.parent
         src = (backend_root / "routes" / "inference.py").read_text(encoding = "utf-8")
         tree = ast.parse(src)
@@ -2929,7 +3064,6 @@ class TestGuardIsKeyedOnWhatIsRead:
             n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_any_remote"
         )
         ns: dict = {}
-        # is_local_path is imported inside the body; give it a stub module to import from.
         exec(compile(ast.Module([fn], []), "<any_remote>", "exec"), ns)
         import sys
         import types
@@ -2946,12 +3080,11 @@ class TestGuardIsKeyedOnWhatIsRead:
             assert any_remote(("/local/a", "/local/b")) is False
             assert any_remote(None) is False
             assert any_remote(()) is False
-            # A falsy entry means there is no base to read, not an unknown one: a local
-            # model whose config carries base_model=None must not pay the probe.
+            # A falsy base means no base, so a local model must not pay the probe.
             assert any_remote((None,)) is False
             assert any_remote(("/local/adapter", None)) is False
             assert any_remote(("/local/adapter", "", "org/base")) is True
-            assert any_remote((123,)) is True  # unresolvable: guard anyway
+            assert any_remote((123,)) is True
         finally:
             if saved is None:
                 del sys.modules["utils.paths"]
@@ -2979,7 +3112,6 @@ class TestGuardIsKeyedOnWhatIsRead:
                 continue
             targets, read = node.args[1], node.args[2]
             read_name = getattr(read, "id", None) or getattr(read, "attr", None)
-            # A read of the resolved config must not be keyed on model_identifier alone.
             if read_name in ("latest_tier_active_for", "_guard_chat_load_against_training"):
                 if isinstance(targets, ast.Name):
                     bad.append((read_name, node.lineno))
@@ -3008,7 +3140,6 @@ class TestTransformersOfflineDoesNotSilenceDatasets:
 
     def test_env_requested_offline_does_not_set_network_offline(self):
         block = self._worker_block()
-        # hf_env_offline() feeds _offline only; the two probes feed _network_offline too.
         assert "_offline = hf_env_offline()" in block
         assert "_offline = _network_offline = hf_dns_dead()" in block
         assert "_offline = _network_offline = hf_endpoint_unreachable(" in block
@@ -3026,6 +3157,7 @@ class TestModelConfigPredicateHonoursTheWindow:
     is back to the user's values, so an env-only predicate would fire that 15s request."""
 
     def test_predicate_is_true_inside_the_spawn_window(self, monkeypatch):
+        from utils.utils import force_hf_offline
         import threading
 
         from utils.models.model_config import _env_offline
@@ -3054,17 +3186,17 @@ class TestModelConfigPredicateHonoursTheWindow:
             t.join(5)
             assert _env_offline() is True
 
-        assert seen["env_during"] is None  # the user's value really was restored
-        assert seen["predicate_during"] is True  # but the predicate still reads offline
-        assert _env_offline() is False  # and it lets go afterwards
+        assert seen["env_during"] is None
+        assert seen["predicate_during"] is True
+        assert _env_offline() is False
 
     def test_raw_fetch_is_skipped_during_the_window(self, monkeypatch, tmp_path):
         """The stall this prevents: _detect_audio_from_tokenizer's own requests.get is the
         call the gate protects, so drive that function rather than a caller that could
         return earlier for unrelated reasons."""
+        from utils.utils import force_hf_offline
         import threading
 
-        import utils.models.model_config as mc
         from utils.utils import force_hf_offline, hf_environment_restored_for_spawn
 
         for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
@@ -3081,7 +3213,6 @@ class TestModelConfigPredicateHonoursTheWindow:
 
         monkeypatch.setitem(sys.modules, "requests", _FakeRequests)
 
-        # Control: outside any window the gate is open and the fetch is attempted.
         mc._detect_audio_from_tokenizer("org/some-audio-model", None, local_files_only = False)
         assert calls, "the raw fetch is not reached at all, so the gate is untested"
         calls.clear()
@@ -3114,7 +3245,6 @@ class TestLocalModelWithRemoteBaseIsGuarded:
     base can still be a hub repo, and resolving the config dereferences that base."""
 
     def test_helper_engages_for_a_remote_target(self, monkeypatch):
-        import utils.models.model_config as mc
         import core.inference.llama_cpp as llama_cpp
 
         opened = []
@@ -3133,8 +3263,6 @@ class TestLocalModelWithRemoteBaseIsGuarded:
         """Worker contexts may not be able to import the route-side guard."""
         import builtins
 
-        import utils.models.model_config as mc
-
         real_import = builtins.__import__
 
         def _boom(name, *a, **k):
@@ -3144,7 +3272,7 @@ class TestLocalModelWithRemoteBaseIsGuarded:
 
         monkeypatch.setattr(builtins, "__import__", _boom)
         with mc._offline_while_reading("org/base"):
-            pass  # must not raise
+            pass
 
     def test_local_lora_base_lookup_runs_inside_the_window(self):
         """AST check: the base-derived vision/audio probes sit under the guard."""
@@ -3202,8 +3330,6 @@ class TestLocalModelWithRemoteBaseIsGuarded:
                 isinstance(node, ast.Call) and getattr(node.func, "id", None) == "is_vision_model"
             ):
                 continue
-            # Only calls on a name that came from resolved metadata, not on the identifier
-            # the caller already guarded.
             arg = node.args[0] if node.args else None
             if (
                 getattr(arg, "id", None) in ("base", "check_model")
@@ -3280,7 +3406,6 @@ class TestLocalGgufWithoutABaseSkipsTheProbe:
                 arg = ctx.args[0] if ctx.args else None
                 if getattr(arg, "id", None) != "base":
                     continue
-                # The base variant must sit under an `if base:` truthiness check.
                 guarded_by_if = any(
                     isinstance(anc, ast.If)
                     and getattr(anc.test, "id", None) == "base"
@@ -3333,7 +3458,6 @@ class TestLocalLoraRemoteBaseIsInTheGuardTargets:
                     names.append(getattr(el.func, "id", "?"))
                 else:
                     names.append(getattr(el, "id", "?"))
-            # A tuple keyed on the resolved config must also carry its base.
             if "config.identifier" in names:
                 checked += 1
                 if not any(n == "getattr" for n in names):
@@ -3377,7 +3501,6 @@ class TestHungProbeHonoursFailOpenBehindAProxy:
 
     def test_it_stays_bounded(self, monkeypatch, clean_proxy_env):
         import time as _time
-
         import utils.transformers_version as tv
 
         monkeypatch.setenv("HF_ENDPOINT", "https://hub.example.test")
@@ -3403,11 +3526,11 @@ class TestGuardsShareOneDnsLookup:
         """The case that accumulates: DNS answers past its deadline, so the shortcut is
         inconclusive and the probe decides. That probe memoises, so the siblings reuse it."""
         from core.inference.llama_cpp import _hf_unreachable
+        import utils.transformers_version as tv
 
         dns = []
         probe = []
         monkeypatch.setattr("utils.utils.hf_dns_dead", lambda *a, **k: (dns.append(1), False)[1])
-        import utils.transformers_version as tv
 
         monkeypatch.setattr(
             tv, "hf_endpoint_unreachable", lambda *a, **k: (probe.append(1), True)[1]
@@ -3421,11 +3544,11 @@ class TestGuardsShareOneDnsLookup:
 
     def test_a_reachable_verdict_is_reused_too(self, monkeypatch, clean_offline_env):
         from core.inference.llama_cpp import _hf_unreachable
+        import utils.transformers_version as tv
 
         dns = []
         probe = []
         monkeypatch.setattr("utils.utils.hf_dns_dead", lambda *a, **k: (dns.append(1), False)[1])
-        import utils.transformers_version as tv
 
         monkeypatch.setattr(
             tv, "hf_endpoint_unreachable", lambda *a, **k: (probe.append(1), False)[1]
@@ -3441,13 +3564,180 @@ class TestGuardsShareOneDnsLookup:
     ):
         """A dead lookup fails fast, so caching it would only delay recovery by the TTL."""
         from core.inference.llama_cpp import _hf_unreachable
+        import utils.transformers_version as tv
 
         state = {"dead": True}
         monkeypatch.setattr("utils.utils.hf_dns_dead", lambda *a, **k: state["dead"])
-        import utils.transformers_version as tv
 
         monkeypatch.setattr(tv, "hf_endpoint_unreachable", lambda *a, **k: False)
 
         assert _hf_unreachable() is True
         state["dead"] = False
-        assert _hf_unreachable() is False  # no waiting out the TTL
+        assert _hf_unreachable() is False
+
+
+class TestPinnedReachability:
+    """One request gets one reachability verdict: a wall-clock memo TTL can flip it mid-request."""
+
+    @pytest.fixture
+    def probe(self, monkeypatch, clean_offline_env):
+        """A reachability probe whose verdict is settable and whose calls are counted."""
+        import utils.transformers_version as tv
+        import utils.utils as uu
+
+        state = _types.SimpleNamespace(calls = 0, verdict = False)
+
+        def _probe(*_a, **_k):
+            state.calls += 1
+            return state.verdict
+
+        monkeypatch.setattr(tv, "hf_endpoint_unreachable", _probe)
+        monkeypatch.setattr(uu, "_HF_REACHABILITY_TTL_S", 0.0)
+        uu.reset_hf_reachability_cache()
+        return state
+
+    def test_the_opt_out_leaves_the_pin_open(self, probe, monkeypatch):
+        """Disabling the probe declines to answer rather than finding the hub reachable,
+        so it is not this request's verdict and the pin stays empty for one that is."""
+        import utils.utils as uu
+
+        monkeypatch.setenv("UNSLOTH_OFFLINE_PROBE", "0")
+        with uu.pinned_hf_reachability():
+            assert uu.hf_unreachable() is False
+            assert uu.hf_reachability_memo() is None
+        assert probe.calls == 0
+
+    def test_the_opt_out_leaves_the_dns_shortcut_to_every_guard(self, probe, monkeypatch):
+        """UNSLOTH_OFFLINE_PROBE turns off the TCP probe, not DNS, so the shortcut is the
+        only detector left and the pin must not answer for it. A link that drops after the
+        guard admitting the request has to be seen by the guards that follow."""
+        from core.inference.llama_cpp import _hf_unreachable
+        import utils.utils as uu
+
+        monkeypatch.setenv("UNSLOTH_OFFLINE_PROBE", "0")
+        lookups = []
+
+        def _dns_dead(*_a, **_k):
+            lookups.append(1)
+            return len(lookups) > 1
+
+        monkeypatch.setattr(uu, "hf_dns_dead", _dns_dead)
+        with uu.pinned_hf_reachability():
+            verdicts = [_hf_unreachable() for _ in range(3)]
+
+        assert verdicts == [False, True, True]
+        assert probe.calls == 0
+
+    @pytest.mark.parametrize("verdict", [False, True])
+    def test_the_verdict_survives_the_memo_expiring_mid_request(self, probe, verdict):
+        import utils.utils as uu
+
+        probe.verdict = verdict
+        with uu.pinned_hf_reachability():
+            assert uu.hf_unreachable() is verdict
+            assert uu.hf_unreachable() is verdict
+            assert uu.hf_reachability_memo() is verdict
+
+        assert probe.calls == 1
+
+    def test_a_memoised_verdict_fills_the_pin_too(self, probe, monkeypatch):
+        """The realistic entry state: the memo is warm when the request opens its first
+        guard, so nothing probes, and the pin would stay empty and let a later guard probe."""
+        import utils.utils as uu
+
+        monkeypatch.setattr(uu, "_HF_REACHABILITY_TTL_S", 60.0)
+        assert uu.hf_unreachable() is False
+        assert probe.calls == 1
+
+        with uu.pinned_hf_reachability():
+            assert uu.hf_unreachable() is False
+            monkeypatch.setattr(uu, "_HF_REACHABILITY_TTL_S", 0.0)
+            probe.verdict = True
+            assert uu.hf_unreachable() is False
+
+        assert probe.calls == 1
+
+    def test_the_guard_the_route_opens_reads_the_pinned_verdict(self, probe, monkeypatch):
+        """The wrapper the handler actually goes through, not only ``hf_unreachable``: it
+        answers from the memo directly, so that path has to pin like every other."""
+        import utils.utils as uu
+
+        import core.inference.llama_cpp as llama_cpp
+
+        monkeypatch.setattr(uu, "_HF_REACHABILITY_TTL_S", 60.0)
+        monkeypatch.setattr(uu, "hf_dns_dead", lambda *_a, **_k: False, raising = False)
+        assert uu.hf_unreachable() is False
+        assert probe.calls == 1
+
+        with uu.pinned_hf_reachability():
+            assert llama_cpp._hf_unreachable() is False
+            monkeypatch.setattr(uu, "_HF_REACHABILITY_TTL_S", 0.0)
+            probe.verdict = True
+            assert llama_cpp._hf_unreachable() is False
+
+        assert probe.calls == 1
+
+    def test_a_later_request_probes_again(self, probe):
+        import utils.utils as uu
+
+        with uu.pinned_hf_reachability():
+            assert uu.hf_unreachable() is False
+        probe.verdict = True
+        with uu.pinned_hf_reachability():
+            assert uu.hf_unreachable() is True
+
+        assert probe.calls == 2
+
+    def test_nothing_is_pinned_until_something_probes(self, probe):
+        import utils.utils as uu
+        with uu.pinned_hf_reachability():
+            assert uu.hf_reachability_memo() is None
+
+        assert probe.calls == 0
+
+    def test_one_request_pinning_does_not_take_over_another_s(self, monkeypatch, probe):
+        """Pins are per request: global state would let one request's pin hand another its verdict."""
+        import threading
+        import utils.transformers_version as tv
+        import utils.utils as uu
+
+        verdicts = [False, True]
+        guard = threading.Lock()
+
+        def _probe(*_a, **_k):
+            with guard:
+                return verdicts.pop(0)
+
+        monkeypatch.setattr(tv, "hf_endpoint_unreachable", _probe)
+
+        a_probed = threading.Event()
+        b_pinned = threading.Event()
+        a_done = threading.Event()
+        seen: dict = {}
+        waited: list = []
+
+        def _request_a():
+            with uu.pinned_hf_reachability():
+                seen["a"] = uu.hf_unreachable()
+                a_probed.set()
+                waited.append(b_pinned.wait(timeout = 30))
+                seen["a_again"] = uu.hf_unreachable()
+                a_done.set()
+
+        def _request_b():
+            waited.append(a_probed.wait(timeout = 30))
+            with uu.pinned_hf_reachability():
+                seen["b"] = uu.hf_unreachable()
+                b_pinned.set()
+                waited.append(a_done.wait(timeout = 30))
+
+        threads = [threading.Thread(target = _request_a), threading.Thread(target = _request_b)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout = 60)
+
+        assert [thread.is_alive() for thread in threads] == [False, False]
+        assert waited == [True, True, True]
+        assert seen["a"] is False and seen["a_again"] is False
+        assert seen["b"] is True

@@ -8,13 +8,14 @@ import re
 from pathlib import Path
 from typing import Any
 
+from utils.paths.lazy import LazyPath
 from utils.paths import ensure_dir, unstructured_seed_cache_root
 
 DEFAULT_CHUNK_SIZE = 1200
 DEFAULT_CHUNK_OVERLAP = 200
 MAX_CHUNK_SIZE = 20000
 _MIN_BREAK_RATIO = 0.6
-_CACHE_DIR = unstructured_seed_cache_root()
+_CACHE_DIR = LazyPath(unstructured_seed_cache_root)
 
 _PANDAS = None
 
@@ -68,6 +69,22 @@ def build_multi_file_preview_rows(
     chunk_size: int | None,
     chunk_overlap: int | None,
 ) -> list[dict[str, str]]:
+    return build_multi_file_preview(
+        file_entries = file_entries,
+        preview_size = preview_size,
+        chunk_size = chunk_size,
+        chunk_overlap = chunk_overlap,
+    )[0]
+
+
+def build_multi_file_preview(
+    *,
+    file_entries: list[tuple[Path, str]],
+    preview_size: int,
+    chunk_size: int | None,
+    chunk_overlap: int | None,
+) -> tuple[list[dict[str, str]], int]:
+    """Preview rows plus the total chunk count, from one materialization."""
     cs = _to_int(chunk_size, DEFAULT_CHUNK_SIZE)
     co = _to_int(chunk_overlap, DEFAULT_CHUNK_OVERLAP)
     _, rows = materialize_multi_file_unstructured_seed(
@@ -75,7 +92,7 @@ def build_multi_file_preview_rows(
         chunk_size = cs,
         chunk_overlap = co,
     )
-    return _round_robin_preview(rows, preview_size)
+    return _round_robin_preview(rows, preview_size), len(rows)
 
 
 def _round_robin_preview(rows: list[dict[str, str]], preview_size: int) -> list[dict[str, str]]:

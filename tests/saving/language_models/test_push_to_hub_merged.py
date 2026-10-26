@@ -1,5 +1,4 @@
-# tests/saving scripts run their whole body at import, so plain pytest
-# collection would download checkpoints and train. Skip unless opted in.
+# tests/saving scripts run their whole body at import, so skip collection unless opted in.
 import sys as _sys
 from pathlib import Path as _Path
 
@@ -163,7 +162,6 @@ success = {
     "download": False,
 }
 
-# Stage 1: Upload model to Hub.
 try:
     print("\n" + "=" * 80)
     print("=== UPLOADING MODEL TO HUB ===".center(80))
@@ -176,7 +174,6 @@ except Exception as e:
     raise Exception("Model upload failed.")
 
 t
-# Stage 2: Test downloading the model.
 safe_remove_directory(f"./{hf_username}")
 
 try:
@@ -190,7 +187,6 @@ except Exception as e:
     print(f"❌ Download failed: {e}")
     raise Exception("Model download failed.")
 
-# Final report.
 print("\n" + "=" * 80)
 print("=== VALIDATION REPORT ===".center(80))
 print("=" * 80 + "\n")
@@ -204,6 +200,5 @@ if all(success.values()):
 else:
     raise Exception("Validation failed for one or more stages.")
 
-# final cleanup.
 safe_remove_directory("./outputs")
 safe_remove_directory("./unsloth_compiled_cache")

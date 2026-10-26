@@ -1,16 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""Tests for LlamaCppBackend._wait_for_health resilience.
-
-The probe loop must swallow transient httpx errors and fall through to the
-subprocess.poll() branch so a crashed llama-server surfaces a structured
-"exited with code X" log instead of bubbling an opaque exception up to the
-/api/inference/load route.
-"""
+"""_wait_for_health swallows transient httpx errors so a crashed llama-server logs its exit code."""
 
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 import threading
 import time
@@ -24,7 +20,6 @@ _BACKEND_DIR = str(Path(__file__).resolve().parent.parent)
 if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
 
-# Mirror sibling tests' stubbing so the module imports without fastapi.
 _loggers_stub = _types.ModuleType("loggers")
 _loggers_stub.get_logger = lambda name: __import__("logging").getLogger(name)
 sys.modules.setdefault("loggers", _loggers_stub)
@@ -33,11 +28,11 @@ sys.modules.setdefault("structlog", _types.ModuleType("structlog"))
 import httpx  # noqa: E402
 
 from core.inference.llama_cpp import LlamaCppBackend  # noqa: E402
+from core.inference.llama_cpp import GgufLoadIntent
 
-# Sibling tests install lightweight httpx stubs, so when collected together our `httpx`
-# may be a stub lacking `get`. Fill in the gaps so collection order does not matter.
+# Sibling tests may install an httpx stub lacking get; fill gaps so order does not matter.
 if not hasattr(httpx, "get"):
-    httpx.get = None  # placeholder; every test below monkeypatches it
+    httpx.get = None
 for _exc_name in (
     "ConnectError",
     "TimeoutException",
@@ -75,6 +70,310 @@ class TestWaitForHealthResilience:
         monkeypatch.setattr(httpx, "get", lambda *a, **kw: mock.Mock(status_code = 503))
         assert b._wait_for_health(timeout = 0.02, interval = 0.01) is False
         assert any("health check timed out" in ln for ln in b._stdout_lines)
+
+    def test_a_teardown_during_the_wait_is_a_failed_load_not_a_crash(self, monkeypatch):
+        """Shutdown clears the reference mid-wait; reading it once and treating
+        its absence as "gone" is what stops the AttributeError the user saw as
+        "Error loading model: 'NoneType' object has no attribute 'poll'" (#10353)."""
+        b = _make_backend()
+        b._process.poll.return_value = None
+        probes = []
+
+        def probe(*a, **kw):
+            probes.append(1)
+            if len(probes) == 2:
+                b._process = None
+            return mock.Mock(status_code = 503)
+
+        monkeypatch.setattr(httpx, "get", probe)
+        assert b._wait_for_health(timeout = 30.0, interval = 0.01) is False
+        assert len(probes) == 2
+        assert not any("health check timed out" in ln for ln in b._stdout_lines)
+        assert b._health_wait_cancelled is True
+
+    def test_a_teardown_before_the_first_probe_is_still_not_a_crash(self, monkeypatch):
+        b = _make_backend()
+        b._process = None
+        monkeypatch.setattr(httpx, "get", lambda *a, **kw: mock.Mock(status_code = 200))
+        assert b._wait_for_health(timeout = 30.0, interval = 0.01) is False
+        assert b._health_wait_cancelled is True
+
+    def test_a_teardown_is_terminal_so_the_caller_reads_no_exit_code(self, monkeypatch):
+        """False alone is not enough: _spawn_and_wait stops only on this flag, else
+        it reads the cleared reference and raises one frame up, and respawns."""
+        b = _make_backend()
+        b._process = None
+        monkeypatch.setattr(httpx, "get", lambda *a, **kw: mock.Mock(status_code = 503))
+        assert b._wait_for_health(timeout = 30.0, interval = 0.01) is False
+        assert b._health_wait_cancelled is True
+        assert (
+            b._process is not None and b._process.poll() is not None and b._process.returncode != 0
+        ) is False
+
+    def test_a_crash_leaves_the_wait_unmarked_so_the_retries_still_run(self, monkeypatch):
+        """The other side: a real crash must NOT look terminal, or the --fit off
+        and CPU fallbacks stop recovering loads that used to recover."""
+        b = _make_backend()
+        b._process.poll.return_value = 1
+        b._process.returncode = 1
+        monkeypatch.setattr(httpx, "get", lambda *a, **kw: mock.Mock(status_code = 503))
+        assert b._wait_for_health(timeout = 1.0, interval = 0.01) is False
+        assert b._health_wait_cancelled is False
+
+    def test_a_teardown_marker_does_not_leak_into_the_next_load(self, monkeypatch):
+        b = _make_backend()
+        b._process = None
+        monkeypatch.setattr(httpx, "get", lambda *a, **kw: mock.Mock(status_code = 200))
+        assert b._wait_for_health(timeout = 30.0, interval = 0.01) is False
+        assert b._health_wait_cancelled is True
+        b._process = mock.Mock()
+        b._process.poll.return_value = None
+        assert b._wait_for_health(timeout = 30.0, interval = 0.01) is True
+        assert b._health_wait_cancelled is False
+
+    def test_a_teardown_from_a_real_thread_is_not_a_crash(self, monkeypatch):
+        """Two real threads, not a probe callback: the once-per-iteration read is
+        what makes it safe, so drive it that way."""
+        b = _make_backend()
+        b._process.poll.return_value = None
+        in_probe = threading.Event()
+        cleared = threading.Event()
+
+        def probe(*a, **kw):
+            in_probe.set()
+            cleared.wait(2.0)
+            return mock.Mock(status_code = 503)
+
+        monkeypatch.setattr(httpx, "get", probe)
+
+        def shutdown():
+            in_probe.wait(2.0)
+            b._process = None
+            cleared.set()
+
+        t = threading.Thread(target = shutdown)
+        t.start()
+        try:
+            assert b._wait_for_health(timeout = 30.0, interval = 0.01) is False
+        finally:
+            t.join(5.0)
+        assert b._health_wait_cancelled is True
+
+    def test_a_signalled_exit_during_teardown_is_not_a_startup_crash(self, monkeypatch):
+        """Publish teardown before signalling, or a SIGTERM exit reads as a startup crash and respawns."""
+        b = _make_backend()
+        b._process.poll.return_value = None
+
+        def probe(*a, **kw):
+            # Set mid-wait because the wait resets the flag on entry.
+            b._torn_down_process = b._process
+            b._process.poll.return_value = -15
+            b._process.returncode = -15
+            return mock.Mock(status_code = 503)
+
+        monkeypatch.setattr(httpx, "get", probe)
+        with mock.patch("core.inference.llama_cpp.logger") as log:
+            assert b._wait_for_health(timeout = 1.0, interval = 0.01) is False
+        assert b._health_wait_cancelled is True
+        assert not any("exited with code" in str(c) for c in log.error.call_args_list)
+
+    def test_a_teardown_between_the_spawn_and_the_wait_still_counts(self, monkeypatch):
+        """The teardown marker is keyed to the process, so a teardown between spawn and wait still
+        counts."""
+        b = _make_backend()
+        b._torn_down_process = b._process
+        b._process.poll.return_value = -15
+        b._process.returncode = -15
+        monkeypatch.setattr(httpx, "get", lambda *a, **kw: mock.Mock(status_code = 503))
+        with mock.patch("core.inference.llama_cpp.logger") as log:
+            assert b._wait_for_health(timeout = 1.0, interval = 0.01) is False
+        assert b._health_wait_cancelled is True
+        assert not any("exited with code" in str(c) for c in log.error.call_args_list)
+
+    def test_shutdown_is_terminal_however_late_it_lands(self, monkeypatch):
+        """The durable shutdown flag only moves false to true and is re-read each loop; waits end
+        terminally."""
+        b = _make_backend()
+        b._process.poll.return_value = None
+
+        def probe(*a, **kw):
+            b._shutting_down = True
+            return mock.Mock(status_code = 503)
+
+        monkeypatch.setattr(httpx, "get", probe)
+        assert b._wait_for_health(timeout = 30.0, interval = 0.01) is False
+        assert b._health_wait_cancelled is True
+        assert not any("health check timed out" in ln for ln in b._stdout_lines)
+
+    def test_kill_process_marks_shutdown_only_for_a_teardown(self):
+        """The flag must not be set by the retry ladder reaping its own child, or
+        the first crash retry would look like a shutdown and abort the load."""
+        for teardown in (True, False):
+            b = _make_backend()
+            b._stop_mtp_crash_watchdog = lambda *a, **kw: None
+            b._reset_effective_parallel_slots = lambda *a, **kw: None
+            b._leading_process_group = lambda *a, **kw: None
+            b._collect_descendants = lambda *a, **kw: ([], True)
+            b._kill_process_group = lambda *a, **kw: None
+            b._terminate_descendants = lambda *a, **kw: None
+            b._process.poll.return_value = 0
+            b._kill_process(teardown = teardown)
+            assert getattr(b, "_shutting_down", False) is teardown
+
+    def test_a_started_shutdown_refuses_to_spawn(self, monkeypatch):
+        """A refused spawn during shutdown must be logged, or the caller health-waits on the
+        previous child."""
+        import subprocess
+
+        b = _make_backend()
+        b._shutting_down = True
+        spawned = []
+        monkeypatch.setattr(subprocess, "Popen", lambda cmd = None, *a, **kw: spawned.append(cmd))
+        assert b._start_llama_process(["llama-server"], {}, child_gpu_physical_ids = None) is False
+        # Check argv, not call count: on macOS the defensive kill shells out to ps via Popen.
+        assert ["llama-server"] not in spawned, "started a server after shutdown had begun"
+
+    def test_a_teardown_with_no_process_still_marks_shutdown(self):
+        """Quitting during a download or staging has nothing to kill, so
+        _kill_process returns early. Marking teardown only on the path that has a
+        process let the load spawn a server after the shutdown sweep finished."""
+        b = _make_backend()
+        b._process = None
+        b._stop_mtp_crash_watchdog = lambda *a, **kw: None
+        b._reset_effective_parallel_slots = lambda *a, **kw: None
+        b._kill_process(teardown = True)
+        assert b._shutting_down is True
+
+    def test_the_published_child_survives_post_spawn_setup(self, monkeypatch):
+        """Post-spawn setup must use the Popen it just made, since shutdown can clear self._process
+        at once."""
+        import subprocess
+
+        b = _make_backend()
+        b._shutting_down = False
+        recorded = []
+        b._record_server_pid = lambda pid: recorded.append(pid)
+        b._drain_stdout = lambda *a, **kw: None
+        b._llama_log_fh = None
+        b._process = None
+        proc = mock.Mock()
+        proc.pid = 4242
+        monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: proc)
+
+        class _TeardownWinsTheLock:
+            """Shutdown taking the lock the instant the spawn releases it, which is
+            the whole window: it clears the reference before the pid is read."""
+
+            def __enter__(self):
+                return None
+
+            def __exit__(self, *_exc):
+                b._process = None
+                return False
+
+        b._spawn_lock = _TeardownWinsTheLock()
+        assert b._start_llama_process(["llama-server"], {}, child_gpu_physical_ids = None) is True
+        assert recorded == [4242]
+
+    def test_a_new_server_lifecycle_clears_the_shutdown_state(self):
+        """The backend is a module singleton and an embedded host may call
+        run_server() again in the same process, so this state is scoped to a
+        lifecycle. Left latched, every launch of the second session is refused."""
+        b = _make_backend()
+        b._shutting_down = True
+        b._torn_down_process = b._process
+        b._begin_server_lifecycle()
+        assert b._shutting_down is False
+        assert b._torn_down_process is None
+
+    def test_a_healthy_probe_during_shutdown_is_not_a_healthy_server(self, monkeypatch):
+        """The probe blocks for up to 2s. A 200 arriving as teardown begins must not
+        publish a child the shutdown is already killing, exactly as for a cancel."""
+        b = _make_backend()
+        b._process.poll.return_value = None
+
+        def probe(*a, **kw):
+            b._shutting_down = True
+            return mock.Mock(status_code = 200)
+
+        monkeypatch.setattr(httpx, "get", probe)
+        assert b._wait_for_health(timeout = 5.0, interval = 0.01) is False
+        assert b._health_wait_cancelled is True
+
+    def test_a_teardown_during_the_last_probe_is_not_reported_as_a_timeout(self, monkeypatch):
+        """The deadline must check the teardown flag too, or a teardown in the last probe reads as a
+        timeout."""
+        b = _make_backend()
+        b._process.poll.return_value = None
+
+        def probe(*a, **kw):
+            b._torn_down_process = b._process
+            return mock.Mock(status_code = 503)
+
+        monkeypatch.setattr(httpx, "get", probe)
+        assert b._wait_for_health(timeout = 0.02, interval = 0.01) is False
+        assert b._health_wait_cancelled is True
+        assert not any("health check timed out" in ln for ln in b._stdout_lines)
+
+    def test_a_timeout_with_no_teardown_still_reports_a_timeout(self, monkeypatch):
+        """The check above must not swallow the ordinary #5740 classification."""
+        b = _make_backend()
+        b._process.poll.return_value = None
+        b._torn_down_process = mock.Mock()
+        monkeypatch.setattr(httpx, "get", lambda *a, **kw: mock.Mock(status_code = 503))
+        assert b._wait_for_health(timeout = 0.02, interval = 0.01) is False
+        assert b._health_wait_cancelled is False
+        assert any("health check timed out" in ln for ln in b._stdout_lines)
+
+    def test_an_earlier_childs_teardown_does_not_end_a_later_wait(self, monkeypatch):
+        """The other half of keying on identity: the marker names one child, so a
+        load that replaced a torn-down one is not aborted by its predecessor."""
+        b = _make_backend()
+        b._torn_down_process = mock.Mock()
+        b._process.poll.return_value = 1
+        b._process.returncode = 1
+        monkeypatch.setattr(httpx, "get", lambda *a, **kw: mock.Mock(status_code = 503))
+        with mock.patch("core.inference.llama_cpp.logger") as log:
+            assert b._wait_for_health(timeout = 1.0, interval = 0.01) is False
+        assert b._health_wait_cancelled is False, "a stale teardown aborted a live load"
+        assert any("exited with code 1" in str(c) for c in log.error.call_args_list)
+
+    @pytest.mark.parametrize("teardown", [True, False])
+    def test_kill_process_publishes_a_teardown_before_it_signals(self, teardown):
+        """Teardown is published before terminate(); retry reaps must not mark it terminal."""
+        b = _make_backend()
+        b._torn_down_process = None
+        b._stop_mtp_crash_watchdog = lambda *a, **kw: None
+        b._reset_effective_parallel_slots = lambda *a, **kw: None
+        b._leading_process_group = lambda *a, **kw: None
+        b._collect_descendants = lambda *a, **kw: ([], True)
+        b._kill_process_group = lambda *a, **kw: None
+        b._terminate_descendants = lambda *a, **kw: None
+        seen = {}
+
+        def _terminate():
+            seen["flag_at_signal"] = getattr(b, "_torn_down_process", None) is b._process
+            seen["process_still_set"] = b._process is not None
+
+        b._process.terminate = _terminate
+        b._process.poll.return_value = -15
+        b._kill_process(teardown = teardown)
+        assert seen["process_still_set"] is True, "the window this guards would not exist"
+        assert (
+            seen["flag_at_signal"] is teardown
+        ), "teardown published late, or a reap marked terminal"
+
+    def test_a_crash_still_reports_the_exit_code(self, monkeypatch):
+        """The teardown guard must not swallow the crash branch: an exited
+        process still has to name its exit code and its output."""
+        b = _make_backend()
+        b._process.poll.return_value = 1
+        b._process.returncode = 1
+        b._stdout_lines = ["ROCm error: out of memory"]
+        monkeypatch.setattr(httpx, "get", lambda *a, **kw: mock.Mock(status_code = 503))
+        with mock.patch("core.inference.llama_cpp.logger") as log:
+            assert b._wait_for_health(timeout = 1.0, interval = 0.01) is False
+        assert any("exited with code 1" in str(c) for c in log.error.call_args_list)
 
     def test_cancel_stops_the_wait_without_a_timeout_marker(self, monkeypatch):
         b = _make_backend()
@@ -123,7 +422,7 @@ class TestWaitForHealthResilience:
         to honor the predicate load_model passes down or it polls the full timeout."""
         b = _make_backend()
         b._process.poll.return_value = None
-        b._cancel_event = threading.Event()  # no unload was issued
+        b._cancel_event = threading.Event()
         scoped = threading.Event()
         scoped.set()
         monkeypatch.setattr(httpx, "get", lambda *a, **kw: mock.Mock(status_code = 503))
@@ -141,7 +440,7 @@ class TestWaitForHealthResilience:
         scoped = threading.Event()
 
         def probe(*a, **kw):
-            scoped.set()  # the user cancels while this request is in flight
+            scoped.set()
             return mock.Mock(status_code = 200)
 
         monkeypatch.setattr(httpx, "get", probe)
@@ -150,7 +449,6 @@ class TestWaitForHealthResilience:
     def test_read_error_loops_to_subprocess_poll(self, monkeypatch):
         """WinError 10054 (httpx.ReadError) must be swallowed; the next iteration sees the dead subprocess and returns False with a structured exit-code log."""
         b = _make_backend()
-        # Iter 1: alive (reach probe); iter 2: exited (exit-code branch -> False).
         b._process.poll.side_effect = [None, 1]
         b._process.returncode = 1
         b._stdout_lines = ["llama-server: ggml-cuda.dll failed to load"]
@@ -160,7 +458,6 @@ class TestWaitForHealthResilience:
 
         monkeypatch.setattr(httpx, "get", raise_read_error)
         assert b._wait_for_health(timeout = 5.0, interval = 0.01) is False
-        # Both loop iterations ran -- the ReadError did not bubble.
         assert b._process.poll.call_count >= 2
 
     def test_remote_protocol_error_also_swallowed(self, monkeypatch):
@@ -265,11 +562,7 @@ class TestWaitForHealthResilience:
 
 
 class TestCrashLogTail:
-    """The "exited with code X" log must keep the TAIL of the output.
-
-    Crash diagnostics (abort reason, ROCm/CUDA error text) print last,
-    after the long startup banner; head truncation has cut off exactly
-    the diagnostic line in field reports (gfx1151 fit-step abort)."""
+    """The exit log keeps the tail of the output, since crash diagnostics print after the startup banner."""
 
     @staticmethod
     def _capture_error_logs(monkeypatch) -> list:
@@ -288,7 +581,6 @@ class TestCrashLogTail:
         b = _make_backend()
         b._process.poll.return_value = 1
         b._process.returncode = 1
-        # >2000 chars of banner, diagnostic on the final line.
         banner = [f"load_model: tensor blk.{i} buffer ROCm0" for i in range(80)]
         diagnostic = "ggml-cuda.cu:103: ROCm error: out of memory"
         b._stdout_lines = banner + [diagnostic]
@@ -299,7 +591,6 @@ class TestCrashLogTail:
         assert crash_logs, "crash must produce an exited-with-code log"
         assert diagnostic in crash_logs[-1]
         assert "Output (tail)" in crash_logs[-1]
-        # The head of the banner must be the part sacrificed to truncation.
         assert "blk.0 buffer" not in crash_logs[-1]
 
     def test_crash_log_mentions_log_file_when_present(self, monkeypatch):
@@ -317,10 +608,8 @@ class TestCrashLogTail:
 
 
 class TestRetryLogFilenameUnique:
-    """The --fit off retry can respawn within the same epoch second; the log
-    filename must carry the attempt index or the second open ("w") truncates
-    the crash log the retry warning just referenced (found by simulation:
-    frozen time.time -> single file, crash evidence gone)."""
+    """The log name must include the attempt index, or a retry in the same second truncates the
+    crash log."""
 
     def test_log_name_includes_attempt_index(self):
         src = (
@@ -330,10 +619,7 @@ class TestRetryLogFilenameUnique:
 
 
 class TestFitOffRetryEligible:
-    """Gate for the one-shot --fit off startup-crash retry.
-
-    Retry only when Unsloth's own VRAM math placed the model and nothing
-    on the command line chose the fit mode explicitly."""
+    """The --fit off retry needs Unsloth's VRAM math to have placed the model and no explicit fit mode."""
 
     def test_eligible_for_plain_ngl_launch(self):
         cmd = ["llama-server", "-m", "x.gguf", "-ngl", "-1", "--jinja"]
@@ -378,21 +664,18 @@ class TestCancelledWaitEndsTheLoad:
     raises a 500 at the caller before it can run its own cancellation handling."""
 
     def test_a_cancelled_health_wait_returns_false_instead_of_raising(self, tmp_path):
-        from core.inference.llama_cpp import GgufLoadIntent
-
         gguf = tmp_path / "model.gguf"
         gguf.write_bytes(b"GGUF" + b"\0" * 4096)
 
         b = LlamaCppBackend()
         b._find_llama_server_binary = lambda *a, **kw: "/usr/bin/true"
-        # The header refusals read a real GGUF; this fixture stands in for a chat model.
         b._non_chat_gguf_refusal_for_path = lambda *a, **kw: None
         b._non_chat_gguf_refusal = lambda *a, **kw: None
         b._kill_process = lambda *a, **kw: None
 
         def _start(cmd, env, **kw):
             proc = mock.Mock()
-            proc.poll.return_value = None  # alive: the cancel kills it, not a crash
+            proc.poll.return_value = None
             proc.pid = 424242
             b._process = proc
             b._stdout_lines = ["build: 6543", "main: loading model"]
@@ -424,12 +707,62 @@ class TestCancelledWaitEndsTheLoad:
             is False
         )
 
+    def test_a_teardown_mid_load_ends_the_load_instead_of_raising(self, tmp_path, monkeypatch):
+        """The whole race through the real caller (#10353): the waiter tests above
+        never reach _spawn_and_wait, which is where the traceback resurfaced."""
+        gguf = tmp_path / "model.gguf"
+        gguf.write_bytes(b"GGUF" + b"\0" * 4096)
+
+        b = LlamaCppBackend()
+        b._find_llama_server_binary = lambda *a, **kw: "/usr/bin/true"
+        b._non_chat_gguf_refusal_for_path = lambda *a, **kw: None
+        b._non_chat_gguf_refusal = lambda *a, **kw: None
+        # The drain thread would iterate a Mock's stdout forever.
+        b._drain_stdout = lambda *a, **kw: None
+
+        def _kill():
+            b._process = None
+
+        b._kill_process = _kill
+
+        spawns = []
+        _real_popen = subprocess.Popen
+
+        def _popen(*a, **kw):
+            argv = [str(x) for x in (a[0] if a else kw.get("args") or [])]
+            # --help and nvidia-smi are not launches; run() needs a real Popen.
+            if str(gguf) not in argv:
+                return _real_popen(*a, **kw)
+            spawns.append(argv)
+            proc = mock.Mock()
+            proc.poll.return_value = None
+            proc.pid = 424242
+            return proc
+
+        monkeypatch.setattr(subprocess, "Popen", _popen)
+
+        def probe(*a, **kw):
+            _kill()
+            return mock.Mock(status_code = 503)
+
+        monkeypatch.setattr(httpx, "get", probe)
+
+        assert (
+            b.load_model(
+                GgufLoadIntent(
+                    model_identifier = "owner/model",
+                    gguf_path = str(gguf),
+                    n_ctx = 4096,
+                ),
+            )
+            is False
+        )
+        assert len(spawns) == 1, f"respawned after shutdown (spawns={len(spawns)})"
+
 
 def test_a_cancelled_diffusion_start_reaps_the_runner():
     """An automatic switch cancels without unloading, so nothing else reaps the shim
     and the visual server; they would keep loading and holding memory."""
-    import subprocess
-
     b = LlamaCppBackend()
     kills = []
     b._kill_process = lambda *a, **kw: kills.append(1)
@@ -458,17 +791,15 @@ def test_a_cancelled_diffusion_start_reaps_the_runner():
                 model_identifier = "o/m",
                 n_ctx = 4096,
                 extra_args = None,
-                cancelled = lambda: True,
+                # Cancelled during the health wait: a Stop before the spawn launches nothing.
+                cancelled = lambda: getattr(b, "_health_wait_cancelled", False),
             )
             is False
         )
-    # One teardown before the launch, one for the cancelled runner.
     assert len(kills) == 2, f"the cancelled runner was left running (kills={len(kills)})"
 
 
 def test_a_diffusion_cancel_after_health_reaps_the_runner():
-    import subprocess
-
     b = LlamaCppBackend()
     kills = []
     b._kill_process = lambda *a, **kw: kills.append(1)
@@ -543,8 +874,6 @@ def test_combined_download_cancel_wait_observes_the_scoped_event():
 
 @pytest.mark.parametrize("cancel_source", ["shared", "scoped"])
 def test_remote_download_observes_both_load_cancel_sources(tmp_path, cancel_source):
-    from core.inference.llama_cpp import GgufLoadIntent
-
     kills = []
     b, gguf = _cancel_scaffold(tmp_path, kills)
     b._remote_non_chat_gguf_refusal = lambda **_kw: None
@@ -578,12 +907,9 @@ def test_a_stale_cancel_marker_does_not_abort_the_next_load(tmp_path):
     """The marker belongs to one attempt. Left set, a guard that runs before this
     load's first health wait reads the previous request's cancellation and swallows
     a genuine start failure."""
-    from core.inference.llama_cpp import GgufLoadIntent
-
     kills = []
     b, gguf = _cancel_scaffold(tmp_path, kills)
-    b._health_wait_cancelled = True  # left over from an earlier cancelled load
-    # A genuine failure: the wait fails and does NOT mark the load cancelled.
+    b._health_wait_cancelled = True
     b._wait_for_health = lambda timeout = 600.0, interval = 0.5, cancelled = None: False
 
     with pytest.raises(RuntimeError):
@@ -597,8 +923,6 @@ def test_a_stale_cancel_marker_does_not_abort_the_next_load(tmp_path):
 
 
 def test_cancelled_health_wait_removes_the_staged_cpu_runtime(tmp_path):
-    from core.inference.llama_cpp import GgufLoadIntent
-
     kills = []
     cleaned = []
     waits = []
@@ -640,8 +964,6 @@ def test_cancelled_health_wait_removes_the_staged_cpu_runtime(tmp_path):
 def test_a_cancel_after_the_server_is_healthy_does_not_publish_it(tmp_path):
     """Cancelling during the post-health setup used to leave the child resident while
     the cancel route saw is_loaded and skipped teardown."""
-    from core.inference.llama_cpp import GgufLoadIntent
-
     kills = []
     cleaned = []
     b, gguf = _cancel_scaffold(tmp_path, kills)
@@ -654,7 +976,7 @@ def test_a_cancel_after_the_server_is_healthy_does_not_publish_it(tmp_path):
         b._cpu_fallback_runtime = _types.SimpleNamespace(
             tempdir = _types.SimpleNamespace(cleanup = lambda: cleaned.append(1))
         )
-        b._cancel_event.set()  # the user cancels while the load finishes publishing
+        b._cancel_event.set()
         return True
 
     b._wait_for_health = _wait
@@ -674,8 +996,6 @@ def test_a_cancel_after_the_server_is_healthy_does_not_publish_it(tmp_path):
 
 
 def test_a_cancel_after_audio_setup_unloads_the_codec(tmp_path, monkeypatch):
-    from core.inference.llama_cpp import GgufLoadIntent
-
     kills = []
     emptied = []
     b, gguf = _cancel_scaffold(tmp_path, kills)
@@ -716,3 +1036,613 @@ def test_a_cancel_after_audio_setup_unloads_the_codec(tmp_path, monkeypatch):
     codec.unload.assert_called_once_with()
     assert LlamaCppBackend._codec_mgr is None
     assert emptied == [1]
+
+
+def _run_server_body() -> str:
+    """Parses run.py with ast; importing it would pull in fastapi and the whole route tree."""
+    import ast
+
+    run_py = Path(__file__).resolve().parent.parent / "run.py"
+    tree = ast.parse(run_py.read_text(encoding = "utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "run_server":
+            return ast.get_source_segment(run_py.read_text(encoding = "utf-8"), node) or ""
+    raise AssertionError("run_server not found in run.py")
+
+
+def test_the_lifecycle_reset_does_not_import_the_route_module_early():
+    """The lifecycle reset must follow `from main import app`, which makes the backend singleton a
+    lookup."""
+    body = _run_server_body()
+
+    main_import = body.index("from main import app")
+    reset = body.index("_begin_server_lifecycle()")
+    assert reset > main_import, (
+        "the lifecycle reset imports routes.inference before `from main import app`, "
+        "so it, not main, builds the backend singleton -- ahead of the startup steps "
+        "run_server requires to come first"
+    )
+
+    for earlier in (
+        'sys.stdout.reconfigure(encoding = "utf-8"',
+        "_setup_server_disk_logging()",
+        "LogConfig.setup_logging(",
+        "initialize_parent_lifetime()",
+        "write_startup_marker()",
+    ):
+        assert body.index(earlier) < reset, f"{earlier} must precede the lifecycle reset"
+
+
+def test_the_lifecycle_reset_stays_below_the_argument_checks():
+    """A rejected invocation must not touch the backend at all."""
+    body = _run_server_body()
+
+    assert body.index("choose an explicit port.") < body.index(
+        "_begin_server_lifecycle()"
+    ), "the reset runs before run_server has finished rejecting bad arguments"
+
+
+def test_the_lifecycle_reset_is_the_last_thing_before_the_serve():
+    """Nothing that can abort startup, such as a port conflict or SystemExit, may follow the flag reset."""
+    body = _run_server_body()
+    # Match statements, not text: surrounding comments name these calls too.
+    reset = body.index("_llama_cpp_backend._begin_server_lifecycle()")
+    serve = body.index("\n    thread.start()")
+    assert reset < serve, "the lifecycle reset no longer precedes the serve"
+
+    # Only the window between reset and serve; match sys.exit( as well as SystemExit.
+    window = body[reset:serve]
+    for fail_fast in ("raise SystemExit", "sys.exit(", "_resolve_port("):
+        assert fail_fast not in window, (
+            f"{fail_fast} runs after the lifecycle reset, so a failed restart leaves the "
+            "spawn guard cleared"
+        )
+
+
+class TestARefusedSpawnClosesItsLog:
+    """A refused spawn must close its tee log; with no process, nothing else ever closes it."""
+
+    def _backend(self, tmp_path):
+        b = _make_backend()
+        b._shutting_down = True
+        b._spawn_lock = threading.Lock()
+        b._stop_mtp_crash_watchdog = lambda: None
+        b._process = None
+        b._redacted_cmd_for_log = lambda c: c
+        b._llama_log_path = str(tmp_path / "llama.log")
+        b._llama_log_fh = None
+        return b
+
+    def test_start_llama_process_closes_it(self, tmp_path):
+        """The handle under test is the one the method opens for itself, not one
+        set beforehand: _start_llama_process clears the attribute and opens a fresh
+        per-attempt log before it reaches the shutdown check."""
+        b = self._backend(tmp_path)
+        opened = []
+        real_open = open
+
+        def tracking_open(*a, **k):
+            fh = real_open(*a, **k)
+            opened.append(fh)
+            return fh
+
+        import builtins
+
+        with mock.patch.object(builtins, "open", tracking_open):
+            assert (
+                b._start_llama_process(["llama-server"], {}, child_gpu_physical_ids = None) is False
+            )
+
+        assert opened, "the method never opened an attempt log; this proves nothing"
+        assert all(fh.closed for fh in opened), "the refused attempt left its tee log open"
+        assert b._llama_log_fh is None
+
+    def test_the_kill_path_does_not_cover_it(self, tmp_path):
+        """Why the explicit close is needed: _kill_process is the only other closer
+        and it returns before that, since a refusal published no process."""
+        b = self._backend(tmp_path)
+        fh = open(tmp_path / "kill.log", "w", encoding = "utf-8")
+        b._llama_log_fh = fh
+        b._reset_effective_parallel_slots = lambda: None
+
+        b._kill_process(teardown = True)
+
+        assert not fh.closed, (
+            "_kill_process now closes the handle with no process; if that is "
+            "deliberate this test and the explicit close are both redundant"
+        )
+        fh.close()
+
+
+def test_the_pid_is_recorded_before_the_spawn_lock_is_released():
+    """The pid must be recorded before the spawn lock is released, or a sweep may have forgotten it."""
+    b = _make_backend()
+    b._shutting_down = False
+    b._stop_mtp_crash_watchdog = lambda: None
+    b._process = None
+    b._redacted_cmd_for_log = lambda c: c
+    b._llama_log_path = None
+    b._llama_log_fh = None
+    order = []
+
+    class _Lock:
+        def __enter__(self):
+            order.append("lock")
+            return None
+
+        def __exit__(self, *_exc):
+            order.append("unlock")
+            return False
+
+    b._spawn_lock = _Lock()
+    b._record_server_pid = lambda pid: order.append("record")
+
+    class _Proc:
+        pid = 4242
+
+        def poll(self):
+            return None
+
+    with mock.patch.object(subprocess, "Popen", lambda *a, **k: _Proc()):
+        with mock.patch.object(threading, "Thread", lambda **k: mock.Mock()):
+            assert b._start_llama_process(["llama-server"], {}, child_gpu_physical_ids = None) is True
+
+    assert order.index("record") < order.index("unlock"), (
+        f"the pid is recorded after the lock is released ({order}), so a teardown "
+        "between the two writes a bare pid record for an already-reaped process"
+    )
+
+
+class TestHealthPublicationIsAtomicWithTeardown:
+    """Health is published under the teardown lock, or a teardown between probe and commit is missed."""
+
+    def _backend(self):
+        b = _make_backend()
+        b._stop_mtp_crash_watchdog = lambda: None
+        b._healthy = False
+        b._spawn_lock = threading.Lock()
+        return b
+
+    def test_a_teardown_before_the_commit_refuses_publication(self):
+        b = self._backend()
+        b._shutting_down = True
+
+        assert b._publish_healthy() is False
+        assert b._healthy is False, "a torn-down backend was published as healthy"
+
+    def test_an_ordinary_load_still_publishes(self):
+        b = self._backend()
+        b._shutting_down = False
+
+        assert b._publish_healthy() is True
+        assert b._healthy is True
+
+    def test_the_teardown_mark_and_the_commit_cannot_interleave(self):
+        """The two orders the lock permits are the only safe ones: publish then
+        teardown (which clears _healthy on its way out), or teardown then a refused
+        publish. This drives the first order and asserts the second is impossible."""
+        b = self._backend()
+        b._shutting_down = False
+        # A real child: _kill_process returns before clearing _healthy when nothing to kill.
+        b._process = object()
+        b._reset_effective_parallel_slots = lambda: None
+        b._leading_process_group = lambda _pid: None
+        b._collect_descendants = lambda _pid: ([], True)
+        b._diffusion_requested_ngl = None
+
+        published = b._publish_healthy()
+        assert published is True and b._healthy is True
+
+        b._kill_process(teardown = True)
+
+        assert (
+            b._healthy is False
+        ), "teardown left _healthy set, so a publication that won the race is never undone"
+        assert b._publish_healthy() is False, "a later publication slipped past the teardown"
+
+
+def test_the_deadline_asks_the_durable_flag_too(monkeypatch):
+    """The deadline must also check the durable flag, or a teardown mid-kill is reported as a timeout."""
+    b = _make_backend()
+    b._process.poll.return_value = None
+    b._shutting_down = False
+    b._torn_down_process = None
+
+    # Set during the LAST probe; setting it up front is caught by the top-of-loop check.
+    def probe(*a, **kw):
+        b._shutting_down = True
+        return mock.Mock(status_code = 503)
+
+    monkeypatch.setattr(httpx, "get", probe)
+
+    assert b._wait_for_health(timeout = 0.01, interval = 0.05) is False
+    assert b._health_wait_cancelled is True, "a teardown was recorded as a timeout"
+    assert not any("health check timed out" in ln for ln in b._stdout_lines)
+
+
+class TestAStaleLoadIsDroppedAtTheSerialScope:
+    """A stale load must be refused at the serial scope, before replacement work can kill the new model."""
+
+    def test_the_check_precedes_the_replacement_work(self):
+        """Checked over the AST, not the text: a first version matched the words
+        '_kill_process' in the explanatory comment above the guard and failed on
+        correct code."""
+        import ast
+        import inspect
+        import textwrap
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(LlamaCppBackend.load_model)))
+        scope = next(
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.With)
+            and any("_serial_load_scope" in ast.unparse(i.context_expr) for i in n.items)
+        )
+
+        guard_line = next(
+            n.lineno
+            for n in ast.walk(scope)
+            if isinstance(n, ast.Call) and "_spawn_is_stale" in ast.unparse(n.func)
+        )
+
+        early_kills = [
+            n.lineno
+            for n in ast.walk(scope)
+            if isinstance(n, ast.Call)
+            and "_kill_process" in ast.unparse(n.func)
+            and n.lineno < guard_line
+        ]
+        assert not early_kills, (
+            f"a stale load calls _kill_process at {early_kills}, before it is refused at "
+            f"line {guard_line}, so it unloads the new lifecycle's model"
+        )
+
+        src = inspect.getsource(LlamaCppBackend.load_model)
+        stale = src.index("_spawn_is_stale()")
+        assert "return False" in src[stale : stale + 300], "the stale-load branch does not return"
+
+
+def test_a_lifecycle_cannot_reopen_while_a_teardown_is_still_killing():
+    """Teardown keeps the lock until _process is cleared, or a new load can spawn into the gap."""
+    b = _make_backend()
+    b._stop_mtp_crash_watchdog = lambda: None
+    b._reset_effective_parallel_slots = lambda: None
+    b._diffusion_requested_ngl = None
+    b._leading_process_group = lambda _pid: None
+    b._collect_descendants = lambda _pid: ([], True)
+    b._spawn_lock = threading.RLock()
+
+    reopened_during_kill = []
+    in_kill = threading.Event()
+    release = threading.Event()
+
+    class _SlowProcess:
+        pid = 999
+
+        def terminate(self):
+            in_kill.set()
+            release.wait(2.0)
+
+        def wait(self, timeout = None):
+            return 0
+
+        def kill(self):
+            pass
+
+    b._process = _SlowProcess()
+
+    def restarter():
+        in_kill.wait(2.0)
+        # Probe _teardown_lock: the kill holds it throughout, _spawn_lock only briefly.
+        got = b._teardown_lock.acquire(blocking = False)
+        if got:
+            b._teardown_lock.release()
+        reopened_during_kill.append(got)
+        release.set()
+
+    t = threading.Thread(target = restarter)
+    t.start()
+    try:
+        b._kill_process(teardown = True)
+    finally:
+        release.set()
+        t.join(5.0)
+
+    assert reopened_during_kill == [False], (
+        "the teardown lock was free while the kill was still running, so "
+        "_begin_server_lifecycle could reopen the lifecycle mid-kill"
+    )
+
+
+def test_the_shutdown_cancels_loads_before_it_kills_the_server():
+    """Order matters: killing first leaves the load to respawn into the teardown."""
+    import ast
+    import textwrap
+    from pathlib import Path
+
+    run_py = (Path(__file__).resolve().parent.parent / "run.py").read_text(encoding = "utf-8")
+    tree = ast.parse(run_py)
+    fn = next(
+        n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_graceful_shutdown"
+    )
+    src = textwrap.dedent(ast.get_source_segment(run_py, fn) or "")
+
+    assert "cancel_pending_loads()" in src, "shutdown does not cancel in-flight loads"
+    assert src.index("cancel_pending_loads()") < src.index(
+        "_kill_process(teardown = True)"
+    ), "the loads are cancelled after the kill, so one can still spawn into the teardown"
+
+
+class TestATeardownDoesNotBlockASpawnItWillRefuse:
+    """Teardown and spawn use separate locks so a spawn refused by shutdown never queues behind a
+    SIGTERM."""
+
+    def _backend(self, on_terminate):
+        b = _make_backend()
+        b._stop_mtp_crash_watchdog = lambda: None
+        b._reset_effective_parallel_slots = lambda: None
+        b._diffusion_requested_ngl = None
+        b._leading_process_group = lambda _p: None
+        b._collect_descendants = lambda _p: ([], True)
+
+        class _Stubborn:
+            pid = 4242
+
+            def __init__(self):
+                self.killed = False
+
+            def terminate(self):
+                on_terminate()
+
+            def wait(self, timeout = None):
+                if not self.killed:
+                    raise subprocess.TimeoutExpired("llama-server", timeout)
+
+            def kill(self):
+                self.killed = True
+
+        b._process = _Stubborn()
+        return b
+
+    def test_a_spawn_is_refused_without_waiting_for_the_kill(self):
+        in_kill = threading.Event()
+        release = threading.Event()
+        b = self._backend(lambda: (in_kill.set(), release.wait(5.0)))
+        seen = []
+
+        def spawner():
+            in_kill.wait(5.0)
+            start = time.monotonic()
+            with b._spawn_lock:
+                stale = b._spawn_is_stale()
+            seen.append((time.monotonic() - start, stale))
+            release.set()
+
+        t = threading.Thread(target = spawner)
+        t.start()
+        try:
+            b._kill_process(teardown = True)
+        finally:
+            release.set()
+            t.join(10)
+
+        waited, refused = seen[0]
+        assert refused is True, "the spawn was allowed through during a teardown"
+        assert waited < 1.0, (
+            f"the spawn waited {waited:.2f}s for the kill before being refused; the "
+            "teardown hold and the flag read must not share one lock"
+        )
+
+    def test_a_lifecycle_reset_still_waits_for_the_kill(self):
+        """The other half, and the reason the long hold exists at all: clearing the
+        flag mid-kill would let a new load spawn a child this teardown then drops."""
+        in_kill = threading.Event()
+        release = threading.Event()
+        b = self._backend(lambda: (in_kill.set(), release.wait(2.0)))
+        order = []
+
+        def resetter():
+            in_kill.wait(5.0)
+            b._begin_server_lifecycle()
+            order.append("reset")
+
+        t = threading.Thread(target = resetter)
+        t.start()
+        try:
+            b._kill_process(teardown = True)
+            order.append("kill_done")
+        finally:
+            release.set()
+            t.join(10)
+
+        assert order == [
+            "kill_done",
+            "reset",
+        ], f"the lifecycle reopened before the kill finished: {order}"
+
+
+def test_the_lock_order_is_teardown_then_spawn():
+    """Two locks means an order, and taking them the other way round deadlocks."""
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(LlamaCppBackend))
+    inversions = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.With) and any(
+            "_spawn_lock" in ast.unparse(i.context_expr) for i in node.items
+        ):
+            for inner in ast.walk(node):
+                if inner is node:
+                    continue
+                if isinstance(inner, ast.With) and any(
+                    "_teardown_lock" in ast.unparse(i.context_expr) for i in inner.items
+                ):
+                    inversions.append(inner.lineno)
+    assert not inversions, f"_teardown_lock taken inside _spawn_lock at {inversions}"
+
+
+def test_no_kill_double_still_returns_the_legacy_shape():
+    """Kill-path doubles must return _collect_descendants' (descendants, known) pair, not a bare list."""
+    import ast
+    import inspect
+    import sys
+
+    module = sys.modules[__name__]
+    tree = ast.parse(inspect.getsource(module))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Attribute) or target.attr != "_collect_descendants":
+            continue
+        assert isinstance(node.value, ast.Lambda), ast.unparse(node)
+        body = node.value.body
+        assert isinstance(body, ast.Tuple) and len(body.elts) == 2, ast.unparse(node)
+
+
+class TestHealthWaitMeasuresStalls:
+    _WORKER = (
+        "import sys, time\n"
+        "held = []\n"
+        "end = time.monotonic() + float(sys.argv[1])\n"
+        "while time.monotonic() < end:\n"
+        "    held.append(b'\\x01' * (4 << 20))\n"
+        "    time.sleep(0.05)\n"
+        "time.sleep(60)\n"
+    )
+
+    _MMAP_WORKER = (
+        "import mmap, os, sys, time\n"
+        "fd = os.open(sys.argv[1], os.O_RDONLY | getattr(os, 'O_BINARY', 0))\n"
+        "view = 16 << 20\n"
+        "end = time.monotonic() + float(sys.argv[2])\n"
+        "offset = 0\n"
+        "while time.monotonic() < end:\n"
+        "    if hasattr(os, 'posix_fadvise'):\n"
+        "        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)\n"
+        "    with mmap.mmap(fd, view, access = mmap.ACCESS_READ, offset = offset) as m:\n"
+        "        sum(m[p] for p in range(0, view, mmap.PAGESIZE))\n"
+        "    offset = view - offset\n"
+        "    time.sleep(0.05)\n"
+        "time.sleep(60)\n"
+    )
+
+    def _wait_on_child(
+        self,
+        monkeypatch,
+        argv,
+        *,
+        healthy_after = None,
+        timeout = 0.6,
+    ):
+        monkeypatch.setattr(LlamaCppBackend, "_STARTUP_PROGRESS_SAMPLE_S", 0.1)
+        # /health is mocked and the worker never listens, so the port-owner check doesn't apply.
+        monkeypatch.setattr(LlamaCppBackend, "_health_listener_is_ours", lambda self, process: True)
+        b = _make_backend()
+        b._process = subprocess.Popen([sys.executable, "-c", *argv])
+        started = time.monotonic()
+
+        def probe(*a, **kw):
+            if healthy_after is not None and time.monotonic() - started >= healthy_after:
+                return mock.Mock(status_code = 200)
+            return mock.Mock(status_code = 503)
+
+        monkeypatch.setattr(httpx, "get", probe)
+        try:
+            ok = b._wait_for_health(timeout = timeout, interval = 0.02)
+            elapsed = time.monotonic() - started
+        finally:
+            import psutil
+
+            for descendant in psutil.Process(b._process.pid).children(recursive = True):
+                descendant.kill()
+            b._process.kill()
+            b._process.wait()
+        return b, ok, elapsed
+
+    # 1.5s stall window: a loaded runner can spend 0.6s just starting the worker interpreter.
+    _WORKING_TIMEOUT = 1.5
+
+    def test_a_load_that_keeps_working_outlives_the_timeout(self, monkeypatch):
+        b, ok, elapsed = self._wait_on_child(
+            monkeypatch, [self._WORKER, "3.0"], healthy_after = 2.5, timeout = self._WORKING_TIMEOUT
+        )
+        assert ok is True
+        assert elapsed >= 2.5
+        assert not any("health check timed out" in ln for ln in b._stdout_lines)
+
+    def test_a_child_doing_nothing_still_times_out(self, monkeypatch):
+        b, ok, elapsed = self._wait_on_child(monkeypatch, [self._WORKER, "0.0"])
+        assert ok is False
+        assert elapsed < 3.0
+        assert any("no startup progress for 0.6s" in ln for ln in b._stdout_lines)
+
+    def test_a_load_that_stalls_times_out_one_timeout_after_its_last_work(self, monkeypatch):
+        timeout = self._WORKING_TIMEOUT
+        b, ok, elapsed = self._wait_on_child(monkeypatch, [self._WORKER, "1.5"], timeout = timeout)
+        assert ok is False
+        assert 1.5 + timeout - 0.2 <= elapsed < 1.5 + timeout + 3.0
+        assert any("health check timed out" in ln for ln in b._stdout_lines)
+
+    def test_work_done_by_a_descendant_counts(self, monkeypatch):
+        shim = (
+            "import subprocess, sys, time\n"
+            "subprocess.Popen([sys.executable, '-c', sys.argv[1], '3.0'])\n"
+            "time.sleep(60)\n"
+        )
+        # 1.5s: interpreter startup alone can outlast the 0.6s default on a loaded runner.
+        b, ok, elapsed = self._wait_on_child(
+            monkeypatch, [shim, self._WORKER], healthy_after = 2.5, timeout = 1.5
+        )
+        assert ok is True
+        assert elapsed >= 2.5
+
+    def test_mmap_page_ins_with_flat_resident_memory_count(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(LlamaCppBackend, "_STARTUP_PROGRESS_MIN_CPU_FRACTION", 100.0)
+        monkeypatch.setattr(LlamaCppBackend, "_STARTUP_PROGRESS_MIN_BYTES", 1 << 40)
+        model = tmp_path / "model.gguf"
+        # Small writes avoid collapsing the file into 2 MiB cache folios.
+        with open(model, "wb") as f:
+            for _ in range(512):
+                f.write(os.urandom(64 << 10))
+        # Longer stall window: page faults use a flat threshold, so CPU starvation hits this test.
+        # Without fault progress the wait still dies at 1.5s, before the 2.5s health flip.
+        b, ok, elapsed = self._wait_on_child(
+            monkeypatch, [self._MMAP_WORKER, str(model), "3.0"], healthy_after = 2.5, timeout = 1.5
+        )
+        assert ok is True
+        assert elapsed >= 2.5
+
+    def test_unreadable_counters_keep_the_fixed_deadline(self, monkeypatch):
+        monkeypatch.setattr(LlamaCppBackend, "_startup_work_sample", staticmethod(lambda p: None))
+        b, ok, elapsed = self._wait_on_child(monkeypatch, [self._WORKER, "3.0"])
+        assert ok is False
+        assert elapsed < 1.5
+
+    def test_cpu_after_an_unreadable_sample_is_measured_from_the_last_readable_one(
+        self, monkeypatch
+    ):
+        samples = iter([(1.0, 0, 0, 0), *[None] * 8, (1.02, 0, 0, 0)])
+        monkeypatch.setattr(
+            LlamaCppBackend,
+            "_startup_work_sample",
+            staticmethod(lambda p: next(samples, None)),
+        )
+        b, ok, elapsed = self._wait_on_child(monkeypatch, [self._WORKER, "0.0"], timeout = 1.5)
+        assert ok is False
+        # Bound sits below the 2.4s floor a wrong measurement would produce.
+        assert elapsed < 2.3
+
+    def test_resident_memory_regained_after_eviction_is_not_progress(self):
+        peak = (10.0, 500 << 20, 0, 0)
+        assert not LlamaCppBackend._made_startup_progress(peak, (10.0, 499 << 20, 0, 0), 5.0)
+        assert LlamaCppBackend._made_startup_progress(peak, (10.0, 502 << 20, 0, 0), 5.0)
+
+    def test_answering_health_probes_is_not_progress(self):
+        before = (1.0, 100 << 20, 50 << 20, 1000)
+        assert not LlamaCppBackend._made_startup_progress(
+            before, (1.02, 100 << 20, 50 << 20, 1033), 5.0
+        )
+        assert LlamaCppBackend._made_startup_progress(before, (1.5, 100 << 20, 50 << 20, 1000), 5.0)
+        assert LlamaCppBackend._made_startup_progress(before, (1.0, 100 << 20, 50 << 20, 1064), 5.0)

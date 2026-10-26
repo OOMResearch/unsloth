@@ -2,21 +2,14 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
 
-// Normalized: the assertions below span lines, and while .gitattributes keeps this tree at
-// LF, a source archive or a stray core.autocrlf would make every multi-line marker miss.
-const source = readFileSync(
-  fileURLToPath(
-    new URL("../src/features/video/video-page.tsx", import.meta.url),
-  ),
-  "utf8",
-).replace(/\r\n/g, "\n");
+import { readSrc } from "./helpers/kit.ts";
 
-/** The source between two markers. Throws if either moved: a silent empty slice would let
- *  the negative assertion below ("no longer calls handleClearAll") pass over nothing. */
+// Normalized: a source archive or core.autocrlf would make multi-line markers miss.
+const source = readSrc("features/video/video-page.tsx").replace(/\r\n/g, "\n");
+
+/** Throws if a marker moved, so a negative assertion cannot pass over an empty slice. */
 function between(start: string, end: string): string {
   const from = source.indexOf(start);
   const to = source.indexOf(end);
@@ -83,8 +76,7 @@ test("video gallery confirmation stays controlled while clearing and off-route",
 });
 
 test("leaving the video route closes the confirmation rather than hiding it", () => {
-  // `active` going false only hides the dialog, and Radix does not call onOpenChange for a
-  // parent-forced close, so without this reset the confirm returns with the route.
+  // Radix does not call onOpenChange for a parent-forced close, so this reset is needed.
   const reset = between(
     "const [clearingGallery, setClearingGallery] = useState(false);",
     "const playCountRef = useRef(0);",

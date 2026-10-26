@@ -4,18 +4,22 @@
 """Authentication API routes."""
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi.security import HTTPAuthorizationCredentials
 
 import base64
+import hashlib
 import importlib.util
 import ipaddress
 import os
 import shlex
+import sqlite3
 import sys
 import threading
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional
 
 from models.auth import (
     ApiKeyListResponse,
@@ -30,7 +34,10 @@ from models.auth import (
     RefreshTokenRequest,
 )
 from models.users import Token
-from auth import storage, hashing
+from auth import storage, hashing, policy
+from loggers import get_logger
+from storage import sqlite_gate
+from utils.account_context import OWNER_ACCOUNT_ID
 from auth.authentication import (
     authenticated_via_desktop_jwt,
     authenticated_without_credential,
@@ -39,19 +46,27 @@ from auth.authentication import (
     get_current_credential,
     get_current_subject,
     get_current_subject_allow_password_change,
+    is_keyless,
+    new_refresh_token_value,
     refresh_access_token,
+    security,
 )
 
 router = APIRouter()
+logger = get_logger(__name__)
+
+
+def _account_id_of(username: str) -> "str | None":
+    """Immutable account id for ``username``, or None. Names are reusable, so state must not key
+    on the name: a recreated account would inherit its predecessor's data."""
+    if username == storage.DEFAULT_ADMIN_USERNAME:
+        return OWNER_ACCOUNT_ID
+    account = storage.get_account(username)
+    return account.account_id if account is not None else None
 
 
 def _require_a_credential_of_its_own(what: str):
-    """Refuse a caller that nothing but keyless API access let in.
-
-    For effects that outlive the setting: turning keyless access back off does not
-    withdraw a key it handed out, restore one it destroyed, or undo a sign-out it
-    forced. Listing keys is refused with them because it names the key to revoke.
-    """
+    """Refuse keyless-API-only callers: keys and sign-outs they cause outlive the keyless setting."""
 
     def dependency(no_credential: bool = Depends(authenticated_without_credential)) -> None:
         if no_credential:
@@ -72,12 +87,9 @@ _CLI_BOOTSTRAP = (
 
 
 def _cli_is_inside(prefix: str) -> bool:
-    """Whether unsloth_cli lives under *prefix*, so -I would still find it.
-
-    Located rather than imported: this runs in a request handler, and a spec
-    lookup answers the only question asked here, which is where the package is
-    on disk and not whether it starts.
-    """
+    """Whether unsloth_cli lives under *prefix*, so -I would still find it. Located rather than
+    imported: this runs in a request handler, and a spec lookup answers the only question asked
+    here, which is where the package is on disk and not whether it starts."""
     try:
         spec = importlib.util.find_spec("unsloth_cli")
         origin = getattr(spec, "origin", None)
@@ -89,33 +101,15 @@ def _cli_is_inside(prefix: str) -> bool:
         return False
 
 
+def _reset_password_command_on_path() -> str:
+    """PATH form only: an unauthenticated 401 body is readable by any origin, so no host paths here."""
+    if os.name == "nt":
+        return "unsloth.cmd studio reset-password"
+    return "unsloth studio reset-password"
+
+
 def _reset_password_command() -> str:
-    """Shell command shown in the 'incorrect password' hint.
-
-    Prefer the absolute path to this install's ``unsloth`` launcher (sibling of
-    the running interpreter) so the hint works even when its dir isn't on PATH.
-
-    POSIX paths are shell-quoted. On Windows we use the bare absolute path only
-    when it has no spaces (a quoted path differs between cmd and PowerShell);
-    otherwise, or if the launcher can't be located, fall back to the PATH form.
-
-    Windows never names unsloth.exe here, present or not. Existing is not the
-    same as runnable: an Application Control policy leaves the generated,
-    unsigned unsloth.exe on disk and denies it at CreateProcess (issue #8490),
-    and a bare `unsloth` resolves to that same file because PATHEXT puts .EXE
-    ahead of the .cmd shim. Whoever is locked out of Unsloth is exactly who needs
-    this command to work, so it must not be the one a policy refuses. Preference
-    order is therefore the interpreter's module entry, which needs no quoting in
-    cmd or PowerShell, then `unsloth.cmd` -- spelling the extension is what stops
-    PATHEXT reaching for the executable.
-
-    -I only when the package is inside this interpreter's own prefix. -I implies
-    -s, so a ``pip install --user`` install would be told to run a command that
-    cannot find itself; unsloth_cli/__main__.py documents that exception and the
-    bootstrap to use instead, and this prints that bootstrap. It is safe to show
-    to either shell: the trampoline contains single quotes only, so one pair of
-    double quotes wraps it identically in cmd and in PowerShell.
-    """
+    """Shell command for the password hint. Windows names unsloth.cmd, never unsloth.exe, which AppControl may deny; -I only inside prefix."""
     try:
         bin_dir = os.path.dirname(os.path.abspath(sys.executable))
         if os.name == "nt":
@@ -124,21 +118,17 @@ def _reset_password_command() -> str:
                 if _cli_is_inside(sys.prefix):
                     return f"{python} -I -m unsloth_cli studio reset-password"
                 return f'{python} -X utf8 -c "{_CLI_BOOTSTRAP}" studio reset-password'
-            # A spaced interpreter path cannot be written unquoted, so fall
-            # through to the PATH form below.
+            # A spaced interpreter path cannot be written unquoted: fall through to the PATH form.
         else:
             exe = os.path.join(bin_dir, "unsloth")
             if os.path.isfile(exe):
                 return f"{shlex.quote(exe)} studio reset-password"
     except Exception:
         pass
-    if os.name == "nt":
-        return "unsloth.cmd studio reset-password"
-    return "unsloth studio reset-password"
+    return _reset_password_command_on_path()
 
 
-# Per-(ip, username) bucket + per-IP aggregate. Account bucket stops one user's
-# typos from blocking others; the aggregate stops username-rotation spray.
+# Per-(ip, user) bucket stops one user's typos blocking others; per-IP stops username spray.
 # Single-process only; multi-worker deployments need a shared store.
 _LOGIN_BUCKETS: dict[tuple[str, str], deque] = {}
 _LOGIN_IP_BUCKETS: dict[str, deque] = {}
@@ -147,14 +137,11 @@ _LOGIN_WINDOW_SECONDS = 60.0
 _LOGIN_MAX_FAILS = 5
 _LOGIN_IP_MAX_FAILS = 30
 _LOGIN_LOCKOUT_SECONDS = 60
-# Bucket-dict cap. On overflow, reclaim expired buckets; a new IP that still can't
-# fit falls back to a sharded overflow rather than evicting a hot bucket.
+# On overflow, reclaim expired buckets, then use sharded overflow rather than evict a hot bucket.
 _LOGIN_MAX_BUCKETS = 4096
 # Last full stale-sweep time; rate-limits the O(n) sweep under a burst of new IPs.
 _LAST_IP_PRUNE = 0.0
-# Sharded overflow for per-IP failures that can't get their own bucket
-# Each shard is a fixed-capacity dict ``ip -> [count, window_start]``; when full, a new IP evicts the lowest-count entry
-# and starts clean.
+# Overflow shards for per-IP failures with no bucket; when full, a new IP evicts the lowest count.
 _LOGIN_IP_OVERFLOW_SHARDS = 256
 _LOGIN_IP_OVERFLOW_MAX = 64
 _LOGIN_IP_OVERFLOW: list[dict] = [dict() for _ in range(_LOGIN_IP_OVERFLOW_SHARDS)]
@@ -172,8 +159,7 @@ def _overflow_record(ip: str, now: float) -> int:
         if now - entry[1] > _LOGIN_WINDOW_SECONDS:
             entry[0], entry[1] = 1, now
         else:
-            # Cap the count at the threshold: uncapped, a saturated source materializes one deque entry per failure
-            # (`[start] * carried`) while holding the login lock.
+            # Cap at the threshold so a saturated source cannot build a huge deque under the lock.
             entry[0] = min(entry[0] + 1, _LOGIN_IP_MAX_FAILS)
         return entry[0]
     if len(shard) >= _LOGIN_IP_OVERFLOW_MAX:
@@ -203,21 +189,19 @@ def _overflow_take(ip: str, now: float) -> tuple[int, float]:
     entry = _overflow_shard(ip).pop(ip, None)
     if entry is None or now - entry[1] > _LOGIN_WINDOW_SECONDS:
         return 0, now
-    # Cap the carried count so the bucket migration never allocates more than the per-IP threshold
-    # worth of deque entries (defensive; _overflow_record already clamps).
+    # Clamp the carried count so migration allocates at most _LOGIN_IP_MAX_FAILS deque entries.
     return min(entry[0], _LOGIN_IP_MAX_FAILS), entry[1]
 
 
-# Unrepresentable as a real username (leading NUL); folds unknown-user attempts
-# into one slot so attacker cardinality can't blow the bucket dict.
+# Leading NUL is not a real username; folds unknown users into one slot so attacker names cannot blow up the bucket dict.
 _UNKNOWN_LOGIN_USER = "\x00unknown-user"
+# Own slot: sharing /login's would let anyone lock out every account via the tunnel.
+_DESKTOP_LOGIN_USER = "\x00desktop-login"
 
 
 def _trust_forwarded_for() -> bool:
-    """Honour X-Forwarded-For only when UNSLOTH_STUDIO_TRUST_FORWARDED is set.
-
-    Off by default so a direct caller can't spoof the header.
-    """
+    """Honour X-Forwarded-For only when UNSLOTH_STUDIO_TRUST_FORWARDED is set. Off by default so a
+    direct caller can't spoof the header."""
     return os.environ.get("UNSLOTH_STUDIO_TRUST_FORWARDED", "").lower() in (
         "1",
         "true",
@@ -261,27 +245,41 @@ def _client_ip(request: Request | None) -> str:
     if request is None:
         return "_unknown"
     if _trust_forwarded_for():
-        xff = request.headers.get("x-forwarded-for", "")
+        # Rightmost entry only: the trusted proxy appends the client it saw, and everything left of
+        # it is the caller's own text, so keying on it would let each guess pick a fresh bucket.
+        from utils.client_ip import header_fields
+
+        xff = header_fields(request.headers, "x-forwarded-for")
         if xff:
-            # First entry is the originating client.
-            normalized = _normalize_forwarded_addr(xff.split(",", 1)[0])
+            normalized = _normalize_forwarded_addr(xff.rsplit(",", 1)[-1])
             if normalized:
                 return normalized
-        fwd = request.headers.get("forwarded", "")
+        fwd = header_fields(request.headers, "forwarded")
         if fwd:
-            # First element only; multi-element headers can't fork buckets.
-            normalized = _forwarded_for_from_element(fwd.split(",", 1)[0])
+            normalized = _forwarded_for_from_element(fwd.rsplit(",", 1)[-1])
             if normalized:
                 return normalized
     return (request.client.host if request.client else None) or "_unknown"
 
 
+_MAX_BUCKET_USERNAME_CHARS = 256
+
+
 def _bucket_key(request: Request | None, username: str) -> tuple[str, str]:
-    return (_client_ip(request), (username or "").casefold())
+    name = (username or "").casefold()
+    # Bound the memory each bucket key holds; real usernames are far shorter and keep their own key.
+    if len(name) > _MAX_BUCKET_USERNAME_CHARS:
+        name = "\x00long:" + hashlib.sha256(name.encode("utf-8", "surrogatepass")).hexdigest()
+    return (_client_ip(request), name)
 
 
 def _unknown_user_key(request: Request | None) -> tuple[str, str]:
     return (_client_ip(request), _UNKNOWN_LOGIN_USER)
+
+
+def _desktop_login_key(request: Request | None) -> tuple[str, str]:
+    # Separate from /login: tunnel and shell share loopback, so guesses would 429 the shell.
+    return (_client_ip(request) + _DESKTOP_LOGIN_USER, _DESKTOP_LOGIN_USER)
 
 
 def _prune_bucket(bucket: deque, now: float) -> None:
@@ -301,10 +299,8 @@ def _prune_stale_buckets(now: float) -> None:
 
 
 def _prune_stale_ip_buckets(now: float) -> None:
-    """Drop empty / expired per-IP buckets to bound memory under spray.
-
-    The dict is otherwise reclaimed only on a successful login, so a failure-only
-    spray from many (or spoofed) IPs would grow it without bound.
+    """Drop empty / expired per-IP buckets to bound memory under spray. The dict is otherwise reclaimed only on a
+    successful login, so a failure-only spray from many (or spoofed) IPs would grow it without bound.
     """
     stale: list[str] = []
     for bucket_ip, bucket in _LOGIN_IP_BUCKETS.items():
@@ -320,25 +316,19 @@ def _record_login_failure(key: tuple[str, str]) -> int:
     now = time.monotonic()
     ip, _username = key
     with _LOGIN_BUCKETS_LOCK:
-        # Keep the dict bounded without disabling throttling and without letting a
-        # spray reset a hot bucket: for a new IP at the cap, reclaim expired buckets
-        # (rate-limited) to make room.
+        # At the cap, a new IP reclaims expired buckets (rate-limited) so a spray cannot reset hot ones.
         ip_bucket = _LOGIN_IP_BUCKETS.get(ip)
         if ip_bucket is None and len(_LOGIN_IP_BUCKETS) >= _LOGIN_MAX_BUCKETS:
             if now - _LAST_IP_PRUNE >= 1.0:
                 _prune_stale_ip_buckets(now)
                 _LAST_IP_PRUNE = now
         if ip_bucket is None and len(_LOGIN_IP_BUCKETS) >= _LOGIN_MAX_BUCKETS:
-            # Still full -- every bucket is hot. Count this failure in the IP's
-            # bounded overflow shard instead of evicting a live one, so the spray
-            # stays throttled but can't push out (and reset) any IP's own counter.
+            # Every bucket is hot: count in the overflow shard, never evict a live bucket, since that would reset its IP counter.
             ip_fails = _overflow_record(ip, now)
         else:
             if ip_bucket is None:
                 ip_bucket = _LOGIN_IP_BUCKETS[ip] = deque()
-                # Carry over any overflow failures this IP accrued while the dict
-                # was saturated, so straddling the overflow -> bucket transition
-                # can't double the effective per-IP limit.
+                # Carry overflow failures so the transition can't double the per-IP limit.
                 carried, start = _overflow_take(ip, now)
                 ip_bucket.extend([start] * carried)
             _prune_bucket(ip_bucket, now)
@@ -383,14 +373,11 @@ def _clear_login_bucket(key: tuple[str, str]) -> None:
     with _LOGIN_BUCKETS_LOCK:
         _LOGIN_BUCKETS.pop(key, None)
         _LOGIN_IP_BUCKETS.pop(ip, None)
-        # A successful login resets the IP's throttle, including any overflow it
-        # accumulated during saturation (drop only this IP's entry, so a
-        # shard-mate's throttle is untouched).
+        # Successful login clears only this IP's throttle and overflow entry, not a shard-mate's.
         _overflow_shard(ip).pop(ip, None)
 
 
-# Sync def (not async): compute_identity_proof touches SQLite on the first call,
-# so FastAPI runs it in the threadpool rather than blocking the event loop.
+# Sync def: SQLite on first call, so FastAPI runs it in the threadpool.
 @router.get("/identity")
 def identity(nonce: str, request: Request) -> dict:
     """Challenge-response proof this is the real local Unsloth: caller sends a nonce,
@@ -408,9 +395,7 @@ def identity(nonce: str, request: Request) -> dict:
         raise HTTPException(
             status_code = status.HTTP_400_BAD_REQUEST, detail = "nonce must decode to 16-128 bytes"
         )
-    # The address + port the connection actually landed on.
-    # request.scope is getsockname, so this is the real local address even when bound to 0.0.0.0, never the client-
-    # controlled Host header.
+    # scope server is getsockname, never the client-controlled Host header.
     server = request.scope.get("server") or ("", 0)
     host = server[0] or ""
     port = server[1] if server[1] is not None else 0
@@ -429,9 +414,14 @@ def auth_status() -> AuthStatusResponse:
         else True
     )
     # Only while the default password stands: that is what the deadline fires on.
+    from auth.policy import installation_has_managed_accounts, login_mode
+
     return AuthStatusResponse(
         initialized = storage.is_initialized(),
         default_username = storage.DEFAULT_ADMIN_USERNAME,
+        login_mode = login_mode(),
+        # Public pre-login hint for older clients; signed-in clients use the account role.
+        full_access = not installation_has_managed_accounts(),
         requires_password_change = requires_change,
         bootstrap_deadline_seconds = (
             bootstrap_deadline_remaining_seconds() if requires_change else None
@@ -439,10 +429,26 @@ def auth_status() -> AuthStatusResponse:
     )
 
 
+def _login_failure_detail() -> str:
+    """PATH form only: the body is unauthenticated, so it must not reveal the account or install layout."""
+    command = _reset_password_command_on_path()
+    where = "in the environment Unsloth is installed in"
+    if policy.installation_is_multi_user():
+        return (
+            "Incorrect username, password or setup code. Ask the installation owner to reset "
+            f"the account, by running this on the Unsloth Studio host {where}: {command} "
+            "--username <name>"
+        )
+    return f"Incorrect password. To reset it, run this in your terminal, {where}: {command}"
+
+
 @router.post("/login", response_model = Token)
 async def login(payload: AuthLoginRequest, request: Request) -> Token:
     """Login with username/password. Per-account + per-IP rate-limited."""
-    key = _bucket_key(request, payload.username)
+    username = (
+        payload.username.casefold() if policy.installation_is_multi_user() else payload.username
+    )
+    key = _bucket_key(request, username)
     unknown_key = _unknown_user_key(request)
     blocked_for = max(_login_blocked(key), _login_blocked(unknown_key))
     if blocked_for > 0:
@@ -453,34 +459,42 @@ async def login(payload: AuthLoginRequest, request: Request) -> Token:
             headers = {"Retry-After": str(blocked_for)},
         )
 
-    record = storage.get_user_and_secret(payload.username)
+    record = storage.get_user_and_secret(username)
     if record is None:
-        # Record under one sentinel key per IP so attacker-controlled username
-        # cardinality can't allocate unbounded buckets.
-        _record_login_failure(unknown_key)
-        raise HTTPException(
-            status_code = status.HTTP_401_UNAUTHORIZED,
-            detail = f"Incorrect password. To reset it, run this in your terminal: {_reset_password_command()}",
-        )
-
-    salt, pwd_hash, jwt_secret, must_change_password = record
-    if not hashing.verify_password(payload.password, salt, pwd_hash):
+        # Per-name buckets as for real accounts: a shared unknown bucket is an existence oracle.
+        hashing.equalize_login_work(payload.password)
         _record_login_failure(key)
         raise HTTPException(
             status_code = status.HTTP_401_UNAUTHORIZED,
-            detail = f"Incorrect password. To reset it, run this in your terminal: {_reset_password_command()}",
+            detail = _login_failure_detail(),
+        )
+
+    if username == storage.DEFAULT_ADMIN_USERNAME:
+        salt, pwd_hash, jwt_secret, must_change_password = record
+        verified = hashing.verify_password(payload.password, salt, pwd_hash)
+    else:
+        record = storage.authenticate_account_login(username, payload.password)
+        verified = record is not None
+        if record is not None:
+            salt, pwd_hash, jwt_secret, must_change_password = record
+    if not verified:
+        _record_login_failure(key)
+        raise HTTPException(
+            status_code = status.HTTP_401_UNAUTHORIZED,
+            detail = _login_failure_detail(),
         )
 
     _clear_login_bucket(key)
     _clear_login_bucket(unknown_key)
     # Issue against the credential version just verified.
-    access_token = create_access_token(subject = payload.username, secret = jwt_secret)
-    refresh_token = create_refresh_token(subject = payload.username, secret = jwt_secret)
+    access_token = create_access_token(subject = username, secret = jwt_secret)
+    refresh_token = create_refresh_token(subject = username, secret = jwt_secret)
     return Token(
         access_token = access_token,
         refresh_token = refresh_token,
         token_type = "bearer",
         must_change_password = must_change_password,
+        account_id = _account_id_of(username),
     )
 
 
@@ -492,55 +506,99 @@ async def logout(
 ) -> Response:
     """Revoke refresh tokens for the subject; the access token is stateless and expires on its own."""
     try:
-        storage.revoke_user_refresh_tokens(current_subject)
+        storage.revoke_user_refresh_tokens(current_subject, account_id = _key_account_scope())
     except Exception:
         pass
-    try:
-        request.app.state.bootstrap_password = None
-    except AttributeError:
-        pass
+    if current_subject == storage.DEFAULT_ADMIN_USERNAME:
+        try:
+            request.app.state.bootstrap_password = None
+        except AttributeError:
+            pass
     return Response(status_code = status.HTTP_204_NO_CONTENT)
 
 
+# Sync def: PBKDF2 + SQLite would block the event loop.
 @router.post("/desktop-login", response_model = Token)
-async def desktop_login(payload: DesktopLoginRequest) -> Token:
-    """Exchange a local desktop secret for normal admin-subject tokens."""
+def desktop_login(payload: DesktopLoginRequest, request: Request) -> Token | Response:
+    """Before reading the bucket: the shell probes with an invalid secret every tick and needs 401, since any other status reads as unmanageable."""
+    if not storage.desktop_secret_is_well_formed(payload.secret):
+        raise HTTPException(
+            status_code = status.HTTP_401_UNAUTHORIZED,
+            detail = "Desktop authentication failed",
+        )
+
+    key = _desktop_login_key(request)
+    blocked_for = _login_blocked(key)
+    if blocked_for > 0:
+        raise HTTPException(
+            status_code = status.HTTP_429_TOO_MANY_REQUESTS,
+            detail = (f"Too many failed login attempts. " f"Try again in {blocked_for} seconds."),
+            headers = {"Retry-After": str(blocked_for)},
+        )
+
     verified = storage.validate_desktop_secret_with_credential(payload.secret)
     if verified is None:
+        _record_login_failure(key)
         raise HTTPException(
             status_code = status.HTTP_401_UNAUTHORIZED,
             detail = "Desktop authentication failed",
         )
     username, jwt_secret = verified
+    # Safe to clear the aggregate: the suffixed key belongs to this route alone, so clearing cannot hand out a fresh guessing budget.
+    _clear_login_bucket(key)
+    # Shell-owned backends never use the seeded password; terminal-started ones keep the web autofill.
+    if getattr(request.app.state, "desktop_owned", False):
+        request.app.state.bootstrap_password = None
+
+    from auth.policy import installation_is_multi_user
+
+    if installation_is_multi_user():
+        # The secret proves the shell owns the backend, not which account is using it.
+        return Response(
+            content = '{"login_required":true,"login_mode":"multi"}',
+            media_type = "application/json",
+        )
 
     return Token(
         access_token = create_access_token(subject = username, desktop = True, secret = jwt_secret),
         refresh_token = create_refresh_token(subject = username, desktop = True, secret = jwt_secret),
         token_type = "bearer",
         must_change_password = False,
+        account_id = _account_id_of(username),
     )
 
 
+# Sync def: rotation is one transaction, so a busy auth.db wait must not freeze the event loop.
 @router.post("/refresh", response_model = Token)
-async def refresh(payload: RefreshTokenRequest) -> Token:
+def refresh(payload: RefreshTokenRequest) -> Token:
     """Exchange a refresh token for a new access+refresh pair (single-use)."""
-    consumed = storage.consume_refresh_token(payload.refresh_token)
-    if consumed is None:
+    new_refresh_token, new_expires_at = new_refresh_token_value()
+    try:
+        rotated = storage.rotate_refresh_token(
+            payload.refresh_token, new_refresh_token, new_expires_at
+        )
+    except sqlite3.OperationalError as exc:
+        if not sqlite_gate.is_busy_error(exc):
+            raise
+        logger.warning("Token refresh deferred: auth.db is busy (%s)", exc)
+        raise HTTPException(
+            status_code = status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail = "Unsloth Studio is busy. Try again in a moment.",
+            headers = {"Retry-After": "2"},
+        )
+    if rotated is None:
         raise HTTPException(
             status_code = status.HTTP_401_UNAUTHORIZED,
             detail = "Invalid or expired refresh token",
         )
-    username, is_desktop, jwt_secret = consumed
-    new_access_token = create_access_token(subject = username, desktop = is_desktop, secret = jwt_secret)
-    new_refresh_token = create_refresh_token(
-        subject = username, desktop = is_desktop, secret = jwt_secret
-    )
-
     return Token(
-        access_token = new_access_token,
+        access_token = create_access_token(
+            subject = rotated.username, desktop = rotated.is_desktop, secret = rotated.jwt_secret
+        ),
         refresh_token = new_refresh_token,
         token_type = "bearer",
-        must_change_password = False if is_desktop else storage.requires_password_change(username),
+        must_change_password = rotated.must_change_password,
+        account_id = rotated.account_id,
     )
 
 
@@ -559,7 +617,7 @@ async def set_desktop_initial_password(
     already-authenticated desktop session may set it while the seeded credential
     is still in place. Once set, change-password owns every later change.
     """
-    if not is_desktop:
+    if not is_desktop or current_subject != storage.DEFAULT_ADMIN_USERNAME:
         raise HTTPException(
             status_code = status.HTTP_403_FORBIDDEN,
             detail = "This action requires the Unsloth desktop app.",
@@ -584,8 +642,7 @@ async def set_desktop_initial_password(
             detail = "New password cannot contain spaces",
         )
 
-    # Conditional on the credential just read: a concurrent web password change or reset-password
-    # must not be overwritten by a caller that verified no password at all.
+    # Conditional on the credential just read, so a concurrent change is not overwritten.
     new_secret = storage.update_password(
         current_subject,
         payload.new_password,
@@ -609,6 +666,7 @@ async def set_desktop_initial_password(
         refresh_token = refresh_token,
         token_type = "bearer",
         must_change_password = False,
+        account_id = _account_id_of(current_subject),
     )
 
 
@@ -645,25 +703,33 @@ async def change_password(
             detail = "New password must be different from the current password",
         )
 
-    # Single transaction: a separate refresh-token purge could fail after the password commit,
-    # leaving pre-change tokens able to mint access tokens. Conditional on the hash just
-    # verified, so a concurrent reset-password cannot be overwritten by it.
-    new_secret = storage.update_password(
-        current_subject,
-        payload.new_password,
-        revoke_refresh_tokens = True,
-        expect_password_hash = pwd_hash,
-        preserve_desktop_secret = is_desktop,
-    )
+    # Single transaction so pre-change refresh tokens cannot survive the password commit;
+    # conditional on the hash just verified so a concurrent reset-password is not overwritten.
+    if current_subject == storage.DEFAULT_ADMIN_USERNAME:
+        new_secret = storage.update_password(
+            current_subject,
+            payload.new_password,
+            revoke_refresh_tokens = True,
+            expect_password_hash = pwd_hash,
+            preserve_desktop_secret = is_desktop,
+        )
+    else:
+        new_secret = storage.update_account_password(
+            current_subject,
+            payload.new_password,
+            expect_password_hash = pwd_hash,
+            expect_secret = _jwt_secret,
+        )
     if new_secret is None:
         raise HTTPException(
             status_code = status.HTTP_409_CONFLICT,
             detail = "The password changed while this request was in flight. Sign in again.",
         )
-    try:
-        request.app.state.bootstrap_password = None
-    except AttributeError:
-        pass
+    if current_subject == storage.DEFAULT_ADMIN_USERNAME:
+        try:
+            request.app.state.bootstrap_password = None
+        except AttributeError:
+            pass
     access_token = create_access_token(
         subject = current_subject, desktop = is_desktop, secret = new_secret
     )
@@ -675,11 +741,8 @@ async def change_password(
         refresh_token = refresh_token,
         token_type = "bearer",
         must_change_password = False,
+        account_id = _account_id_of(current_subject),
     )
-
-
-# API key management
-# ---------------------------------------------------------------------------
 
 
 def _row_to_api_key_response(row: dict) -> ApiKeyResponse:
@@ -691,22 +754,45 @@ def _row_to_api_key_response(row: dict) -> ApiKeyResponse:
         last_used_at = row.get("last_used_at"),
         expires_at = row.get("expires_at"),
         is_active = bool(row["is_active"]),
+        purpose = row.get("purpose"),
     )
+
+
+def _key_account_scope() -> "str | None":
+    from utils.account_context import current_account, is_owner_context
+    if is_owner_context():
+        return None
+    return current_account().account_id
 
 
 @router.post("/api-keys", response_model = CreateApiKeyResponse)
 async def create_api_key(
     payload: CreateApiKeyRequest,
     credential: tuple = Depends(get_current_credential),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
     _own_credential: None = Depends(_require_a_credential_of_its_own("Managing API keys")),
+    is_desktop: bool = Depends(authenticated_via_desktop_jwt),
 ) -> CreateApiKeyResponse:
     """Create a new API key. The raw key is returned once and cannot be retrieved later."""
     current_subject, generation = credential
+    if payload.name == storage.UNSLOTH_START_API_KEY_NAME and not is_desktop:
+        raise HTTPException(
+            status_code = status.HTTP_403_FORBIDDEN,
+            detail = "This key name is reserved for `unsloth start`.",
+        )
     expires_at = None
     if payload.expires_in_days is not None:
         expires_at = (
             datetime.now(timezone.utc) + timedelta(days = payload.expires_in_days)
         ).isoformat()
+    # A key minted with an expiring key expires no later than it, so a leaked short-lived key cannot
+    # be turned into a permanent one.
+    parent_expires_at = _api_key_caller_expiry(credentials)
+    if parent_expires_at is not None and (
+        expires_at is None
+        or datetime.fromisoformat(expires_at) > datetime.fromisoformat(parent_expires_at)
+    ):
+        expires_at = parent_expires_at
 
     try:
         raw_key, row = storage.create_api_key(
@@ -714,6 +800,10 @@ async def create_api_key(
             name = payload.name,
             expires_at = expires_at,
             expect_gen = generation,
+            account_id = _key_account_scope(),
+            purpose = storage.UNSLOTH_START_API_KEY_PURPOSE
+            if payload.name == storage.UNSLOTH_START_API_KEY_NAME
+            else None,
         )
     except storage.CredentialRotated:
         raise HTTPException(
@@ -726,13 +816,30 @@ async def create_api_key(
     )
 
 
+def _api_key_caller_expiry(credentials: Optional[HTTPAuthorizationCredentials]) -> Optional[str]:
+    """Expiry of the sk-unsloth key that authenticated this request, or None (UI session, keyless
+    caller, or a key that never expires)."""
+    if credentials is None or is_keyless(credentials):
+        return None
+    raw = credentials.credentials or ""
+    if not raw.startswith(storage.API_KEY_PREFIX):
+        return None
+    validated = storage.validate_api_key_account(raw, touch = False)
+    if validated is None:
+        # Expired or revoked since it authenticated: no cap to apply, so refuse rather than mint uncapped.
+        raise HTTPException(
+            status_code = status.HTTP_401_UNAUTHORIZED, detail = "Invalid or expired token"
+        )
+    return validated[0].get("expires_at")
+
+
 @router.get("/api-keys", response_model = ApiKeyListResponse)
 def list_api_keys(
     current_subject: str = Depends(get_current_subject),
     _own_credential: None = Depends(_require_a_credential_of_its_own("Managing API keys")),
 ) -> ApiKeyListResponse:
     """List all API keys for the authenticated user (raw keys are never exposed)."""
-    rows = storage.list_api_keys(current_subject)
+    rows = storage.list_api_keys(current_subject, account_id = _key_account_scope())
     return ApiKeyListResponse(
         api_keys = [_row_to_api_key_response(r) for r in rows],
     )
@@ -745,7 +852,7 @@ async def revoke_api_key(
     _own_credential: None = Depends(_require_a_credential_of_its_own("Managing API keys")),
 ) -> dict:
     """Revoke (soft-delete) an API key."""
-    if not storage.revoke_api_key(current_subject, key_id):
+    if not storage.revoke_api_key(current_subject, key_id, account_id = _key_account_scope()):
         raise HTTPException(
             status_code = status.HTTP_404_NOT_FOUND,
             detail = "API key not found",

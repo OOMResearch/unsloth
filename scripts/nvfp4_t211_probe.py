@@ -47,7 +47,8 @@ def diagnostics() -> None:
         f"e8m0={hasattr(torch, 'float8_e8m0fnu')} _scaled_mm={hasattr(torch, '_scaled_mm')}",
         flush = True,
     )
-    # torchao prints "Skipping import of cpp extensions" on torch<2.11; its absence means CUTLASS FP4 is live.
+    # torchao prints "Skipping import of cpp extensions" on torch<2.11;
+    # its absence means CUTLASS FP4 is live.
     print(
         "  (no 'Skipping import of cpp extensions' line above => cpp/CUTLASS ext loaded)",
         flush = True,
@@ -79,7 +80,7 @@ def _bench_linear(K, N, M, cfg, iters, compile_):
     fn = torch.compile(m, fullgraph = True, dynamic = False) if compile_ else m
     x = torch.randn(M, K, device = "cuda", dtype = torch.bfloat16)
     with torch.no_grad():
-        for _ in range(3):  # warmup / compile
+        for _ in range(3):
             fn(x)
         torch.cuda.synchronize()
         dts = []
@@ -212,7 +213,7 @@ def e2e(steps, res, seed, iters, mf):
                 print(
                     f"    [{tag}] compile failed: {type(exc).__name__}: {str(exc)[:90]}", flush = True
                 )
-        _gen(pipe, steps, seed, res)  # warmup / compile
+        _gen(pipe, steps, seed, res)
         dts, img = [], None
         for _ in range(iters):
             img, dt = _gen(pipe, steps, seed, res)

@@ -28,7 +28,7 @@ function makeDefaultSeedConfig(id: string): SeedConfig {
     hf_split: "",
     hf_path: "",
     hf_token: "",
-    hf_endpoint: "https://huggingface.co",
+    hf_endpoint: "",
     local_file_name: "",
     unstructured_file_ids: [],
     unstructured_file_names: [],
@@ -71,7 +71,8 @@ function parseSeedSettings(seedConfigRaw: unknown): Partial<SeedConfig> {
   let seed_source_type: SeedSourceType = "hf";
   let hf_path = "";
   let hf_token = "";
-  let hf_endpoint = "https://huggingface.co";
+  // Blank so an endpoint that arrives later is picked up at build time.
+  let hf_endpoint = "";
   let hf_repo_id = "";
   let local_file_name = "";
   let unstructuredFileIds: string[] = [];
@@ -197,6 +198,7 @@ export function parseSeedConfig(
     seed_columns?: string[];
     seed_drop_columns?: string[];
     seed_preview_rows?: Record<string, unknown>[];
+    seed_total_rows?: number;
     local_file_name?: string;
     unstructuredUploadUid?: string;
     unstructuredFileIds?: string[];
@@ -228,7 +230,7 @@ export function parseSeedConfig(
   }
   return {
     ...makeDefaultSeedConfig(id),
-    ...parsed, // payload-only fields override ui defaults
+    ...parsed,
     seed_source_type: sourceType,
     ...(options?.drop !== undefined ? { drop: options.drop } : {}),
     ...(options?.seed_columns ? { seed_columns: options.seed_columns } : {}),
@@ -237,6 +239,9 @@ export function parseSeedConfig(
       : {}),
     ...(options?.seed_preview_rows
       ? { seed_preview_rows: options.seed_preview_rows }
+      : {}),
+    ...(options?.seed_total_rows !== undefined
+      ? { seed_total_rows: options.seed_total_rows }
       : {}),
     ...(options?.local_file_name !== undefined
       ? { local_file_name: options.local_file_name }

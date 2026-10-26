@@ -1,15 +1,15 @@
+//! Cleans up what the 805-807 background update left on disk. Nothing here activates a stage.
+//! Every step is a rename or a delete, so it is idempotent.
+
 use crate::process_identity::ProcessOrigin;
 use log::{info, warn};
-use serde::{Deserialize, Serialize};
-use std::cmp::Ordering;
-use std::fs::{self, File};
-use std::io::Write;
+use serde::Deserialize;
+use std::fs;
 use std::path::{Path, PathBuf};
 
-pub(crate) const STAGE_DIR: &str = ".update-stage";
+const STAGE_DIR: &str = ".update-stage";
 const PREV_DIR: &str = ".update-prev";
 const FAILED_MARKER: &str = ".update-failed.json";
-const READY_MARKER: &str = "READY.json";
 const PENDING_MARKER: &str = "PENDING.json";
 const CONFIRMED_MARKER: &str = "CONFIRMED.json";
 const ROLLED_BACK_MARKER: &str = "ROLLED_BACK.json";
@@ -20,7 +20,7 @@ const RUNTIME_ENTRIES: [&str; 4] = [
     ".venv_t5_550",
     ".venv_t5_510",
 ];
-const HELPER_RUNTIME_ENTRIES: [&str; 3] = ["node", "llama.cpp", "whisper.cpp"];
+const HELPER_RUNTIME_ENTRIES: [&str; 4] = ["node", "llama.cpp", "whisper.cpp", "audio.cpp"];
 
 fn all_runtime_entries() -> impl Iterator<Item = &'static str> {
     RUNTIME_ENTRIES.into_iter().chain(HELPER_RUNTIME_ENTRIES)
@@ -34,118 +34,91 @@ fn live_entry(home: &Path, name: &str) -> PathBuf {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct StagedVersions {
-    pub backend_version: String,
-    #[serde(default)]
-    pub shell_version: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+/// Unknown fields are ignored, so a journal from any of 805-807 still parses.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 struct ActivationJournal {
-    #[serde(flatten)]
-    versions: StagedVersions,
     #[serde(default)]
     previous_entries: Vec<String>,
-}
-
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct StagedUpdateStatus {
-    pub state: &'static str,
-    pub backend_version: Option<String>,
-    pub shell_version: Option<String>,
-    /// A staged child is running now, so a partial stage is being written rather
-    /// than left over.
-    pub staging: bool,
-    pub staging_shell_version: Option<String>,
-}
-
-impl StagedUpdateStatus {
-    fn with(state: &'static str, versions: Option<StagedVersions>) -> Self {
-        Self {
-            state,
-            backend_version: versions.as_ref().map(|v| v.backend_version.clone()),
-            shell_version: versions.and_then(|v| v.shell_version),
-            staging: false,
-            staging_shell_version: None,
-        }
-    }
-}
-
-fn read_versions(path: &Path) -> Option<StagedVersions> {
-    serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
-}
-
-fn write_versions(path: &Path, versions: &StagedVersions) -> Result<(), String> {
-    let body = serde_json::to_vec_pretty(versions).map_err(|e| e.to_string())?;
-    write_atomic(path, &body)
 }
 
 fn read_journal(path: &Path) -> Option<ActivationJournal> {
     serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
 }
 
-pub(crate) fn pending_versions(home: &Path) -> Option<StagedVersions> {
-    read_journal(&home.join(PREV_DIR).join(PENDING_MARKER)).map(|journal| journal.versions)
+pub(crate) fn reconcile_legacy_at_launch(home: &Path) {
+    remove_stale_trash(home);
+    let _ = fs::remove_file(home.join(FAILED_MARKER));
+    // Before the rollback: a READY stage must never be activated, and a rollback that saw one
+    // would leave unrestored entries live.
+    discard_stage(home);
+    if let Err(error) = roll_back_unconfirmed(home) {
+        warn!("[staged-update] could not restore the previous runtime: {error}");
+    }
 }
 
-fn write_journal(path: &Path, journal: &ActivationJournal) -> Result<(), String> {
-    let body = serde_json::to_vec_pretty(journal).map_err(|e| e.to_string())?;
-    write_atomic(path, &body)
+/// Settle a deferred legacy rollback before an update mutates the live runtime, or the next idle
+/// launch would restore the pre-update trees over it.
+pub(crate) fn reconcile_before_update(home: &Path) -> Result<(), String> {
+    if !home.join(PREV_DIR).is_dir() && !home.join(STAGE_DIR).exists() {
+        return Ok(());
+    }
+    reconcile_before_update_with(home, live_tree_in_use(home))
 }
 
-fn write_atomic(path: &Path, body: &[u8]) -> Result<(), String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("{} has no parent", path.display()))?;
-    fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-    let mut temporary = tempfile::Builder::new()
-        .prefix(".update-marker-")
-        .tempfile_in(parent)
-        .map_err(|e| format!("{}: {e}", parent.display()))?;
-    temporary
-        .write_all(body)
-        .and_then(|()| temporary.as_file().sync_all())
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    temporary
-        .persist(path)
-        .map_err(|e| format!("{}: {}", path.display(), e.error))?;
-    #[cfg(unix)]
-    let _ = File::open(parent).and_then(|directory| directory.sync_all());
+fn reconcile_before_update_with(home: &Path, in_use: bool) -> Result<(), String> {
+    // Restarting is the fix: an idle launch finishes the rollback itself.
+    const RESTART: &str =
+        "An unfinished background update from an earlier release is still waiting on a \
+         running backend. Quit Unsloth, reopen it, and update again.";
+    if in_use {
+        return Err(RESTART.to_string());
+    }
+    discard_stage(home);
+    roll_back_unconfirmed_with(home, false)?;
+    if home.join(PREV_DIR).join(PENDING_MARKER).is_file() {
+        return Err(RESTART.to_string());
+    }
     Ok(())
 }
 
-pub(crate) fn status(home: &Path) -> StagedUpdateStatus {
+/// A rename, not a delete: unlinking a torch-sized tree here would hold the runtime gate through
+/// all of setup.
+fn discard_stage(home: &Path) {
+    discard_stage_with(home, |from, to| fs::rename(from, to));
+}
+
+fn discard_stage_with(home: &Path, rename: impl Fn(&Path, &Path) -> std::io::Result<()>) {
     let stage = home.join(STAGE_DIR);
-    if let Some(versions) = read_versions(&stage.join(READY_MARKER)) {
-        return StagedUpdateStatus::with("ready", Some(versions));
-    }
-    if stage.is_dir() {
-        return StagedUpdateStatus::with("partial", None);
-    }
-    if let Some(versions) = read_versions(&home.join(FAILED_MARKER)) {
-        return StagedUpdateStatus::with("failed", Some(versions));
-    }
-    StagedUpdateStatus::with("none", None)
-}
-
-pub(crate) fn discard(home: &Path) {
-    let _ = fs::remove_dir_all(home.join(STAGE_DIR));
-}
-
-pub(crate) fn reconcile_at_launch(home: &Path, shell_version: &str) {
-    remove_stale_trash(home);
-    if let Err(error) = roll_back_unconfirmed(home) {
-        // Activating now would delete .update-prev, and a rollback that failed part
-        // way may have left the unconfirmed runtime live: the next candidate would
-        // then be recorded against it with the last known-good copy already gone.
-        warn!("[staged-update] rollback failed, not activating: {error}");
+    if !stage.exists() {
         return;
     }
-    if let Err(error) = activate_ready(home, shell_version) {
-        warn!("[staged-update] activation failed: {error}");
+    let trash = trash_path(home, "stage");
+    if rename(&stage, &trash).is_ok() {
+        std::thread::spawn(move || {
+            let _ = fs::remove_dir_all(trash);
+        });
+        return;
     }
+    // Off the launch path: on Windows the rename fails when a file inside is open. A stage that
+    // survives is inert.
+    std::thread::spawn(move || {
+        let _ = fs::remove_dir_all(stage);
+    });
+}
+
+/// A coarse clock can repeat, so the counter keeps trash names distinct within a launch.
+static TRASH_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn trash_path(home: &Path, label: &str) -> PathBuf {
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = TRASH_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    home.join(format!(
+        "{ROLLBACK_TRASH_PREFIX}{label}-{}-{suffix}-{sequence}",
+        std::process::id()
+    ))
 }
 
 fn remove_stale_trash(home: &Path) {
@@ -171,113 +144,51 @@ fn remove_stale_trash(home: &Path) {
     });
 }
 
-pub(crate) fn confirm_activated(home: &Path, observed_backend_version: &str) -> bool {
-    let prev = home.join(PREV_DIR);
-    let Some(versions) = read_versions(&prev.join(PENDING_MARKER)) else {
-        return false;
-    };
-    if crate::desktop_update_policy::compare_versions(
-        observed_backend_version,
-        &versions.backend_version,
-    ) < 0
-    {
-        warn!(
-            "[staged-update] backend {} is older than staged runtime {}",
-            observed_backend_version, versions.backend_version
-        );
-        return false;
+/// Quarantine the confirmed backup by atomic rename, then unlink it. A delete in place could leave
+/// a `.update-prev` the next launch rolls back to.
+fn quarantine_confirmed_previous(home: &Path, prev: PathBuf) {
+    let trash = trash_path(home, "confirmed");
+    if fs::rename(&prev, &trash).is_err() {
+        // Still consistent: leave it for the next launch rather than strand the marker.
+        warn!("[staged-update] could not quarantine the confirmed backup, leaving it for the next launch");
+        return;
     }
-    if let Err(error) = write_versions(&prev.join(CONFIRMED_MARKER), &versions) {
-        warn!("[staged-update] could not confirm activated runtime: {error}");
-        return false;
-    }
-    info!("[staged-update] backend healthy, dropping previous runtime");
     std::thread::spawn(move || {
-        remove_confirmed_previous(&prev);
+        let _ = fs::remove_dir_all(trash);
     });
-    true
-}
-
-fn remove_confirmed_previous(prev: &Path) {
-    if let Ok(entries) = fs::read_dir(prev) {
-        for entry in entries.flatten() {
-            if entry.file_name() == CONFIRMED_MARKER {
-                continue;
-            }
-            let path = entry.path();
-            if path.is_dir() {
-                let _ = fs::remove_dir_all(path);
-            } else {
-                let _ = fs::remove_file(path);
-            }
-        }
-    }
-    let _ = fs::remove_file(prev.join(CONFIRMED_MARKER));
-    let _ = fs::remove_dir(prev);
 }
 
 fn roll_back_unconfirmed(home: &Path) -> Result<(), String> {
+    // `live_tree_in_use` is costly; installs that never took a 805-807 update skip it.
+    if !home.join(PREV_DIR).is_dir() {
+        return Ok(());
+    }
     roll_back_unconfirmed_with(home, live_tree_in_use(home))
-}
-
-pub(crate) fn roll_back_failed_activation(
-    home: &Path,
-) -> Result<Option<StagedVersions>, String> {
-    let versions = pending_versions(home);
-    if versions.is_none() || live_tree_in_use(home) {
-        return Ok(None);
-    }
-    roll_back_unconfirmed_with(home, false)?;
-    Ok(versions)
-}
-
-pub(crate) fn recover_failed_activation(
-    home: &Path,
-    restart: impl FnOnce(),
-) -> Result<bool, String> {
-    if roll_back_failed_activation(home)?.is_none() {
-        return Ok(false);
-    }
-    restart();
-    Ok(true)
 }
 
 fn roll_back_unconfirmed_with(home: &Path, in_use: bool) -> Result<(), String> {
     let prev = home.join(PREV_DIR);
     if prev.join(CONFIRMED_MARKER).is_file() {
-        remove_confirmed_previous(&prev);
+        quarantine_confirmed_previous(home, prev);
         return Ok(());
     }
-    let rolled_back = prev.join(ROLLED_BACK_MARKER);
-    if rolled_back.is_file() {
-        if let Some(versions) = read_versions(&rolled_back) {
-            let failed = home.join(FAILED_MARKER);
-            if !failed.is_file() {
-                write_versions(&failed, &versions)?;
-            }
-        }
-        let _ = fs::remove_dir_all(home.join(STAGE_DIR));
+    if prev.join(ROLLED_BACK_MARKER).is_file() {
         let _ = fs::remove_dir_all(&prev);
         return Ok(());
     }
     let journal = read_journal(&prev.join(PENDING_MARKER));
-    let versions = journal.as_ref().map(|journal| journal.versions.clone());
     let has_previous_runtime = all_runtime_entries().any(|name| prev.join(name).exists());
-    if versions.is_none() && !has_previous_runtime {
+    if journal.is_none() && !has_previous_runtime {
         if prev.is_dir() {
             let _ = fs::remove_dir_all(&prev);
         }
         return Ok(());
     }
     if in_use {
-        // Renaming the tree under a live process is unsafe, but a process that never
-        // reached validate_candidate_port is not healthy either. Confirming here
-        // would drop the only way back. Leave the marker: validate_candidate_port
-        // still confirms on a healthy port, and a later launch can still roll back.
+        // Never rename the tree under a live process; defer to the next launch.
         info!("[staged-update] runtime still in use, deferring the rollback decision");
         return Ok(());
     }
-    let versions = versions.or_else(|| read_versions(&home.join(STAGE_DIR).join(READY_MARKER)));
     let previous_entries = journal
         .map(|journal| journal.previous_entries)
         .filter(|entries| !entries.is_empty())
@@ -287,15 +198,9 @@ fn roll_back_unconfirmed_with(home: &Path, in_use: bool) -> Result<(), String> {
                 .map(str::to_string)
                 .collect()
         });
-    info!("[staged-update] staged backend never became healthy, restoring previous runtime");
+    info!("[staged-update] restoring the runtime a background update replaced");
     let trash = restore_previous_runtime(home, &prev, &previous_entries)?;
-    if let Some(versions) = versions.as_ref() {
-        let failed = home.join(FAILED_MARKER);
-        let _ = fs::remove_file(&failed);
-        write_versions(&failed, versions)?;
-        write_versions(&prev.join(ROLLED_BACK_MARKER), versions)?;
-    }
-    let _ = fs::remove_dir_all(home.join(STAGE_DIR));
+    let _ = fs::remove_file(prev.join(PENDING_MARKER));
     let _ = fs::remove_dir_all(&prev);
     std::thread::spawn(move || {
         let _ = fs::remove_dir_all(trash);
@@ -303,157 +208,19 @@ fn roll_back_unconfirmed_with(home: &Path, in_use: bool) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(unix)]
-fn finalize_stage_for_activation(stage: &Path) -> Result<(), String> {
-    let python = stage.join("unsloth_studio").join("bin").join("python");
-    let code = concat!(
-        "import sys; from pathlib import Path; ",
-        "from unsloth_cli._studio_stage import finalize_for_activation; ",
-        "finalize_for_activation(Path(sys.argv[1]))"
-    );
-    let output = std::process::Command::new(&python)
-        .args(["-I", "-c", code])
-        .arg(stage)
-        .current_dir(stage)
-        .env_remove("PYTHONHOME")
-        .env_remove("PYTHONPATH")
-        .env_remove("VIRTUAL_ENV")
-        .output()
-        .map_err(|error| format!("{}: {error}", python.display()))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Err(format!(
-        "{} exited with {}: {}",
-        python.display(),
-        output.status,
-        stderr.trim()
-    ))
-}
-
-#[cfg(windows)]
-fn finalize_stage_for_activation(_stage: &Path) -> Result<(), String> {
-    Ok(())
-}
-
-fn activate_ready(home: &Path, shell_version: &str) -> Result<(), String> {
-    let stage = home.join(STAGE_DIR);
-    if !stage.is_dir() {
-        return Ok(());
-    }
-    let Some(versions) = read_versions(&stage.join(READY_MARKER)) else {
-        info!("[staged-update] removing incomplete stage");
-        let _ = fs::remove_dir_all(&stage);
-        return Ok(());
-    };
-    if let Some(required) = versions.shell_version.as_deref() {
-        match shell_order(shell_version, required) {
-            Ordering::Less => {
-                info!("[staged-update] staged backend waits for app {required}");
-                return Ok(());
-            }
-            Ordering::Greater => {
-                info!("[staged-update] staged backend was built for app {required}, discarding");
-                let _ = fs::remove_dir_all(&stage);
-                return Ok(());
-            }
-            Ordering::Equal => {}
-        }
-    }
-    if live_tree_in_use(home) {
-        info!("[staged-update] runtime in use, keeping staged backend for the next launch");
-        return Ok(());
-    }
-    if let Err(error) = finalize_stage_for_activation(&stage) {
-        let failed = home.join(FAILED_MARKER);
-        let _ = fs::remove_file(&failed);
-        write_versions(&failed, &versions)?;
-        let _ = fs::remove_dir_all(&stage);
-        return Err(format!("staged runtime finalization failed: {error}"));
-    }
-    let prev = home.join(PREV_DIR);
-    let _ = fs::remove_dir_all(&prev);
-    fs::create_dir_all(&prev).map_err(|e| e.to_string())?;
-    let journal = ActivationJournal {
-        versions: versions.clone(),
-        previous_entries: all_runtime_entries()
-            .filter(|name| live_entry(home, name).exists())
-            .map(str::to_string)
-            .collect(),
-    };
-    write_journal(&prev.join(PENDING_MARKER), &journal)?;
-    if let Err(error) = swap_entries(home, &stage, &prev, false) {
-        let rollback = restore_previous_runtime(home, &prev, &journal.previous_entries);
-        if rollback.is_ok() {
-            let _ = fs::remove_file(prev.join(PENDING_MARKER));
-            let _ = fs::remove_dir_all(&prev);
-        }
-        return Err(match rollback {
-            Ok(trash) => {
-                let _ = fs::remove_dir_all(trash);
-                error
-            }
-            Err(rollback_error) => format!("{error}; rollback failed: {rollback_error}"),
-        });
-    }
-    let _ = fs::remove_file(home.join(FAILED_MARKER));
-    let _ = fs::remove_dir_all(&stage);
-    info!(
-        "[staged-update] activated backend {}",
-        versions.backend_version
-    );
-    Ok(())
-}
-
-/// A stage is only useful if it actually advanced to what this shell expects.
-///
-/// `unsloth studio update` upgrades best effort: against a stale mirror or an
-/// unreachable index it can succeed from cache without moving the cloned package,
-/// and the marker would then advertise a backend older than the shell needs. The
-/// restart would activate it and drop straight into preflight repair, or fail to
-/// start and roll back, instead of the fast update the pill promised.
-pub(crate) fn staged_backend_meets(home: &Path, required: &str) -> Result<(), String> {
-    let Some(actual) = status(home).backend_version else {
-        return Err("the staged update recorded no backend version".to_string());
-    };
-    if crate::desktop_update_policy::compare_versions(&actual, required) < 0 {
-        return Err(format!(
-            "staged backend {actual} is older than the {required} this app needs; \
-             the package index may be stale or unreachable"
-        ));
-    }
-    Ok(())
-}
-
-fn shell_order(current: &str, required: &str) -> Ordering {
-    match crate::desktop_update_policy::compare_versions(current, required) {
-        1 => Ordering::Greater,
-        -1 => Ordering::Less,
-        _ => Ordering::Equal,
-    }
-}
-
+/// Entries the previous runtime lacked are moved aside, so the restored backend does not import
+/// from unconfirmed sidecars.
 fn restore_previous_runtime(
     home: &Path,
     previous: &Path,
     previous_entries: &[String],
 ) -> Result<PathBuf, String> {
-    let stage = home.join(STAGE_DIR);
-    let suffix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let trash = home.join(format!(
-        "{ROLLBACK_TRASH_PREFIX}{}-{suffix}",
-        std::process::id()
-    ));
+    let trash = trash_path(home, "rollback");
     fs::create_dir_all(&trash).map_err(|e| e.to_string())?;
     let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
     let result = (|| {
         for name in all_runtime_entries() {
             let old = previous.join(name);
-            let staged = stage.join(name);
             let live = live_entry(home, name);
             if previous_entries.iter().any(|entry| entry == name) {
                 if old.exists() {
@@ -462,7 +229,7 @@ fn restore_previous_runtime(
                     }
                     rename_tracked(&old, &live, &mut moved)?;
                 }
-            } else if !staged.exists() && live.exists() {
+            } else if live.exists() {
                 rename_tracked(&live, &trash.join(name), &mut moved)?;
             }
         }
@@ -476,44 +243,6 @@ fn restore_previous_runtime(
     result.map(|()| trash)
 }
 
-/// `evict_extra` moves a live entry the incoming tree does not have out of the way
-/// instead of leaving it. Rollback needs it: a legacy install with no tiered
-/// sidecars has nothing to put in `.update-prev` for them, so without this the
-/// failed update's sidecars stay live beside the restored backend, which then
-/// imports from an environment that was never confirmed. Activation must not do
-/// it -- there the live tree is the one being preserved.
-fn swap_entries(
-    home: &Path,
-    incoming: &Path,
-    outgoing: &Path,
-    evict_extra: bool,
-) -> Result<(), String> {
-    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
-    let result = (|| {
-        for name in all_runtime_entries() {
-            let staged = incoming.join(name);
-            let live = live_entry(home, name);
-            if !staged.exists() {
-                if evict_extra && live.exists() {
-                    rename_tracked(&live, &outgoing.join(name), &mut moved)?;
-                }
-                continue;
-            }
-            if live.exists() {
-                rename_tracked(&live, &outgoing.join(name), &mut moved)?;
-            }
-            rename_tracked(&staged, &live, &mut moved)?;
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        for (from, to) in moved.iter().rev() {
-            let _ = fs::rename(to, from);
-        }
-    }
-    result
-}
-
 fn rename_tracked(
     from: &Path,
     to: &Path,
@@ -525,15 +254,9 @@ fn rename_tracked(
     Ok(())
 }
 
-/// Pids that claim to be a backend of this install.
-///
-/// Mirrors `live_sibling_backend` in studio/backend/run.py, which reads all three
-/// record kinds because a backend can be in a state where only one exists: a
-/// startup marker while it is still binding, a per-port record once it has bound,
-/// and a bare `studio.pid` for a pre-upgrade server or one whose per-port write
-/// failed. Markers matter most here: the backend keeps its marker after dropping
-/// its pid records until shutdown really finishes, and renaming the tree during
-/// either window would move it under a process still importing out of it.
+/// Pids claiming to be a backend of this install. Mirrors `live_sibling_backend` in run.py and
+/// reads startup markers, per-port records and `studio.pid`; a backend may have only one. Markers
+/// matter most: a backend keeps its marker after dropping its pid records.
 fn recorded_pids(home: &Path) -> Vec<u32> {
     let mut pids = Vec::new();
     let mut timed = Vec::new();
@@ -543,8 +266,6 @@ fn recorded_pids(home: &Path) -> Vec<u32> {
             let Some(name) = name.to_str() else {
                 continue;
             };
-            // Markers use the same body layout as a per-port record, so both carry
-            // the start time that settles a reused pid.
             let pid = name
                 .strip_suffix(".marker")
                 .and_then(|rest| rest.strip_prefix("studio-starting-"))
@@ -557,8 +278,7 @@ fn recorded_pids(home: &Path) -> Vec<u32> {
             let Some(pid) = pid else {
                 continue;
             };
-            // Judged either way, so the untimed legacy record below must not
-            // resurrect a pid this evidence already rejected.
+            // Judged either way, so the untimed legacy record must not resurrect this pid.
             timed.push(pid);
             if crate::process_identity::pid_start_time_matches(
                 pid,
@@ -570,8 +290,6 @@ fn recorded_pids(home: &Path) -> Vec<u32> {
     }
     if let Ok(body) = fs::read_to_string(home.join("studio.pid")) {
         if let Some(pid) = body.lines().next().and_then(|l| l.trim().parse::<u32>().ok()) {
-            // It carries no start time, so on its own it would re-add a pid the
-            // timed records just proved was reused.
             if !timed.contains(&pid) {
                 pids.push(pid);
             }
@@ -605,31 +323,43 @@ fn live_tree_in_use(home: &Path) -> bool {
 mod tests {
     use super::*;
 
+    const READY_MARKER: &str = "READY.json";
+
+    /// One level below a private container: `live_entry` resolves helpers against the parent.
     fn temp_home(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "unsloth-staged-update-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+        let home = std::env::temp_dir()
+            .join(format!(
+                "unsloth-staged-update-{name}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ))
+            .join("studio");
+        fs::create_dir_all(&home).unwrap();
+        home
     }
 
-    /// Three code paths drop a tree on a background thread, and Windows refuses to
-    /// remove a directory while another handle is still walking inside it, so a
-    /// teardown that races one of them fails with ERROR_ACCESS_DENIED rather than
-    /// telling anyone anything. Retry until the deleter is done.
+    /// Windows refuses to remove a dir another thread is walking (ERROR_ACCESS_DENIED); retry.
     fn cleanup(home: PathBuf) {
         for _ in 0..100 {
             if fs::remove_dir_all(&home).is_ok() || !home.exists() {
+                let _ = home.parent().map(fs::remove_dir_all);
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         fs::remove_dir_all(&home).unwrap();
+    }
+
+    fn wait_gone(path: &Path) {
+        for _ in 0..250 {
+            if !path.exists() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     fn make_runtime(root: &Path, tag: &str) {
@@ -643,202 +373,207 @@ mod tests {
         fs::read_to_string(root.join(name).join("tag")).unwrap_or_default()
     }
 
-    fn stage_ready(home: &Path, versions: &StagedVersions) {
+    fn write_marker(path: &Path, previous_entries: &[String]) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let body = serde_json::json!({
+            "backend_version": "2026.9.1",
+            "shell_version": "0.1.900-beta",
+            "previous_entries": previous_entries,
+        });
+        fs::write(path, serde_json::to_vec_pretty(&body).unwrap()).unwrap();
+    }
+
+    fn stage_ready(home: &Path) {
         let stage = home.join(STAGE_DIR);
         make_runtime(&stage, "new");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            let python = stage.join("unsloth_studio").join("bin").join("python");
-            fs::create_dir_all(python.parent().unwrap()).unwrap();
-            fs::write(&python, "#!/bin/sh\nexit 0\n").unwrap();
-            let mut permissions = fs::metadata(&python).unwrap().permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(&python, permissions).unwrap();
-        }
-        write_versions(&stage.join(READY_MARKER), versions).unwrap();
+        write_marker(&stage.join(READY_MARKER), &[]);
     }
 
-    fn versions(shell: Option<&str>) -> StagedVersions {
-        StagedVersions {
-            backend_version: "2026.9.1".into(),
-            shell_version: shell.map(str::to_string),
+    /// What 805-807 did at activation.
+    fn activate_by_hand(home: &Path) -> Vec<String> {
+        let stage = home.join(STAGE_DIR);
+        let prev = home.join(PREV_DIR);
+        fs::create_dir_all(&prev).unwrap();
+        let previous_entries: Vec<String> = all_runtime_entries()
+            .filter(|name| live_entry(home, name).exists())
+            .map(str::to_string)
+            .collect();
+        write_marker(&prev.join(PENDING_MARKER), &previous_entries);
+        for name in all_runtime_entries() {
+            let staged = stage.join(name);
+            let live = live_entry(home, name);
+            if !staged.exists() {
+                continue;
+            }
+            if live.exists() {
+                fs::rename(&live, prev.join(name)).unwrap();
+            }
+            fs::rename(&staged, &live).unwrap();
         }
+        let _ = fs::remove_dir_all(&stage);
+        previous_entries
     }
 
     #[test]
-    fn ready_stage_replaces_the_runtime_and_keeps_the_previous_one_pending() {
-        let home = temp_home("activate");
+    fn a_ready_stage_is_deleted_and_never_activated() {
+        let home = temp_home("ready-stage");
         make_runtime(&home, "old");
-        stage_ready(&home, &versions(Some("0.1.900-beta")));
+        stage_ready(&home);
 
-        reconcile_at_launch(&home, "0.1.900-beta");
+        reconcile_legacy_at_launch(&home);
 
+        assert!(!home.join(STAGE_DIR).exists());
+        assert_eq!(tag(&home, "unsloth_studio"), "old");
+        assert!(!home.join(PREV_DIR).exists());
+
+        reconcile_legacy_at_launch(&home);
+        assert_eq!(tag(&home, "unsloth_studio"), "old");
+        cleanup(home);
+    }
+
+    #[test]
+    fn a_ready_stage_is_discarded_before_the_rollback_it_would_otherwise_survive() {
+        // 807 crashed mid-swap: the venv is staged, the sidecars are not.
+        let home = temp_home("ready-stage-and-pending");
+        make_runtime(&home, "old");
+        stage_ready(&home);
+        let stage = home.join(STAGE_DIR);
+        let prev = home.join(PREV_DIR);
+        let previous_entries: Vec<String> = RUNTIME_ENTRIES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        write_marker(&prev.join(PENDING_MARKER), &previous_entries);
+        fs::rename(home.join("unsloth_studio"), prev.join("unsloth_studio")).unwrap();
+        fs::rename(stage.join("unsloth_studio"), home.join("unsloth_studio")).unwrap();
         assert_eq!(tag(&home, "unsloth_studio"), "new");
-        assert_eq!(tag(&home.join(PREV_DIR), "unsloth_studio"), "old");
-        assert!(home.join(PREV_DIR).join(PENDING_MARKER).is_file());
-        assert_eq!(pending_versions(&home), Some(versions(Some("0.1.900-beta"))));
-        assert!(!home.join(STAGE_DIR).exists());
-        assert_eq!(status(&home).state, "none");
+        assert!(stage.join(".venv_t5_530").exists());
+
+        reconcile_legacy_at_launch(&home);
+
+        for name in RUNTIME_ENTRIES {
+            assert_eq!(tag(&home, name), "old", "{name}");
+        }
+        assert!(!stage.exists());
+        assert!(!prev.exists());
         cleanup(home);
     }
 
     #[test]
-    fn stage_built_for_a_newer_shell_waits() {
-        let home = temp_home("wait");
+    fn a_stage_that_cannot_be_renamed_is_still_swept() {
+        let home = temp_home("stage-rename-fails");
         make_runtime(&home, "old");
-        stage_ready(&home, &versions(Some("0.1.901-beta")));
+        stage_ready(&home);
+        let stage = home.join(STAGE_DIR);
 
-        reconcile_at_launch(&home, "0.1.900-beta");
+        discard_stage_with(&home, |_, _| Err(std::io::Error::other("rename refused")));
 
+        wait_gone(&stage);
+        assert!(!stage.exists());
         assert_eq!(tag(&home, "unsloth_studio"), "old");
-        assert_eq!(status(&home).state, "ready");
         cleanup(home);
     }
 
     #[test]
-    fn stage_built_for_an_older_shell_is_discarded() {
-        let home = temp_home("discard");
+    fn two_trash_names_in_one_launch_never_collide() {
+        let home = temp_home("trash-names");
+
+        let first = trash_path(&home, "stage");
+        let second = trash_path(&home, "stage");
+
+        assert_ne!(first, second);
+        for path in [&first, &second] {
+            let name = path.file_name().unwrap().to_str().unwrap();
+            // Still swept by `remove_stale_trash`, which matches on the prefix alone.
+            assert!(name.starts_with(ROLLBACK_TRASH_PREFIX), "{name}");
+        }
+        cleanup(home);
+    }
+
+    #[test]
+    fn a_retained_desktop_update_bundle_survives_the_cleanup() {
+        let home = temp_home("bundle");
         make_runtime(&home, "old");
-        stage_ready(&home, &versions(Some("0.1.899-beta")));
+        stage_ready(&home);
+        for name in [".desktop-update-bundle", ".desktop-update-bundle.json"] {
+            fs::write(home.join(name), b"bundle").unwrap();
+        }
 
-        reconcile_at_launch(&home, "0.1.900-beta");
+        reconcile_legacy_at_launch(&home);
 
-        assert_eq!(tag(&home, "unsloth_studio"), "old");
-        assert!(!home.join(STAGE_DIR).exists());
+        for name in [".desktop-update-bundle", ".desktop-update-bundle.json"] {
+            assert_eq!(fs::read(home.join(name)).unwrap(), b"bundle", "{name}");
+        }
         cleanup(home);
     }
 
     #[test]
-    fn incomplete_stage_is_removed() {
-        let home = temp_home("partial");
+    fn a_half_written_stage_is_removed() {
+        let home = temp_home("partial-stage");
         make_runtime(&home, "old");
         make_runtime(&home.join(STAGE_DIR), "half");
-        assert_eq!(status(&home).state, "partial");
 
-        reconcile_at_launch(&home, "0.1.900-beta");
+        reconcile_legacy_at_launch(&home);
 
         assert_eq!(tag(&home, "unsloth_studio"), "old");
         assert!(!home.join(STAGE_DIR).exists());
         cleanup(home);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn a_stage_that_cannot_finalize_never_replaces_the_live_runtime() {
-        let home = temp_home("finalize-failure");
+    fn the_compatibility_failure_marker_is_removed_at_launch() {
+        let home = temp_home("failed-marker");
         make_runtime(&home, "old");
-        stage_ready(&home, &versions(Some("0.1.900-beta")));
-        let python = home
-            .join(STAGE_DIR)
-            .join("unsloth_studio")
-            .join("bin")
-            .join("python");
-        fs::write(&python, "#!/bin/sh\nexit 42\n").unwrap();
+        fs::write(
+            home.join(FAILED_MARKER),
+            r#"{"backend_version": "2026.9.1", "shell_version": "0.1.807-beta"}"#,
+        )
+        .unwrap();
 
-        reconcile_at_launch(&home, "0.1.900-beta");
+        reconcile_legacy_at_launch(&home);
 
+        assert!(!home.join(FAILED_MARKER).exists());
         assert_eq!(tag(&home, "unsloth_studio"), "old");
-        assert!(!home.join(STAGE_DIR).exists());
-        assert_eq!(status(&home).state, "failed");
         cleanup(home);
     }
 
     #[test]
-    fn unconfirmed_activation_rolls_back_and_records_the_failure() {
+    fn an_unconfirmed_activation_is_rolled_back_at_launch() {
         let home = temp_home("rollback");
         make_runtime(&home, "old");
-        stage_ready(&home, &versions(None));
-        reconcile_at_launch(&home, "0.1.900-beta");
+        stage_ready(&home);
+        activate_by_hand(&home);
         assert_eq!(tag(&home, "unsloth_studio"), "new");
 
-        reconcile_at_launch(&home, "0.1.900-beta");
+        reconcile_legacy_at_launch(&home);
 
         assert_eq!(tag(&home, "unsloth_studio"), "old");
         assert_eq!(tag(&home, ".venv_t5_530"), "old");
         assert!(!home.join(PREV_DIR).exists());
-        let failed = status(&home);
-        assert_eq!(failed.state, "failed");
-        assert_eq!(failed.backend_version.as_deref(), Some("2026.9.1"));
-        cleanup(home);
-    }
+        assert!(!home.join(FAILED_MARKER).exists());
 
-    #[test]
-    fn failed_activation_rolls_back_once_without_waiting_for_an_app_relaunch() {
-        let home = temp_home("same-launch-rollback");
-        make_runtime(&home, "old");
-        stage_ready(&home, &versions(None));
-        activate_ready(&home, "0.1.900-beta").unwrap();
-
-        let restarts = std::cell::Cell::new(0);
-        assert!(recover_failed_activation(&home, || restarts.set(restarts.get() + 1)).unwrap());
+        reconcile_legacy_at_launch(&home);
         assert_eq!(tag(&home, "unsloth_studio"), "old");
-        assert!(home.join(FAILED_MARKER).is_file());
-        assert!(!recover_failed_activation(&home, || restarts.set(restarts.get() + 1)).unwrap());
-        assert_eq!(restarts.get(), 1);
         cleanup(home);
     }
 
     #[test]
-    fn failed_activation_waits_until_the_live_runtime_is_unused() {
-        let home = temp_home("same-launch-live");
+    fn an_807_journal_with_extra_fields_still_names_the_entries_to_restore() {
+        let home = temp_home("journal-compat");
         make_runtime(&home, "old");
-        stage_ready(&home, &versions(None));
-        activate_ready(&home, "0.1.900-beta").unwrap();
-        let me = std::process::id();
-        fs::write(
-            home.join(format!("studio-starting-{me}.marker")),
-            format!("{me}\n"),
-        )
-        .unwrap();
+        let prev = home.join(PREV_DIR);
+        fs::create_dir_all(&prev).unwrap();
+        let body = r#"{
+            "backend_version": "2026.9.1",
+            "shell_version": "0.1.807-beta",
+            "previous_entries": ["unsloth_studio", ".venv_t5_530"],
+            "unknown_807_field": 7
+        }"#;
+        fs::write(prev.join(PENDING_MARKER), body).unwrap();
 
-        let restarts = std::cell::Cell::new(0);
-        assert!(!recover_failed_activation(&home, || restarts.set(1)).unwrap());
-        assert_eq!(tag(&home, "unsloth_studio"), "new");
-        assert!(home.join(PREV_DIR).join(PENDING_MARKER).is_file());
-        assert_eq!(restarts.get(), 0);
-        cleanup(home);
-    }
+        let journal = read_journal(&prev.join(PENDING_MARKER)).unwrap();
 
-    #[test]
-    fn confirmation_drops_the_previous_runtime_and_the_next_launch_keeps_the_new_one() {
-        let home = temp_home("confirm");
-        make_runtime(&home, "old");
-        stage_ready(&home, &versions(None));
-        reconcile_at_launch(&home, "0.1.900-beta");
-
-        assert!(confirm_activated(&home, "2026.9.1"));
-        for _ in 0..50 {
-            if !home.join(PREV_DIR).exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        reconcile_at_launch(&home, "0.1.900-beta");
-
-        assert_eq!(tag(&home, "unsloth_studio"), "new");
-        assert_eq!(status(&home).state, "none");
-        cleanup(home);
-    }
-
-    #[test]
-    fn an_older_backend_cannot_confirm_a_newer_activation() {
-        let home = temp_home("confirm-version");
-        make_runtime(&home, "old");
-        stage_ready(&home, &versions(None));
-        activate_ready(&home, "0.1.900-beta").unwrap();
-
-        assert!(!confirm_activated(&home, "2026.8.4"));
-        assert!(home.join(PREV_DIR).join(PENDING_MARKER).is_file());
-        assert_eq!(tag(&home.join(PREV_DIR), "unsloth_studio"), "old");
-        assert!(confirm_activated(&home, "2026.9.2"));
-        for _ in 0..50 {
-            if !home.join(PREV_DIR).exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        assert_eq!(journal.previous_entries, ["unsloth_studio", ".venv_t5_530"]);
         cleanup(home);
     }
 
@@ -847,15 +582,12 @@ mod tests {
         for completed_renames in 0..=RUNTIME_ENTRIES.len() * 2 {
             let home = temp_home(&format!("crash-{completed_renames}"));
             make_runtime(&home, "old");
-            stage_ready(&home, &versions(None));
+            stage_ready(&home);
             let stage = home.join(STAGE_DIR);
             let prev = home.join(PREV_DIR);
-            fs::create_dir_all(&prev).unwrap();
-            let journal = ActivationJournal {
-                versions: versions(None),
-                previous_entries: RUNTIME_ENTRIES.iter().map(|name| (*name).to_string()).collect(),
-            };
-            write_journal(&prev.join(PENDING_MARKER), &journal).unwrap();
+            let previous_entries: Vec<String> =
+                RUNTIME_ENTRIES.iter().map(|name| (*name).to_string()).collect();
+            write_marker(&prev.join(PENDING_MARKER), &previous_entries);
 
             let mut completed = 0;
             for name in RUNTIME_ENTRIES {
@@ -870,6 +602,7 @@ mod tests {
                 fs::rename(stage.join(name), home.join(name)).unwrap();
                 completed += 1;
             }
+            let _ = fs::remove_dir_all(&stage);
 
             roll_back_unconfirmed_with(&home, false).unwrap();
 
@@ -885,21 +618,9 @@ mod tests {
     fn repeating_an_interrupted_rollback_keeps_the_restored_runtime() {
         let home = temp_home("rollback-retry");
         make_runtime(&home, "old");
-        stage_ready(&home, &versions(None));
-        let stage = home.join(STAGE_DIR);
+        stage_ready(&home);
+        let previous_entries = activate_by_hand(&home);
         let prev = home.join(PREV_DIR);
-        fs::create_dir_all(&prev).unwrap();
-        let previous_entries: Vec<String> =
-            RUNTIME_ENTRIES.iter().map(|name| (*name).to_string()).collect();
-        write_journal(
-            &prev.join(PENDING_MARKER),
-            &ActivationJournal {
-                versions: versions(None),
-                previous_entries: previous_entries.clone(),
-            },
-        )
-        .unwrap();
-        swap_entries(&home, &stage, &prev, false).unwrap();
 
         let first_trash = restore_previous_runtime(&home, &prev, &previous_entries).unwrap();
         let second_trash = restore_previous_runtime(&home, &prev, &previous_entries).unwrap();
@@ -913,20 +634,16 @@ mod tests {
     }
 
     #[test]
-    fn an_interrupted_rollback_marker_recreates_the_failed_version() {
+    fn an_interrupted_rollback_marker_only_drops_the_bookkeeping() {
         let home = temp_home("rollback-marker-recovery");
         make_runtime(&home, "old");
-        let stage = home.join(STAGE_DIR);
-        make_runtime(&stage, "bad");
         let prev = home.join(PREV_DIR);
-        fs::create_dir_all(&prev).unwrap();
-        write_versions(&prev.join(ROLLED_BACK_MARKER), &versions(None)).unwrap();
+        write_marker(&prev.join(ROLLED_BACK_MARKER), &[]);
 
-        roll_back_unconfirmed_with(&home, false).unwrap();
+        reconcile_legacy_at_launch(&home);
 
-        assert_eq!(read_versions(&home.join(FAILED_MARKER)), Some(versions(None)));
+        assert!(!home.join(FAILED_MARKER).exists());
         assert_eq!(tag(&home, "unsloth_studio"), "old");
-        assert!(!stage.exists());
         assert!(!prev.exists());
         cleanup(home);
     }
@@ -935,105 +652,114 @@ mod tests {
     fn a_durable_confirmation_never_rolls_back_the_new_runtime() {
         let home = temp_home("confirmed-crash");
         make_runtime(&home, "old");
-        stage_ready(&home, &versions(None));
-        activate_ready(&home, "0.1.900-beta").unwrap();
+        stage_ready(&home);
+        activate_by_hand(&home);
         let prev = home.join(PREV_DIR);
-        write_versions(&prev.join(CONFIRMED_MARKER), &versions(None)).unwrap();
+        write_marker(&prev.join(CONFIRMED_MARKER), &[]);
 
-        roll_back_unconfirmed_with(&home, false).unwrap();
+        reconcile_legacy_at_launch(&home);
 
+        wait_gone(&prev);
         assert_eq!(tag(&home, "unsloth_studio"), "new");
         assert!(!prev.exists());
         cleanup(home);
     }
 
     #[test]
-    fn a_failed_swap_restores_every_entry_it_moved() {
-        let home = temp_home("swap-fail");
+    fn a_confirmed_backup_leaves_the_directory_the_moment_it_is_dropped() {
+        let home = temp_home("confirmed-quarantine");
         make_runtime(&home, "old");
-        let stage = home.join(STAGE_DIR);
-        make_runtime(&stage, "new");
+        stage_ready(&home);
+        activate_by_hand(&home);
         let prev = home.join(PREV_DIR);
-        let blocker = prev.join(".venv_t5_510");
-        fs::create_dir_all(&blocker).unwrap();
-        fs::write(blocker.join("occupied"), "").unwrap();
+        write_marker(&prev.join(CONFIRMED_MARKER), &[]);
 
-        let result = swap_entries(&home, &stage, &prev, false);
+        roll_back_unconfirmed_with(&home, false).unwrap();
 
-        assert!(result.is_err());
-        for name in RUNTIME_ENTRIES {
-            assert_eq!(tag(&home, name), "old", "{name}");
-            assert!(!prev.join(name).join("tag").exists(), "{name}");
-        }
-        assert_eq!(tag(&stage, "unsloth_studio"), "new");
+        assert!(!prev.exists());
+        assert_eq!(tag(&home, "unsloth_studio"), "new");
+
+        reconcile_legacy_at_launch(&home);
+        assert_eq!(tag(&home, "unsloth_studio"), "new");
         cleanup(home);
     }
 
     #[test]
-    fn swapping_back_restores_the_runtime_the_activation_replaced() {
-        let home = temp_home("swap-back");
+    fn a_deferred_rollback_is_settled_before_an_update_touches_the_runtime() {
+        let home = temp_home("before-update");
         make_runtime(&home, "old");
-        let stage = home.join(STAGE_DIR);
-        make_runtime(&stage, "new");
-        let prev = home.join(PREV_DIR);
-        fs::create_dir_all(&prev).unwrap();
+        stage_ready(&home);
+        activate_by_hand(&home);
+        roll_back_unconfirmed_with(&home, true).unwrap();
+        assert!(home.join(PREV_DIR).join(PENDING_MARKER).is_file());
 
-        swap_entries(&home, &stage, &prev, false).unwrap();
+        reconcile_before_update_with(&home, false).unwrap();
+
+        assert_eq!(tag(&home, "unsloth_studio"), "old");
+        assert!(!home.join(PREV_DIR).exists());
+        cleanup(home);
+    }
+
+    #[test]
+    fn an_update_is_refused_while_a_deferred_rollback_cannot_be_settled() {
+        let home = temp_home("before-update-busy");
+        make_runtime(&home, "old");
+        stage_ready(&home);
+        activate_by_hand(&home);
+
+        let error = reconcile_before_update_with(&home, true).unwrap_err();
+
+        assert!(error.contains("Quit Unsloth"), "{error}");
         assert_eq!(tag(&home, "unsloth_studio"), "new");
-        // What the failed-marker branch runs: the previous runtime goes back and the
-        // staged one returns to the stage, so the next launch can try it again.
-        swap_entries(&home, &prev, &stage, false).unwrap();
+        assert!(home.join(PREV_DIR).join(PENDING_MARKER).is_file());
+        cleanup(home);
+    }
 
-        for name in RUNTIME_ENTRIES {
-            assert_eq!(tag(&home, name), "old", "{name}");
-            assert_eq!(tag(&stage, name), "new", "{name}");
-        }
+    #[test]
+    fn an_install_that_never_staged_has_nothing_to_settle_before_an_update() {
+        let home = temp_home("before-update-clean");
+        make_runtime(&home, "old");
+
+        reconcile_before_update(&home).unwrap();
+
+        assert_eq!(tag(&home, "unsloth_studio"), "old");
         cleanup(home);
     }
 
     #[test]
     fn rollback_takes_back_sidecars_the_failed_update_added() {
         let home = temp_home("rollback-extra");
-        // A legacy install: the managed venv is there, the tiered sidecars are not.
         fs::create_dir_all(home.join("unsloth_studio")).unwrap();
         fs::write(home.join("unsloth_studio").join("tag"), "old").unwrap();
-        // The staged update builds all of them.
-        stage_ready(&home, &versions(None));
-        reconcile_at_launch(&home, "0.1.900-beta");
+        stage_ready(&home);
+        activate_by_hand(&home);
         assert_eq!(tag(&home, "unsloth_studio"), "new");
         assert_eq!(tag(&home, ".venv_t5_530"), "new");
 
-        // The new backend never became healthy.
-        reconcile_at_launch(&home, "0.1.900-beta");
+        reconcile_legacy_at_launch(&home);
 
         assert_eq!(tag(&home, "unsloth_studio"), "old");
         for name in [".venv_t5_530", ".venv_t5_550", ".venv_t5_510"] {
-            // The restored backend must not find the unconfirmed update's sidecars.
             assert!(!home.join(name).exists(), "{name}");
         }
-        assert_eq!(status(&home).state, "failed");
         cleanup(home);
     }
 
     #[test]
-    fn native_helpers_activate_and_roll_back_with_the_python_runtime() {
-        let container = temp_home("helpers");
-        let home = container.join("studio");
-        fs::create_dir_all(&home).unwrap();
+    fn native_helpers_roll_back_with_the_python_runtime() {
+        let home = temp_home("helpers");
+        let container = home.parent().unwrap().to_path_buf();
         make_runtime(&home, "old");
-        stage_ready(&home, &versions(None));
+        stage_ready(&home);
         for name in HELPER_RUNTIME_ENTRIES {
             fs::create_dir_all(container.join(name)).unwrap();
             fs::write(container.join(name).join("tag"), "old").unwrap();
             fs::create_dir_all(home.join(STAGE_DIR).join(name)).unwrap();
             fs::write(home.join(STAGE_DIR).join(name).join("tag"), "new").unwrap();
         }
-
-        activate_ready(&home, "0.1.900-beta").unwrap();
-
+        activate_by_hand(&home);
         for name in HELPER_RUNTIME_ENTRIES {
             assert_eq!(tag(&container, name), "new", "{name}");
-            assert_eq!(tag(&home.join(PREV_DIR), name), "old", "{name}");
         }
 
         roll_back_unconfirmed_with(&home, false).unwrap();
@@ -1041,57 +767,26 @@ mod tests {
         for name in HELPER_RUNTIME_ENTRIES {
             assert_eq!(tag(&container, name), "old", "{name}");
         }
-        cleanup(container);
-    }
-
-    #[test]
-    fn undoing_an_activation_takes_the_staged_only_sidecars_back() {
-        let home = temp_home("undo-extra");
-        // A legacy install: the managed venv, and no tiered sidecars to swap back.
-        fs::create_dir_all(home.join("unsloth_studio")).unwrap();
-        fs::write(home.join("unsloth_studio").join("tag"), "old").unwrap();
-        let stage = home.join(STAGE_DIR);
-        make_runtime(&stage, "new");
-        let prev = home.join(PREV_DIR);
-        fs::create_dir_all(&prev).unwrap();
-
-        swap_entries(&home, &stage, &prev, false).unwrap();
-        assert_eq!(tag(&home, ".venv_t5_530"), "new");
-
-        // What activate_ready runs when the pending marker cannot be written.
-        swap_entries(&home, &prev, &stage, true).unwrap();
-
-        assert_eq!(tag(&home, "unsloth_studio"), "old");
-        for name in [".venv_t5_530", ".venv_t5_550", ".venv_t5_510"] {
-            // No marker is left to undo these later, so they cannot stay live.
-            assert!(!home.join(name).exists(), "{name}");
-            assert_eq!(tag(&stage, name), "new", "{name}");
-        }
         cleanup(home);
     }
 
     #[test]
-    fn a_runtime_still_in_use_defers_instead_of_confirming() {
+    fn a_runtime_still_in_use_defers_to_the_next_launch() {
         let home = temp_home("defer");
         make_runtime(&home, "old");
-        stage_ready(&home, &versions(None));
-        reconcile_at_launch(&home, "0.1.900-beta");
+        stage_ready(&home);
+        activate_by_hand(&home);
         assert_eq!(tag(&home, "unsloth_studio"), "new");
-        assert!(home.join(PREV_DIR).join(PENDING_MARKER).is_file());
 
-        // Force-closed after activation: a backend is alive on the new tree but it
-        // never reached validate_candidate_port, so nothing has vouched for it.
         roll_back_unconfirmed_with(&home, true).unwrap();
 
-        // Neither confirmed nor rolled back -- the way back has to survive.
         assert_eq!(tag(&home, "unsloth_studio"), "new");
         assert!(home.join(PREV_DIR).join(PENDING_MARKER).is_file());
 
-        // Once nothing holds the tree, the rollback it was owed still happens.
         roll_back_unconfirmed_with(&home, false).unwrap();
 
         assert_eq!(tag(&home, "unsloth_studio"), "old");
-        assert_eq!(status(&home).state, "failed");
+        assert!(!home.join(PREV_DIR).exists());
         cleanup(home);
     }
 
@@ -1102,7 +797,7 @@ mod tests {
         let trash = home.join(format!("{ROLLBACK_TRASH_PREFIX}1"));
         fs::create_dir_all(trash.join("unsloth_studio")).unwrap();
 
-        reconcile_at_launch(&home, "0.1.900-beta");
+        reconcile_legacy_at_launch(&home);
         for _ in 0..50 {
             if !trash.exists() {
                 break;
@@ -1115,24 +810,34 @@ mod tests {
         cleanup(home);
     }
 
-    /// This process, whose real start time the guard can be measured against.
     fn live_pid_or_skip(home: &Path) -> Option<u32> {
         let me = std::process::id();
         if crate::process_identity::process_start_time_secs(me).is_none() {
-            // The OS will not say, so the reuse guard cannot fire and neither can
-            // the assertion built on it.
             fs::remove_dir_all(home).ok();
             return None;
         }
         Some(me)
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stable_records_guard_updates_after_an_epoch_clock_shift() {
+        let home = temp_home("stable-markers");
+        let me = std::process::id();
+        let identity = crate::process_identity::linux_process_identity(me).unwrap();
+        let marker = home.join(format!("studio-starting-{me}.marker"));
+        fs::write(&marker, format!("{me}\n1.0\n\n{identity}\n")).unwrap();
+        assert!(recorded_pids(&home).contains(&me));
+        fs::write(&marker, format!("{me}\n1.0\n\nlinux:another-boot:0\n")).unwrap();
+        fs::write(home.join("studio.pid"), format!("{me}\n")).unwrap();
+        assert!(!recorded_pids(&home).contains(&me));
+        cleanup(home);
+    }
+
     #[test]
     fn a_startup_marker_counts_as_a_live_tree_record() {
         let home = temp_home("markers");
         let me = std::process::id();
-        // What a backend has while it is still binding, and what it keeps after
-        // dropping its pid records until shutdown finishes.
         fs::write(
             home.join(format!("studio-starting-{me}.marker")),
             format!("{me}\n"),
@@ -1149,8 +854,6 @@ mod tests {
         let Some(me) = live_pid_or_skip(&home) else {
             return;
         };
-        // A start time nowhere near this process's: the record describes something
-        // that is gone, and the pid has since been handed out again.
         fs::write(
             home.join(format!("studio-8888-{me}.pid")),
             format!("{me}\n1.0\n"),
@@ -1166,51 +869,9 @@ mod tests {
     fn a_bare_record_with_no_timed_evidence_still_counts() {
         let home = temp_home("bare");
         let me = std::process::id();
-        // A pre-upgrade backend, or one whose per-port write failed.
         fs::write(home.join("studio.pid"), format!("{me}\n")).unwrap();
 
         assert!(recorded_pids(&home).contains(&me));
-        cleanup(home);
-    }
-
-    #[test]
-    fn a_stage_that_never_reached_the_pinned_backend_is_rejected() {
-        let home = temp_home("version-gate");
-        stage_ready(
-            &home,
-            &StagedVersions {
-                // What a stale mirror leaves behind: setup succeeded from cache and
-                // the cloned package never moved.
-                backend_version: "2026.9.1".into(),
-                shell_version: None,
-            },
-        );
-
-        let err = staged_backend_meets(&home, "2026.9.2").unwrap_err();
-        assert!(err.contains("2026.9.1"), "{err}");
-        assert!(err.contains("2026.9.2"), "{err}");
-        // Equal and newer both pass: the pin is a floor, not an exact match.
-        assert!(staged_backend_meets(&home, "2026.9.1").is_ok());
-        assert!(staged_backend_meets(&home, "2026.9.0").is_ok());
-        cleanup(home);
-    }
-
-    #[test]
-    fn status_reports_a_ready_stage() {
-        let home = temp_home("status");
-        stage_ready(&home, &versions(Some("0.1.900-beta")));
-        assert_eq!(
-            status(&home),
-            StagedUpdateStatus {
-                state: "ready",
-                backend_version: Some("2026.9.1".into()),
-                shell_version: Some("0.1.900-beta".into()),
-                staging: false,
-                staging_shell_version: None,
-            }
-        );
-        discard(&home);
-        assert_eq!(status(&home).state, "none");
         cleanup(home);
     }
 }

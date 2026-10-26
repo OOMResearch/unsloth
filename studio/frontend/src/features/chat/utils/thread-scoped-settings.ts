@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-// The chat settings that describe one conversation rather than the installation: the composer
-// pills, the permission level, the retrieval controls and the sampling params. Editing one with a
-// chat open writes this snapshot onto the thread, and reopening that thread applies it back.
+// Per-conversation chat settings, snapshotted onto the thread and reapplied on reopen.
 
+import { normalizeSavedMinP } from "../lib/min-p-policy.ts";
 import type {
   PermissionMode,
   RagAutoInject,
@@ -12,7 +11,7 @@ import type {
   RagSource,
   ReasoningEffort,
 } from "../stores/chat-runtime-store";
-import { MAX_SAMPLING_SEED } from "../types/runtime.ts";
+import { MAX_SAMPLING_SEED, type MinPMode } from "../types/runtime.ts";
 import {
   isRecord,
   sanitizeBoundedNumber,
@@ -30,7 +29,6 @@ export interface ThreadScopedSettings {
   imageToolsEnabled?: boolean;
   webFetchToolsEnabled?: boolean;
   deepResearchEnabled?: boolean;
-  artifactsEnabled?: boolean;
   mcpEnabledForChat?: boolean;
   permissionMode?: ThreadPermissionMode;
   ragEnabled?: boolean;
@@ -43,6 +41,7 @@ export interface ThreadScopedSettings {
   topP?: number;
   topK?: number;
   minP?: number;
+  minPMode?: MinPMode;
   repetitionPenalty?: number;
   presencePenalty?: number;
   /** null is the cleared pin, and is the only thread-scoped value that is not undefined. */
@@ -51,12 +50,12 @@ export interface ThreadScopedSettings {
   systemVariables?: string;
 }
 
-/** The subset living under `params` rather than as a store field of its own. */
 export const THREAD_SCOPED_PARAM_KEYS = [
   "temperature",
   "topP",
   "topK",
   "minP",
+  "minPMode",
   "repetitionPenalty",
   "presencePenalty",
   "seed",
@@ -83,12 +82,12 @@ const THREAD_SCOPED_BOOLEAN_KEYS = [
   "imageToolsEnabled",
   "webFetchToolsEnabled",
   "deepResearchEnabled",
-  "artifactsEnabled",
   "mcpEnabledForChat",
   "ragEnabled",
 ] as const satisfies readonly (keyof ThreadScopedSettings)[];
 
 const THREAD_SCOPED_ENUM_VALUES = {
+  minPMode: ["server-default", "custom"],
   reasoningEffort: ["none", "minimal", "low", "medium", "high", "max", "xhigh"],
   permissionMode: ["ask", "auto", "off"],
   ragMode: ["hybrid", "lexical", "dense"],
@@ -97,11 +96,10 @@ const THREAD_SCOPED_ENUM_VALUES = {
   Record<keyof ThreadScopedSettings, readonly string[]>
 >;
 
-// bounds match the ge/le PATCH /api/chat/threads/{id} enforces on the same fields.
+// Bounds match the ge/le PATCH /api/chat/threads/{id} enforces.
 const THREAD_SCOPED_NUMBER_BOUNDS = {
   ragTopK: { min: 1, max: 50, integer: true },
   ragAutoInjectMinScore: { min: 0, max: 1, integer: false },
-  // Same ranges as the sampling sliders, and as the ge/le on the same fields.
   temperature: { min: 0, max: 2, integer: false },
   topP: { min: 0, max: 1, integer: false },
   // -1 disables top-k and is what default.yaml resolves to, so the floor is -1, not 0.
@@ -148,13 +146,11 @@ export function isThreadScopedSettingKey(
   return THREAD_SCOPED_SETTING_KEY_SET.has(key);
 }
 
-// Derived on apply, so unstored, but loadPermissionMode falls back to the confirm toggle: writing
-// it globally would turn one chat's permission level into every other browser's default.
+// Not stored globally: it would turn one chat's permission level into every browser's default.
 const THREAD_DERIVED_SETTING_KEYS: ReadonlySet<string> = new Set([
   "confirmToolCalls",
 ]);
 
-/** whether an edit to `key` belongs to the open chat rather than the installation. */
 export function isThreadOwnedSettingKey(key: string): boolean {
   return (
     THREAD_SCOPED_SETTING_KEY_SET.has(key) ||
@@ -162,7 +158,7 @@ export function isThreadOwnedSettingKey(key: string): boolean {
   );
 }
 
-// the patch model is extra="forbid", so one out-of-contract field would 400 the whole write.
+// The patch model is extra="forbid", so one bad field would 400 the whole write.
 export function sanitizeThreadScopedSettings(
   value: unknown,
 ): ThreadScopedSettings {
@@ -188,17 +184,21 @@ export function sanitizeThreadScopedSettings(
   for (const key of THREAD_SCOPED_STRING_KEYS) {
     if (typeof value[key] === "string") target[key] = value[key];
   }
-  // null is a value here, not an absence, and sanitizeBoundedNumber reads it as one.
   if (value.seed === null) settings.seed = null;
   const ragSource = sanitizeRagSource(value.ragSource);
   if (ragSource) settings.ragSource = ragSource;
   return settings;
 }
 
-/** whether `settings` carries any thread-scoped value at all. */
 export function hasThreadScopedSettings(
   settings: ThreadScopedSettings | null | undefined,
 ): boolean {
   if (!settings) return false;
   return THREAD_SCOPED_SETTING_KEYS.some((key) => settings[key] !== undefined);
+}
+
+export function normalizeSavedThreadScopedSettings(
+  value: unknown,
+): ThreadScopedSettings {
+  return normalizeSavedMinP(sanitizeThreadScopedSettings(value));
 }

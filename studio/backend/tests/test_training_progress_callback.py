@@ -1,14 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""Training progress callbacks must report an active status once training starts.
-
-Both training paths used to leave the parent on the pre-train "Starting ..." status
-for the whole run, so /api/train/status and the progress card read "Starting
-training..." while the loss was already moving: the callbacks report an empty status
-on every log and the parent only overwrites a non-empty one. These tests drive the
-real callbacks, worker emit rule and parent handler. Fakes only; no GPU, no model.
-"""
+"""Progress callbacks must report an active status: the parent only overwrites a non-empty one."""
 
 from __future__ import annotations
 
@@ -18,7 +11,7 @@ import sys
 import types
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -26,8 +19,7 @@ _BACKEND_DIR = str(Path(__file__).resolve().parent.parent)
 if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
 
-# core/training/trainer.py imports unsloth and trl at module level (heavy, GPU init). Stub
-# whichever are missing just long enough to import it, then restore.
+# trainer.py imports unsloth and trl at module level; stub missing ones only for the import.
 _STUBS = {
     "unsloth": ("FastLanguageModel", "FastVisionModel", "is_bfloat16_supported"),
     "unsloth.chat_templates": ("get_chat_template",),
@@ -72,8 +64,7 @@ from core.training.worker import (  # noqa: E402
 if not _TRAINER_PRE_IMPORTED:
     for _name in _STUBBED:
         sys.modules.pop(_name, None)
-    # Drop the stub-bound module and its parent package so a later test re-imports it against the
-    # real packages; the UnslothTrainer class held above stays usable.
+    # Drop the stub-bound module so later tests re-import against the real packages.
     sys.modules.pop("core.training.trainer", None)
     sys.modules.pop("core.training", None)
 
@@ -117,13 +108,8 @@ def _drive(
     return state, control
 
 
-# --- LLM/VLM/audio path: UnslothTrainer._create_progress_callback ->
-# worker._create_trainer_progress_callback ---
-
-
 def _make_owner():
-    # __new__ dispatches to the MLX adapter on Apple hardware, which has no
-    # _create_progress_callback; go straight to the class under test.
+    # __new__ dispatches to the MLX adapter on Apple hardware.
     owner = object.__new__(UnslothTrainer)
     UnslothTrainer.__init__(owner)
     owner._update_progress(is_training = True, total_steps = 4, status_message = "Starting training...")
@@ -154,12 +140,31 @@ def test_logging_reports_an_empty_status_so_the_active_one_is_sent_once():
     assert owner.training_progress.num_tokens == 384
 
 
+def test_unbounded_run_reports_the_trainer_epoch():
+    owner = _make_owner()
+
+    _drive(owner._create_progress_callback(), steps = 3)
+
+    assert owner.training_progress.epoch == 1.5
+
+
+def test_bounded_run_reports_epochs_over_the_whole_dataset():
+    owner = _make_owner()
+    owner._kept_row_fraction = 0.1
+    reported: list[float] = []
+    owner.add_progress_callback(lambda progress: reported.append(progress.epoch))
+
+    _drive(owner._create_progress_callback(), steps = 3)
+
+    assert [epoch for epoch in reported if epoch][:3] == [0.05, 0.1, 0.15]
+    assert owner.training_progress.epoch == pytest.approx(0.15)
+
+
 def test_parent_status_advances_over_the_whole_chain():
     owner = _make_owner()
     backend = TrainingBackend()
     event_queue = _FakeQueue()
     owner.add_progress_callback(_create_trainer_progress_callback(event_queue))
-    # The worker sends this right before trainer.train().
     event_queue.put({"type": "status", "message": "Starting training...", "ts": 0.0})
 
     _drive(owner._create_progress_callback(), steps = 3)
@@ -234,9 +239,61 @@ def test_stop_status_is_never_replaced_by_the_active_one(stop_status):
     assert control.should_training_stop is True
 
 
-# ---------------------------------------------------------------------------
-# Embedding path: worker._create_embedding_progress_callback
-# ---------------------------------------------------------------------------
+def _drive_resumed(callback, start_step, step):
+    state = SimpleNamespace(global_step = start_step, epoch = 0.9, num_input_tokens_seen = 0)
+    control = SimpleNamespace(should_training_stop = False)
+    with patch("time.time", return_value = 700):
+        callback.on_train_begin(None, state, control)
+    state.global_step = step
+    with patch("time.time", return_value = 760):
+        callback.on_log(None, state, control, logs = {"loss": 0.5, "learning_rate": 1e-4})
+
+
+def test_resumed_run_eta_uses_the_steps_done_in_this_session():
+    owner = _make_owner()
+    owner._update_progress(total_steps = 1000)
+    backend = TrainingBackend()
+    event_queue = _FakeQueue()
+    owner.add_progress_callback(_create_trainer_progress_callback(event_queue))
+    owner.training_start_time = 100
+
+    _drive_resumed(owner._create_progress_callback(), start_step = 900, step = 910)
+    for event in event_queue.events:
+        backend._handle_event(event)
+
+    assert owner.training_progress.eta_seconds == pytest.approx(540, rel = 0.02)
+    assert backend._progress.eta_seconds == pytest.approx(540, rel = 0.02)
+    assert backend._progress.session_start_step == 900
+    assert backend._progress.elapsed_seconds == 60
+
+
+def test_resumed_run_reports_no_eta_before_its_first_step():
+    owner = _make_owner()
+    owner._update_progress(total_steps = 1000)
+    owner.training_start_time = 100
+
+    _drive_resumed(owner._create_progress_callback(), start_step = 900, step = 900)
+
+    assert owner.training_progress.eta_seconds is None
+
+
+def test_fresh_run_eta_is_unchanged():
+    owner = _make_owner()
+    owner._update_progress(total_steps = 1000)
+    owner.training_start_time = 700
+
+    _drive_resumed(owner._create_progress_callback(), start_step = 0, step = 100)
+
+    assert owner.training_progress.eta_seconds == pytest.approx(540, rel = 0.02)
+
+
+def test_mlx_adapter_keeps_the_session_start_step():
+    adapter = _MLXTrainerAdapter()
+
+    adapter._handle_event({"type": "progress", "step": 910, "session_start_step": 900})
+    adapter._handle_event({"type": "progress", "step": 920, "eval_loss": 0.4})
+
+    assert adapter.training_progress.session_start_step == 900
 
 
 def _make_embedding_callback(event_queue, should_stop = lambda: False):
@@ -251,7 +308,6 @@ def _make_embedding_callback(event_queue, should_stop = lambda: False):
 def test_embedding_parent_status_advances_over_the_whole_chain():
     event_queue = _FakeQueue()
     backend = TrainingBackend()
-    # The worker sends this right before trainer.train().
     event_queue.put({"type": "status", "message": "Starting embedding training...", "ts": 0.0})
 
     _drive(_make_embedding_callback(event_queue), steps = 3)
@@ -290,3 +346,22 @@ def test_embedding_callback_survives_a_real_queue():
     events = [event_queue.get_nowait() for _ in range(event_queue.qsize())]
     assert [e["type"] for e in events] == ["status", "progress"]
     assert pickle.loads(pickle.dumps(events)) == events
+
+
+def test_embedding_resumed_run_eta_uses_the_steps_done_in_this_session():
+    event_queue = _FakeQueue()
+    backend = TrainingBackend()
+    callback = _create_embedding_progress_callback(
+        event_queue,
+        total_steps = 1000,
+        training_start_time = 100,
+        should_stop = lambda: False,
+    )
+
+    _drive_resumed(callback, start_step = 900, step = 910)
+    for event in event_queue.events:
+        backend._handle_event(event)
+
+    assert backend._progress.eta_seconds == pytest.approx(540, rel = 0.02)
+    assert backend._progress.session_start_step == 900
+    assert backend._progress.elapsed_seconds == 60

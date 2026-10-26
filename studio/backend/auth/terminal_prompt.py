@@ -2,14 +2,13 @@
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 """Interactive terminal prompt that forces a bootstrap password change before
-Unsloth is exposed on a public Cloudflare URL (``--secure`` / ``--cloudflare``).
+Unsloth becomes reachable: a public Cloudflare URL (``--secure`` / ``--cloudflare``)
+or a raw non-loopback bind such as ``-H 0.0.0.0``.
 
-Masked input echoes one ``*`` per keystroke (unlike ``getpass``). Works on
-Windows (``msvcrt``) and Linux/macOS (``termios``). All output goes to stderr so
-redirected stdout never swallows the prompt.
-
-Mirrored for the CLI at ``unsloth_cli/commands/_password_prompt.py`` (the CLI
-cannot import the Unsloth backend package); keep the two in sync.
+Masked input echoes one ``*`` per keystroke (unlike ``getpass``). Works on Windows (``msvcrt``) and Linux/macOS
+(``termios``). All output goes to stderr so redirected stdout never swallows the prompt. Mirrored for the CLI at
+``unsloth_cli/commands/_password_prompt.py`` (the CLI cannot import the Unsloth backend package); keep the two
+in sync.
 """
 
 from __future__ import annotations
@@ -40,11 +39,9 @@ def _getch_windows() -> str:  # pragma: no cover - exercised via fake on Linux C
 
 
 class _RestoreTtyOnSignals:
-    """Restore terminal attrs if SIGTERM/SIGHUP kills the prompt mid-read.
-
-    A finally block can't run when a signal terminates the process, leaving the
-    shared terminal in cbreak/no-echo. Best-effort: no-op off the main thread or
-    where the signals are absent.
+    """Restore terminal attrs if SIGTERM/SIGHUP kills the prompt mid-read. A finally block can't run when a
+    signal terminates the process, leaving the shared terminal in cbreak/no-echo. Best-effort: no-op off the
+    main thread or where the signals are absent.
     """
 
     def __init__(self, fd: int, old_attrs) -> None:
@@ -144,18 +141,57 @@ def _getch_posix() -> str:  # pragma: no cover - needs a real tty
 _getch: Callable[[], str] = _getch_windows if os.name == "nt" else _getch_posix
 
 
-def _read_password(prompt: str, *, out: "TextIO | None" = None) -> str:
-    """Read one masked line: echo ``*`` per char, support backspace editing.
+class PromptUnattended(Exception):
+    """A terminal is attached but nobody answered before the deadline.
 
-    Raises KeyboardInterrupt on Ctrl-C and EOFError on Ctrl-D/Ctrl-Z with an
-    empty buffer; the terminal is restored on every exit path.
+    A pty is not a person: ``tmux new -d`` / ``docker run -dt`` allocate a real
+    foreground pty nobody reads, so isatty() is True on both streams and the read
+    never returns. Callers that must not block a launch treat this as a refusal.
     """
+
+
+def _wait_for_first_key(timeout: float) -> bool:
+    """Needs cbreak mode already set; canonical mode holds input until a newline. True on any doubt."""
+    if os.name == "nt":
+        import time
+
+        try:
+            import msvcrt
+        except ImportError:
+            return True
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if msvcrt.kbhit():
+                return True
+            time.sleep(0.05)
+        return False
+    import select
+
+    try:
+        fd = sys.stdin.fileno()
+        ready, _, _ = select.select([fd], [], [], timeout)
+    except (AttributeError, OSError, ValueError):
+        return True
+    return bool(ready)
+
+
+def _read_password(
+    prompt: str,
+    *,
+    out: "TextIO | None" = None,
+    first_key_timeout: "float | None" = None,
+) -> str:
+    """With ``first_key_timeout``, a silent terminal raises PromptUnattended; typing has no deadline."""
     if out is None:
         out = sys.stderr
     out.write(prompt)
     out.flush()
     chars: list[str] = []
     with _prompt_raw_mode():
+        if first_key_timeout is not None and not _wait_for_first_key(first_key_timeout):
+            out.write("\n")
+            out.flush()
+            raise PromptUnattended
         while True:
             key = _getch()
             if key == "":
@@ -191,15 +227,17 @@ def _read_password(prompt: str, *, out: "TextIO | None" = None) -> str:
 
 
 def should_prompt_password_change(
-    *, tunnel_will_start: bool, requires_change: bool, stdin_isatty: bool, stderr_isatty: bool
+    *,
+    tunnel_will_start: bool,
+    requires_change: bool,
+    stdin_isatty: bool,
+    stderr_isatty: bool,
+    bind_is_exposed: bool = False,
 ) -> bool:
-    """Whether to block startup on an interactive terminal password change.
-
-    True only when the tunnel is actually about to start, the admin still has
-    the seeded password, and both stdin and stderr are real terminals (headless
-    launches keep the bootstrap-timeout protection instead of hanging).
-    """
-    return tunnel_will_start and requires_change and stdin_isatty and stderr_isatty
+    """A raw non-loopback bind (-H 0.0.0.0) is reachable without a tunnel, so it prompts too."""
+    if not (tunnel_will_start or bind_is_exposed):
+        return False
+    return requires_change and stdin_isatty and stderr_isatty
 
 
 def prompt_for_password_change(
@@ -209,23 +247,32 @@ def prompt_for_password_change(
     apply_change: Callable[[str], None],
     username: str = "unsloth",
     out: "TextIO | None" = None,
-) -> bool:
-    """Force a new admin password before public exposure; True on success.
-
-    Loops until a valid, confirmed password is committed via ``apply_change``.
-    Ctrl-C / EOF returns False; the caller must then abort the launch.
-    """
+    exposure: str = "on the public internet",
+    first_key_timeout: "float | None" = None,
+    refusal_aborts: bool = True,
+) -> "bool | None":
+    """Only ``first_key_timeout`` callers pass it: a detached pty looks attended and would wait forever."""
     if out is None:
         out = sys.stderr
+    refusal = (
+        "Ctrl+C to abort."
+        if refusal_aborts
+        else "Ctrl+C to skip, and Unsloth starts with the auto-generated password."
+    )
     out.write(
         "\n"
-        "Unsloth Studio will be exposed on the public internet, so set a\n"
-        "password now. Ctrl+C to abort.\n\n"
+        f"Unsloth Studio will be reachable {exposure}, so set a\n"
+        f"password now. {refusal}\n\n"
     )
     out.flush()
+    # Only the first read is deadlined; a key arriving proves someone is there.
+    pending_timeout = first_key_timeout
     try:
         while True:
-            new_password = _read_password("New password: ", out = out)
+            new_password = _read_password(
+                "New password: ", out = out, first_key_timeout = pending_timeout
+            )
+            pending_timeout = None
             if len(new_password) < min_length:
                 out.write(f"Password must be at least {min_length} characters; try again.\n")
                 out.flush()
@@ -249,20 +296,25 @@ def prompt_for_password_change(
             out.write(f"Password updated for '{username}'.\n")
             out.flush()
             return True
+    except PromptUnattended:
+        out.write(
+            "No response at the terminal; leaving the auto-generated admin password in place.\n"
+        )
+        out.flush()
+        return None
     except (KeyboardInterrupt, EOFError):
-        out.write("Password change aborted; not exposing Unsloth.\n")
+        # Must agree with the banner: a caller that continues cannot claim otherwise.
+        out.write(
+            "Password change aborted; not exposing Unsloth.\n"
+            if refusal_aborts
+            else "Password change skipped; leaving the auto-generated admin password in place.\n"
+        )
         out.flush()
         return False
 
 
 def resolve_supplied_password(cli_value: "str | None", out: "TextIO | None" = None) -> "str | None":
-    """Resolve a non-interactive initial admin password, or None if unset.
-
-    Precedence: an explicit ``--password`` (literal ``-`` reads a line from
-    stdin), then the ``UNSLOTH_STUDIO_PASSWORD`` env var; empty/omitted means off.
-    A literal argv value is visible in the process list, so a note points at the
-    env var or stdin instead. Mirror of the CLI helper -- keep the two in sync.
-    """
+    """Mirrors the CLI helper, so keep both in sync; a literal --password is visible in the process list."""
     if out is None:
         out = sys.stderr
     if cli_value == "-":

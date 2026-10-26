@@ -1,19 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""The scoped download worker must never report success without the files.
-
-``snapshot_download`` returns an existing snapshot folder -- having fetched nothing -- when
-its own ``repo_info`` call fails, and with HF metadata unavailable no manifest is written,
-so the usual verification is a no-op. A repo already on disk from a full snapshot job (which
-ignores ``*.gguf``) would otherwise flip a scoped job to complete with no weights, and the
-Images page auto-loads as soon as the job completes.
-"""
+"""A scoped job must not complete with no weights when snapshot_download returns an existing folder."""
 
 from __future__ import annotations
 
+import shutil
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -58,7 +53,7 @@ def _run(scope = "diffusion"):
 
 
 def test_offline_scoped_download_fails_when_the_files_are_not_on_disk(offline, capsys):
-    (offline / "model_index.json").write_text("{}", encoding = "utf-8")  # the cheap file only
+    (offline / "model_index.json").write_text("{}", encoding = "utf-8")
 
     with pytest.raises(SystemExit) as exit_info:
         _run()
@@ -74,7 +69,7 @@ def test_offline_scoped_download_passes_when_every_file_is_present(offline):
         path.parent.mkdir(parents = True, exist_ok = True)
         path.write_text("weights", encoding = "utf-8")
 
-    _run()  # no SystemExit: everything the job asked for is on disk
+    _run()
 
 
 def test_a_dangling_symlink_does_not_count_as_present(offline, capsys):
@@ -88,3 +83,20 @@ def test_a_dangling_symlink_does_not_count_as_present(offline, capsys):
         _run()
     assert exit_info.value.code == 1
     assert "incomplete" in capsys.readouterr().err
+
+
+def test_disk_space_refusal_reports_decimal_gigabytes(monkeypatch, tmp_path, capsys):
+    import hub.utils.download_registry as registry_mod
+    import hub.utils.hf_cache_state as cache_state_mod
+
+    monkeypatch.setattr(registry_mod, "existing_blob_bytes", lambda *a, **k: 0)
+    monkeypatch.setattr(cache_state_mod, "hf_cache_root", lambda **k: tmp_path)
+    monkeypatch.setattr(shutil, "disk_usage", lambda _p: SimpleNamespace(free = 1_500_000_000))
+    q8 = SimpleNamespace(size = 1_834_426_944, sha256 = "a" * 64)
+
+    with pytest.raises(SystemExit) as exit_info:
+        hf_download._preflight_disk_space("model", "unsloth/Qwen3-1.7B-GGUF", [q8])
+    assert exit_info.value.code == 1
+    err = capsys.readouterr().err
+    assert "need about 1.8 GB free" in err
+    assert "only 1.5 GB is available" in err

@@ -1,14 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""Parent-process offline regression tests (follow-up to #5505).
-
-Pins the LoRA-detect, transformers_version urllib short-circuit, and
-training-worker DNS probe so a dead DNS no longer burns 30-60s of
-soft-failed timeouts before the worker subprocess spawns.
-
-No GPU, no network, no subprocess. Cross-platform.
-"""
+"""Dead DNS must not stall the parent with soft-failed timeouts before the training worker spawns."""
 
 from __future__ import annotations
 
@@ -43,7 +36,6 @@ if not _module_available("loggers"):
     sys.modules.setdefault("loggers", _loggers_stub)
 if not _module_available("structlog"):
     sys.modules.setdefault("structlog", _types.ModuleType("structlog"))
-# Prefer real httpx if installed (CI installs it). Stub only as fallback.
 try:
     import httpx  # noqa: F401
 except ImportError:
@@ -86,6 +78,9 @@ from utils.transformers_version import (
     _check_tokenizer_config_needs_v5,
     _env_offline as _env_offline_tv,
 )
+import importlib.util
+import json
+import pathlib
 
 
 @pytest.fixture
@@ -119,14 +114,13 @@ class TestTransformersVersionOfflineShortCircuits:
     def test_tokenizer_config_skips_urllib_when_offline(
         self, monkeypatch, clean_offline_env, tmp_path
     ):
-        # No local config + offline env -> must NOT call urlopen.
         monkeypatch.setenv("HF_HUB_OFFLINE", "1")
         unique = f"unsloth/never-cached-{tmp_path.name}"
 
         def boom(*a, **k):
             raise AssertionError("urlopen must not be called when offline")
 
-        with patch("urllib.request.urlopen", boom):
+        with patch("utils.utils.auth_safe_open", boom):
             assert _check_tokenizer_config_needs_v5(unique) is False
 
     def test_config_550_skips_urllib_when_offline(self, monkeypatch, clean_offline_env, tmp_path):
@@ -136,7 +130,7 @@ class TestTransformersVersionOfflineShortCircuits:
         def boom(*a, **k):
             raise AssertionError("urlopen must not be called when offline")
 
-        with patch("urllib.request.urlopen", boom):
+        with patch("utils.utils.auth_safe_open", boom):
             assert _check_config_needs_550(unique) is False
 
 
@@ -153,8 +147,7 @@ class TestLoraDetectOffline:
 
         monkeypatch.setenv("HF_HUB_OFFLINE", "1")
 
-        # Unsloth catches Exception broadly; pin that the call still happens
-        # (so cached LoRAs aren't missed) and returns fast via the mock.
+        # Pin that the LoRA-detect call still happens (Exception is caught broadly).
         class _OfflineModeIsEnabled(Exception):
             pass
 
@@ -167,7 +160,7 @@ class TestLoraDetectOffline:
                     gguf_variant = None,
                 )
             except Exception:
-                pass  # registry miss OK; pinning the LoRA-detect call
+                pass
 
         assert mock.call_count >= 1, (
             "LoRA-detect must still consult hf_model_info offline; "
@@ -205,8 +198,6 @@ class TestLoraDetectOffline:
             except Exception:
                 cfg = None
 
-        # cfg may be None (base not resolvable offline); pin the fixture
-        # so the cache-side detect block had a file to find.
         assert (snap / "adapter_config.json").is_file()
 
 
@@ -232,8 +223,7 @@ class TestTrainingWorkerProbeNoGlobalTimeout:
             "training worker still calls socket.setdefaulttimeout; "
             "concurrent sockets would inherit the probe timeout"
         )
-        # The probe now lives in the shared helper (endpoint- and proxy-aware), so the
-        # worker must delegate to it rather than resolve a hardcoded host itself.
+        # The worker must delegate to the shared endpoint/proxy-aware probe.
         assert (
             "hf_env_offline" in block
         ), "training worker must honor TRANSFORMERS_OFFLINE before probing"
@@ -269,26 +259,20 @@ class TestInferenceWorkerProbesForItself:
     into the retry paths the parent already ruled out."""
 
     def _block(self):
-        import pathlib
-
         backend_root = pathlib.Path(__file__).resolve().parent.parent
         src = (backend_root / "core" / "inference" / "worker.py").read_text(
             encoding = "utf-8",
         )
         start = src.index("# Offline auto-detect")
-        # To the end of the block, not a fixed slice: a gate added ahead of it would
-        # otherwise push the tail out of the window and pass vacuously.
+        # To the block end, not a fixed slice, or a new gate could make this vacuous.
         return src[start : src.index("\n    import warnings", start)]
 
     def test_the_probe_exists_and_runs_before_activation(self):
-        import pathlib
-
         backend_root = pathlib.Path(__file__).resolve().parent.parent
         src = (backend_root / "core" / "inference" / "worker.py").read_text(
             encoding = "utf-8",
         )
         probe = src.index("# Offline auto-detect")
-        # Both HF-reading steps the parent's verdict was meant to cover.
         assert probe < src.index("_remote_lora_base(model_name")
         assert probe < src.index("_activate_transformers_version(_base")
 
@@ -322,9 +306,6 @@ class TestWorkerProbesOnlyWhenTheHubIsNeeded:
     was DNS-only on main for training, and absent entirely for inference."""
 
     def _load(self, relpath, name):
-        import importlib.util
-        import pathlib
-
         backend_root = pathlib.Path(__file__).resolve().parent.parent
         spec = importlib.util.spec_from_file_location(name, backend_root / relpath)
         mod = importlib.util.module_from_spec(spec)
@@ -337,10 +318,8 @@ class TestWorkerProbesOnlyWhenTheHubIsNeeded:
 
         assert w._training_job_is_local({"model_name": local}) is True
         assert w._training_job_is_local({"model_name": local, "hf_dataset": ""}) is True
-        # A remote dataset needs the Hub even with a local model.
         assert w._training_job_is_local({"model_name": local, "hf_dataset": "org/ds"}) is False
         assert w._training_job_is_local({"model_name": "org/model"}) is False
-        # Fail closed on anything unresolvable.
         assert w._training_job_is_local({}) is False
         assert w._training_job_is_local({"model_name": None}) is False
 
@@ -358,8 +337,6 @@ class TestWorkerProbesOnlyWhenTheHubIsNeeded:
     def test_inference_gate_reads_a_local_adapter_base_from_disk(self, tmp_path):
         """A local adapter pointing at a REMOTE base still needs the probe, and the base
         is readable without touching the network."""
-        import json
-
         w = self._load("core/inference/worker.py", "inference_worker_gate_adapter")
         (tmp_path / "adapter_config.json").write_text(
             json.dumps({"base_model_name_or_path": "org/base"}),
@@ -375,8 +352,6 @@ class TestWorkerProbesOnlyWhenTheHubIsNeeded:
         assert w._recorded_local_base("org/model") == (None, False)
 
     def test_both_probes_sit_behind_the_gate(self):
-        import pathlib
-
         backend_root = pathlib.Path(__file__).resolve().parent.parent
         inf = (backend_root / "core" / "inference" / "worker.py").read_text(
             encoding = "utf-8",
@@ -386,7 +361,6 @@ class TestWorkerProbesOnlyWhenTheHubIsNeeded:
         )
         assert "not _hub_targets_are_local(" in inf
         assert "not _training_job_is_local(config)" in trn
-        # The user's own flag still wins in both.
         assert inf.count('if "HF_HUB_OFFLINE" not in os.environ and (') == 1
         assert trn.count('if "HF_HUB_OFFLINE" not in os.environ and not') == 1
 
@@ -396,9 +370,6 @@ class TestLocalLoraTrainingJobStillProbes:
     training and security code fetches, so the job is not filesystem-only."""
 
     def _worker(self):
-        import importlib.util
-        import pathlib
-
         backend_root = pathlib.Path(__file__).resolve().parent.parent
         spec = importlib.util.spec_from_file_location(
             "training_worker_lora_gate",
@@ -409,8 +380,6 @@ class TestLocalLoraTrainingJobStillProbes:
         return mod
 
     def test_local_adapter_with_a_remote_base_is_not_local(self, tmp_path):
-        import json
-
         w = self._worker()
         (tmp_path / "adapter_config.json").write_text(
             json.dumps({"base_model_name_or_path": "org/base"}),
@@ -419,8 +388,6 @@ class TestLocalLoraTrainingJobStillProbes:
         assert w._training_job_is_local({"model_name": str(tmp_path)}) is False
 
     def test_local_adapter_with_a_local_base_is_local(self, tmp_path):
-        import json
-
         w = self._worker()
         base = tmp_path / "base"
         base.mkdir()
@@ -437,8 +404,6 @@ class TestLocalLoraTrainingJobStillProbes:
     def test_a_null_recorded_base_still_probes(self, tmp_path):
         """An explicit null reads the same as a missing key: no base on disk, so the
         resolver falls through to get_base_model_from_lora, which is a Hub call."""
-        import json
-
         w = self._worker()
         (tmp_path / "adapter_config.json").write_text(
             json.dumps({"base_model_name_or_path": None}),
@@ -448,10 +413,6 @@ class TestLocalLoraTrainingJobStillProbes:
 
     def test_both_workers_agree(self, tmp_path):
         """The two gates must classify the same adapter the same way."""
-        import importlib.util
-        import json
-        import pathlib
-
         backend_root = pathlib.Path(__file__).resolve().parent.parent
         (tmp_path / "adapter_config.json").write_text(
             json.dumps({"base_model_name_or_path": "org/base"}),
@@ -476,9 +437,6 @@ class TestFullCheckpointBaseKeepsTheProbe:
     job is not filesystem-only even though every path on disk is local."""
 
     def _module(self, relative_path, name):
-        import importlib.util
-        import pathlib
-
         backend_root = pathlib.Path(__file__).resolve().parent.parent
         spec = importlib.util.spec_from_file_location(name, backend_root / relative_path)
         mod = importlib.util.module_from_spec(spec)
@@ -486,7 +444,6 @@ class TestFullCheckpointBaseKeepsTheProbe:
         return mod
 
     def _checkpoint(self, tmp_path, config_json):
-        import json
         (tmp_path / "config.json").write_text(json.dumps(config_json), encoding = "utf-8")
         return str(tmp_path)
 
@@ -517,8 +474,6 @@ class TestFullCheckpointBaseKeepsTheProbe:
 
     def test_an_adapter_base_still_wins_over_config_json(self, tmp_path):
         """Ordering matches the resolver: the adapter's base, not the config.json one."""
-        import json
-
         target = self._checkpoint(tmp_path, {"model_name": "org/from-config"})
         (tmp_path / "adapter_config.json").write_text(
             json.dumps({"base_model_name_or_path": "org/from-adapter"}),
@@ -530,8 +485,6 @@ class TestFullCheckpointBaseKeepsTheProbe:
     def test_a_baseless_adapter_needs_the_hub(self, tmp_path):
         """With no base on disk the resolver falls through to get_base_model_from_lora,
         which is a Hub call, so the gate must fail closed."""
-        import json
-
         (tmp_path / "adapter_config.json").write_text(json.dumps({}), encoding = "utf-8")
         inf = self._module("core/inference/worker.py", "inference_worker_baseless_gate")
         trn = self._module("core/training/worker.py", "training_worker_baseless_gate")
@@ -542,7 +495,6 @@ class TestFullCheckpointBaseKeepsTheProbe:
     def test_the_gate_agrees_with_the_resolver(self, tmp_path):
         """Anti-drift: this bug was the gate reading less than _resolve_base_model does.
         For every on-disk shape the two must name the same base."""
-        import json
         import sys
 
         backend_root = str(__import__("pathlib").Path(__file__).resolve().parent.parent)
@@ -550,15 +502,13 @@ class TestFullCheckpointBaseKeepsTheProbe:
             sys.path.insert(0, backend_root)
         from utils.transformers_version import _resolve_base_model, recorded_local_base
 
-        # dir name -> (adapter_config.json, config.json, drop adapter weights in)
         shapes = {
             "adapter": ({"base_model_name_or_path": "org/a"}, None, False),
             "config": (None, {"model_name": "org/c"}, False),
             "name_or_path": (None, {"_name_or_path": "org/n"}, False),
             "both": ({"base_model_name_or_path": "org/a"}, {"model_name": "org/c"}, False),
             "bare": (None, None, False),
-            # Adapter-only LoRAs: no JSON at all, so the resolver falls back to the
-            # unsloth_<model>_<timestamp> dir-name convention.
+            # Adapter-only: no JSON, so the resolver uses the unsloth_<model>_<ts> dir name.
             "unsloth_llama-3_1700000000": (None, None, True),
             "unsloth_a_b_1700000000": (None, None, True),
             "plain_adapter_dir": (None, None, True),
@@ -576,7 +526,6 @@ class TestFullCheckpointBaseKeepsTheProbe:
 
             base, needs_hub = recorded_local_base(str(d))
             resolved = _resolve_base_model(str(d))
-            # The resolver returns the input unchanged when it finds no base.
             assert needs_hub is False, name
             assert (base or str(d)) == resolved, name
 
@@ -602,7 +551,6 @@ class TestLoadRouteResolvesConfigOffTheLoop:
 
     def test_the_guard_and_config_resolution_run_in_a_thread(self):
         import ast
-        import pathlib
 
         backend_root = pathlib.Path(__file__).resolve().parent.parent
         src = (backend_root / "routes" / "inference.py").read_text(encoding = "utf-8")
@@ -628,7 +576,6 @@ class TestLoadRouteResolvesConfigOffTheLoop:
             "_resolve_config" in threaded
         ), "the load guard must be awaited off the event loop, as /validate does"
 
-        # And nothing in that function may enter the guard inline any more.
         bad = [
             n.lineno
             for n in ast.walk(impl)

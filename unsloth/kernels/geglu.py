@@ -1,11 +1,8 @@
 # Copyright 2023-present Daniel Han-Chen & the Unsloth team. All rights reserved.
-#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-#
 #     http://www.apache.org/licenses/LICENSE-2.0
-#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -65,6 +62,7 @@ def geglu_exact_forward_kernel(gate, up):
             n_elements,
             BLOCK_SIZE = BLOCK_SIZE,
             LONG_INDEXING = 0 if n_elements <= INT32_SAFETY_BUFFER else 1,
+            enable_fp_fusion = True,
         )
     return out
 
@@ -131,6 +129,7 @@ def geglu_exact_backward_kernel(DW, e, g):
             n_elements,
             BLOCK_SIZE = BLOCK_SIZE,
             LONG_INDEXING = 0 if n_elements <= INT32_SAFETY_BUFFER else 1,
+            enable_fp_fusion = True,
         )
     return DW, e, g
 
@@ -174,6 +173,7 @@ def geglu_approx_forward_kernel(gate, up):
             n_elements,
             BLOCK_SIZE = BLOCK_SIZE,
             LONG_INDEXING = 0 if n_elements <= INT32_SAFETY_BUFFER else 1,
+            enable_fp_fusion = True,
         )
     return out
 
@@ -248,5 +248,6 @@ def geglu_approx_backward_kernel(DW, e, g):
             n_elements,
             BLOCK_SIZE = BLOCK_SIZE,
             LONG_INDEXING = 0 if n_elements <= INT32_SAFETY_BUFFER else 1,
+            enable_fp_fusion = True,
         )
     return DW, e, g
