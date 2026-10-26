@@ -19,6 +19,7 @@ from auth.storage import DEFAULT_ADMIN_USERNAME
 from models.inference import ChatCompletionRequest, LoadRequest
 from routes.inference import (
     _reject_unsupported_content_parts,
+    _request_has_video,
     disable_openai_auto_switch_for_request,
     load_model_for_preview,
     openai_chat_completions,
@@ -28,14 +29,14 @@ from utils.client_ip import client_ip
 from utils.models.checkpoints import list_preview_targets, resolve_preview_checkpoint
 from utils.preview_rate_limit import check_rate_limit
 from utils.preview_sharing_settings import get_preview_sharing_enabled
-from utils.preview_token import sign_preview_ref, verify_preview_ref
+from utils.account_context import bind_account, reset_account
+from utils.preview_token import preview_token_account, sign_preview_ref
 
 logger = get_logger(__name__)
 
 router = APIRouter()
 
-# A shared preview link is a public bearer capability; cap per-request generation so a
-# single call can't tie up the (serialized) preview GPU indefinitely.
+# Public bearer link: cap generation so one call cannot hold the serialized GPU.
 _PREVIEW_MAX_OUTPUT_TOKENS = 1024
 
 # One model loads at a time, so serialize load+generate.
@@ -52,12 +53,34 @@ def _extract_token(request: Request) -> str | None:
     return None
 
 
-def _verify_or_404(run: str, checkpoint: str | None, request: Request) -> None:
+def _verify_or_404(run: str, checkpoint: str | None, request: Request):
+    """The account the capability opens, or 404. Never says which check failed."""
     ref = run if not checkpoint else f"{run}/{checkpoint}"
-    if not verify_preview_ref(ref, _extract_token(request)):
+    account = preview_token_account(ref, _extract_token(request))
+    if account is None:
         raise HTTPException(status_code = 404, detail = "Not found")
     if not get_preview_sharing_enabled():
         raise HTTPException(status_code = 404, detail = "Not found")
+    return account
+
+
+# The public routes carry no credential, so the capability decides whose outputs the ref resolves in.
+async def _latest_account(run: str, request: Request):
+    account = _verify_or_404(run, None, request)
+    token = bind_account(account)
+    try:
+        yield account
+    finally:
+        reset_account(token)
+
+
+async def _checkpoint_account(run: str, checkpoint: str, request: Request):
+    account = _verify_or_404(run, checkpoint, request)
+    token = bind_account(account)
+    try:
+        yield account
+    finally:
+        reset_account(token)
 
 
 def _enforce_rate_limit(request: Request) -> None:
@@ -74,8 +97,7 @@ def _resolve_or_4xx(run: str, checkpoint: str | None):
     try:
         return resolve_preview_checkpoint(run, checkpoint)
     except ValueError as exc:
-        # Detail can carry the absolute install path on a symlink escape; log it,
-        # return a generic message on this public route.
+        # Detail can carry the absolute install path; never return it on this public route.
         logger.warning("preview path rejected: %s", exc)
         raise HTTPException(status_code = 400, detail = "Invalid run or checkpoint")
     except FileNotFoundError as exc:
@@ -104,6 +126,8 @@ def _sanitize_preview_payload(
             "bypass_permissions": False,
             "confirm_tool_calls": False,
             "session_id": None,
+            # A streamed body outlives tools_force_disabled(), so no thread archive may be reachable.
+            "thread_id": None,
             "rag_scope": None,
             "openai_code_exec_container_id": None,
             "anthropic_code_exec_container_id": None,
@@ -135,9 +159,13 @@ async def _serve_chat(
     run: str, checkpoint: str | None, payload: ChatCompletionRequest, request: Request
 ):
     path = _resolve_or_4xx(run, checkpoint)
-    # Before the lock and the load: openai_chat_completions refuses these too, but only after a
-    # checkpoint load that can evict the resident model on its way to the same 400.
     _reject_unsupported_content_parts(payload)
+    # A checkpoint cannot read a clip: refuse before the load the refusal would otherwise follow.
+    if _request_has_video(payload):
+        raise HTTPException(
+            status_code = 400,
+            detail = "Video input is only supported on a local GGUF model with video support.",
+        )
     is_lora = (path / "adapter_config.json").exists()
     payload = _sanitize_preview_payload(payload, is_lora)
     scope = getattr(request, "scope", None)
@@ -157,9 +185,7 @@ async def _serve_chat(
         if serializer_waiting:
             await resume_preview_after_serializer(scope)
             serializer_waiting = False
-        # The in-process coroutine, not the /load route: the route's padding returns a
-        # StreamingResponse while the checkpoint is still loading, so the chat below
-        # would run against the previous model (or none).
+        # Not the /load route: it returns while still loading, so chat would hit the old model.
         await load_model_for_preview(
             LoadRequest(model_path = str(path)), request, DEFAULT_ADMIN_USERNAME
         )
@@ -199,18 +225,16 @@ async def list_previews(
     return {"object": "list", "data": previews, "sharing_enabled": sharing_on}
 
 
-@router.post("/{run}/v1/chat/completions")
+@router.post("/{run}/v1/chat/completions", dependencies = [Depends(_latest_account)])
 async def preview_chat_latest(run: str, payload: ChatCompletionRequest, request: Request):
-    _verify_or_404(run, None, request)
     _enforce_rate_limit(request)
     return await _serve_chat(run, None, payload, request)
 
 
-@router.post("/{run}/{checkpoint}/v1/chat/completions")
+@router.post("/{run}/{checkpoint}/v1/chat/completions", dependencies = [Depends(_checkpoint_account)])
 async def preview_chat_checkpoint(
     run: str, checkpoint: str, payload: ChatCompletionRequest, request: Request
 ):
-    _verify_or_404(run, checkpoint, request)
     _enforce_rate_limit(request)
     return await _serve_chat(run, checkpoint, payload, request)
 
@@ -231,17 +255,14 @@ def _models_response(run: str, checkpoint: str | None):
     }
 
 
-# The models/page GET routes only stat the checkpoint dir (no GPU), so they are
-# token-gated but not rate-limited; only the GPU-backed chat path is throttled.
-@router.get("/{run}/v1/models")
+# GET routes only stat the checkpoint dir (no GPU), so they are token-gated but not rate-limited.
+@router.get("/{run}/v1/models", dependencies = [Depends(_latest_account)])
 async def preview_models_latest(run: str, request: Request):
-    _verify_or_404(run, None, request)
     return _models_response(run, None)
 
 
-@router.get("/{run}/{checkpoint}/v1/models")
+@router.get("/{run}/{checkpoint}/v1/models", dependencies = [Depends(_checkpoint_account)])
 async def preview_models_checkpoint(run: str, checkpoint: str, request: Request):
-    _verify_or_404(run, checkpoint, request)
     return _models_response(run, checkpoint)
 
 
@@ -278,8 +299,7 @@ def _preview_page(run: str, checkpoint: str | None) -> HTMLResponse:
     _resolve_or_4xx(run, checkpoint)
     title = run if not checkpoint else f"{run}/{checkpoint}"
     page = _PREVIEW_PAGE_HTML.replace("__TITLE__", html.escape(title))
-    # no-referrer: the capability token rides in the query string, so keep it out
-    # of the Referer header on any outbound navigation.
+    # no-referrer: the capability token rides in the query string, so keep it out of Referer headers.
     return HTMLResponse(
         page,
         headers = {
@@ -289,13 +309,13 @@ def _preview_page(run: str, checkpoint: str | None) -> HTMLResponse:
     )
 
 
-@router.get("/{run}", response_class = HTMLResponse)
+@router.get("/{run}", response_class = HTMLResponse, dependencies = [Depends(_latest_account)])
 async def preview_page_latest(run: str, request: Request):
-    _verify_or_404(run, None, request)
     return _preview_page(run, None)
 
 
-@router.get("/{run}/{checkpoint}", response_class = HTMLResponse)
+@router.get(
+    "/{run}/{checkpoint}", response_class = HTMLResponse, dependencies = [Depends(_checkpoint_account)]
+)
 async def preview_page_checkpoint(run: str, checkpoint: str, request: Request):
-    _verify_or_404(run, checkpoint, request)
     return _preview_page(run, checkpoint)

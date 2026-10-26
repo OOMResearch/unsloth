@@ -1,22 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Dispatch and collect: the ways this trades forty minutes for nothing.
-
-The GPU jobs no longer wait for their kernel, buying back 41.5 and 18.7 minutes
-of runner per commit (runs 33479481067 and 33486360729). Every test here aims
-at the one new class of bug, **the result stops arriving and nothing says so**,
-in its four green shapes:
-
-1. the dispatching job reports success and is still the required check, so the
-   check now means "Kaggle accepted a push";
-2. the kernel is never collected, so it bills quota to its ceiling and the
-   commit keeps a status that never resolves;
-3. the collector deletes a kernel before reading it, or one never ours;
-4. the slug loses the commit, so a finished result cannot be attributed.
-
-Everything runs on CPU against stubs; no Kaggle session is spent.
-"""
+"""Guards the ways a dispatched result silently never arrives; all tests run on CPU against stubs."""
 
 from __future__ import annotations
 
@@ -28,6 +13,34 @@ from pathlib import Path
 
 import pytest
 import yaml
+
+
+def _shared_setup_1(monkeypatch):
+    deleted: list[str] = []
+    monkeypatch.setattr(
+        launch, "delete_kernel", lambda slug, deadline = None: deleted.append(slug) or True
+    )
+    return deleted
+
+
+def _shared_setup_2():
+    entry = {
+        "slug": "me/unsloth-t4-ci-nabcdef01-1111",
+        "sha": "abcdef01",
+        "kind": "notebook",
+        "legacy": False,
+        "age_hours": 0.4,
+    }
+    return entry
+
+
+def _shared_setup_3(deleted, monkeypatch):
+    monkeypatch.setattr(
+        launch, "delete_kernel", lambda slug, deadline = None: deleted.append(slug) or True
+    )
+    api = _StubApi([], {"me/unsloth-t4-ci-nabcdef01-1111": "COMPLETE"})
+    return api
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CI_DIR = REPO_ROOT / ".github" / "scripts" / "kaggle_t4_ci"
@@ -56,9 +69,6 @@ def _steps(workflow: dict) -> list[tuple[str, str, dict]]:
     return out
 
 
-# ------------------------------------------------------- the slug is the record
-
-
 def test_the_slug_carries_the_commit_and_the_workflow():
     """The slug is the ONLY thing surviving the dispatching runner: without the
     commit and the workflow in it, a finished kernel has nowhere to report."""
@@ -78,8 +88,7 @@ def test_the_slug_carries_twelve_hex_characters_and_still_reads_eight():
     assert launch.parse_slug(name)["sha"] == "a" * 12
     old = launch.parse_slug("me/unsloth-t4-ci-nabcdef01-1111")
     assert old is not None and old["sha"] == "abcdef01" and old["kind"] == "notebook"
-    # Too short to be unambiguous is not written into a slug at all: it falls
-    # back to the unattributable form rather than inventing a prefix.
+    # A too-short commit falls back to the legacy slug form.
     assert launch.parse_slug(launch.slug_name("notebook", "abcdef01"))["legacy"] is True
 
 
@@ -113,10 +122,8 @@ def test_the_slug_carries_the_slot_and_reads_slot_one_when_absent():
     assert launch.parse_slug("me/unsloth-t4-ci-n1a2b3c4d5e6f-abcd")["slot"] == "1"
     assert launch.parse_slug("me/unsloth-t4-ci-nabcdef01-1111")["slot"] == "1"
     assert launch.parse_slug("me/unsloth-t4-ci-nabcdef01-21111")["slot"] == "2"
-    # Anything that is not a single digit 2-9 is slot 1 in the slug.
     assert launch.parse_slug(launch.slug_name("notebook", "1a2b3c4d5e6f", slot = "23"))["slot"] == "1"
     assert launch._slugify(two.replace("-", " ")) == two
-    # The collector narrows its in-flight answer by slot too.
     assert "slot" in launch.parse_slug(two)
     assert (
         gate.in_flight_for_commit([f"me/{two} (RUNNING)"], "1a2b3c4d5e6f7890", "notebook", "2")
@@ -165,10 +172,8 @@ def test_the_slug_still_round_trips_through_slugify():
 
 
 def test_the_gate_still_recognises_a_dispatched_kernel_as_ours():
-    """THE ONE THAT KEEPS THE CONCURRENCY CONTROL WORKING. The GitHub group no
-    longer bounds Kaggle sessions; the gate's survey of slugs carrying
-    OWN_KERNEL_PREFIX does, and without the prefix every push believes the
-    account idle until Kaggle refuses one at its 2-session cap."""
+    """Dispatched slugs need OWN_KERNEL_PREFIX, or the gate thinks the account is idle and Kaggle
+    refuses."""
     import gate
     for kind in ("notebook", "studio"):
         name = launch.slug_name(kind, "abcdef01")
@@ -204,9 +209,6 @@ def test_a_legacy_slug_is_still_reapable_but_reports_nothing():
     assert collect.statuses_from([{**parsed, "slug": "x", "verdict": "pass", "reason": "ok"}]) == []
 
 
-# ------------------------------------------------------------ dispatch refuses
-
-
 def test_dispatch_without_a_commit_is_a_usage_error(monkeypatch, capsys):
     """A dispatch whose slug carries no commit runs, costs quota, and reports to
     nobody. Refused at the only moment it is still free."""
@@ -233,11 +235,7 @@ def test_dispatch_does_not_delete_the_kernel_it_pushed():
 
 
 def test_dispatch_does_not_report_pass():
-    """`dispatched` is not `pass`, and the difference is the whole change.
-
-    Nothing has run when the dispatch returns, so `pass` would be worse than the
-    silent skip this repo has been caught by twice: it looks like a result.
-    """
+    """A dispatch reports dispatched, not pass: nothing has run yet, and pass would read as a result."""
     src = (CI_DIR / "launch.py").read_text(encoding = "utf-8")
     block = src[src.index("if args.dispatch:", src.index('result["slug"] = live[0]')) :]
     block = block[: block.index("return finish()")]
@@ -252,9 +250,6 @@ def test_the_dispatch_worst_case_excludes_the_phases_it_never_runs():
     full = launch.worst_case_seconds(5400, 1)
     quick = launch.worst_case_seconds(5400, 1, dispatch = True)
     assert quick < full, (quick, full)
-
-
-# ---------------------------------------------------------------- the collector
 
 
 class _StubKernel:
@@ -313,14 +308,8 @@ def test_a_running_kernel_within_its_ceiling_is_left_completely_alone(tmp_path):
 
 
 def test_a_kernel_past_its_ceiling_is_reaped_and_reported(tmp_path, monkeypatch):
-    """THE REASON THE SCHEDULED COLLECTOR EXISTS. Nothing deletes the kernel
-    now, and a wedged one bills to its ceiling unwatched: one here was measured
-    ignoring Kaggle's own `-t` timeout for over two hours. Reported as a failure
-    rather than dropped, or the commit stays pending forever."""
-    deleted: list[str] = []
-    monkeypatch.setattr(
-        launch, "delete_kernel", lambda slug, deadline = None: deleted.append(slug) or True
-    )
+    """The collector reaps a kernel past its ceiling and reports it, since nothing else deletes it now."""
+    deleted = _shared_setup_1(monkeypatch)
     api = _StubApi([], {"me/unsloth-t4-ci-nabcdef01-1111": "RUNNING"})
     entry = {
         "slug": "me/unsloth-t4-ci-nabcdef01-1111",
@@ -339,10 +328,7 @@ def test_a_kernel_past_its_ceiling_is_reaped_and_reported(tmp_path, monkeypatch)
 def test_a_kernel_with_no_timestamp_is_never_reaped(tmp_path, monkeypatch):
     """A missing timestamp is not evidence that a kernel is old, and guessing in
     that direction DELETES A RUNNING SESSION."""
-    deleted: list[str] = []
-    monkeypatch.setattr(
-        launch, "delete_kernel", lambda slug, deadline = None: deleted.append(slug) or True
-    )
+    deleted = _shared_setup_1(monkeypatch)
     api = _StubApi([], {"me/unsloth-t4-ci-nabcdef01-1111": "RUNNING"})
     entry = {
         "slug": "me/unsloth-t4-ci-nabcdef01-1111",
@@ -368,13 +354,7 @@ def test_evidence_is_downloaded_before_the_kernel_is_deleted(tmp_path, monkeypat
         launch, "delete_kernel", lambda slug, deadline = None: order.append("delete") or True
     )
     api = _StubApi([], {"me/unsloth-t4-ci-nabcdef01-1111": "COMPLETE"})
-    entry = {
-        "slug": "me/unsloth-t4-ci-nabcdef01-1111",
-        "sha": "abcdef01",
-        "kind": "notebook",
-        "legacy": False,
-        "age_hours": 0.4,
-    }
+    entry = _shared_setup_2()
     collect.collect_one(api, entry, tmp_path, expect = 1, max_age_hours = 3.0)
     assert order == ["fetch", "delete"], order
 
@@ -392,20 +372,10 @@ def test_a_kernel_whose_evidence_will_not_download_is_NOT_deleted(tmp_path, monk
 
     deleted: list[str] = []
     monkeypatch.setattr(launch, "fetch_evidence", _boom)
-    monkeypatch.setattr(
-        launch, "delete_kernel", lambda slug, deadline = None: deleted.append(slug) or True
-    )
-    api = _StubApi([], {"me/unsloth-t4-ci-nabcdef01-1111": "COMPLETE"})
-    entry = {
-        "slug": "me/unsloth-t4-ci-nabcdef01-1111",
-        "sha": "abcdef01",
-        "kind": "notebook",
-        "legacy": False,
-        "age_hours": 0.4,
-    }
+    api = _shared_setup_3(deleted, monkeypatch)
+    entry = _shared_setup_2()
     record = collect.collect_one(api, entry, tmp_path, expect = 1, max_age_hours = 3.0)
-    # `pending`, not `infra`: an infra verdict posts green and is released by
-    # --delete-collected, breaking the "next pass retries" promise.
+    # `pending`, not `infra`: infra posts green and is released, so it would never be retried.
     assert record["verdict"] == "pending"
     assert record["verdict"] not in collect.DELETABLE
     assert collect.statuses_from([record]) == []
@@ -415,18 +385,9 @@ def test_a_kernel_whose_evidence_will_not_download_is_NOT_deleted(tmp_path, monk
 def test_an_unreadable_status_does_nothing_at_all(tmp_path, monkeypatch):
     """Both available actions are destructive: delete and we may kill a running
     session, report and we may fail a run that was fine. Ask again next pass."""
-    deleted: list[str] = []
-    monkeypatch.setattr(
-        launch, "delete_kernel", lambda slug, deadline = None: deleted.append(slug) or True
-    )
+    deleted = _shared_setup_1(monkeypatch)
     api = _StubApi([], {"me/unsloth-t4-ci-nabcdef01-1111": RuntimeError("503 upstream")})
-    entry = {
-        "slug": "me/unsloth-t4-ci-nabcdef01-1111",
-        "sha": "abcdef01",
-        "kind": "notebook",
-        "legacy": False,
-        "age_hours": 0.4,
-    }
+    entry = _shared_setup_2()
     record = collect.collect_one(api, entry, tmp_path, expect = 1, max_age_hours = 3.0)
     assert record["verdict"] == "pending"
     assert deleted == []
@@ -484,9 +445,6 @@ def test_the_collector_never_sees_a_github_token():
     src = (CI_DIR / "collect.py").read_text(encoding = "utf-8")
     for forbidden in ("GH_TOKEN", "GITHUB_TOKEN", "api.github.com"):
         assert forbidden not in src, f"collect.py references {forbidden}"
-
-
-# ------------------------------------------------------------- the workflows
 
 
 @pytest.mark.parametrize(
@@ -616,10 +574,8 @@ def test_a_dispatch_posts_a_pending_status():
 
 
 def test_the_reporters_wait_for_an_EXECUTED_NOTEBOOK_not_just_a_directory():
-    """Measured on run 33628507954, which reported `Kaggle T4 smoke: PARTIAL`
-    for a dispatch where nothing had run: `hashFiles('kaggle_evidence/**')` is
-    true once launch.py writes launch_result.json. The condition has to name
-    what a report is MADE of, an executed notebook."""
+    """Wait on an executed notebook, not hashFiles of a directory, which passes once
+    launch_result.json exists."""
     for path in (NOTEBOOK_WF, STUDIO_WF):
         for _job, name, step in _steps(_wf(path)):
             body = step.get("run") or ""
@@ -670,14 +626,7 @@ _STATUS = {
 
 
 def test_an_abbreviated_sha_is_EXPANDED_before_a_status_is_posted(monkeypatch):
-    """MEASURED AGAINST THE REAL API, and it fails closed in the worst way:
-
-        POST /repos/{o}/{r}/statuses/2ecb19df
-        422 "Sha must be a valid hex object ID"
-
-    The slug carries an abbreviation, so the poster must expand it first or
-    every verdict 422s while the collection quietly succeeds.
-    """
+    """The statuses API rejects an abbreviated SHA with 422, so the poster must expand it first."""
     full = "2ecb19df" + "a" * 32
     calls = _fake_gh(monkeypatch, resolve_to = full)
     outcome = post_statuses.post_all([dict(_STATUS)], "unslothai/unsloth")
@@ -705,9 +654,6 @@ def test_every_workflow_posts_through_the_shared_poster_and_none_keeps_a_shell_l
         body = path.read_text(encoding = "utf-8")
         assert "kaggle_t4_ci/post_statuses.py" in body, f"{path.name} does not use the poster"
         assert "statuses.txt" not in body, f"{path.name} still carries the tab-delimited loop"
-
-
-# ---------------------------------------------- post, then delete; never the reverse
 
 
 @pytest.mark.parametrize(
@@ -742,10 +688,7 @@ def test_collection_never_deletes_and_the_release_step_comes_after_posting(path)
 
 
 def test_a_kernel_whose_status_did_not_post_is_KEPT_for_the_next_pass(tmp_path, monkeypatch):
-    deleted: list[str] = []
-    monkeypatch.setattr(
-        launch, "delete_kernel", lambda slug, deadline = None: deleted.append(slug) or True
-    )
+    deleted = _shared_setup_1(monkeypatch)
     result = tmp_path / "collect_result.json"
     result.write_text(
         json.dumps(
@@ -772,10 +715,7 @@ def test_no_delivery_record_at_all_keeps_every_kernel_that_had_something_to_post
     tmp_path, monkeypatch
 ):
     """The poster never ran, so deleting would lose every verdict of the pass."""
-    deleted: list[str] = []
-    monkeypatch.setattr(
-        launch, "delete_kernel", lambda slug, deadline = None: deleted.append(slug) or True
-    )
+    deleted = _shared_setup_1(monkeypatch)
     result = tmp_path / "collect_result.json"
     result.write_text(
         json.dumps(
@@ -824,9 +764,6 @@ def test_the_poster_signs_only_records_it_recognises(monkeypatch, capsys):
     assert calls == [], "a malformed record reached gh"
 
 
-# ------------------------------------------------- what a status is built from
-
-
 def test_two_kernels_for_one_commit_and_context_post_ONE_status_and_a_failure_wins():
     """Slots 1 and 2 on one sha are two kernels under one context, and two
     statuses would race, the last posted becoming the visible verdict."""
@@ -857,7 +794,6 @@ def test_two_kernels_for_one_commit_and_context_post_ONE_status_and_a_failure_wi
     assert len(statuses) == 2
     joint = next(s for s in statuses if s["sha"] == "abcdef01")
     assert joint["state"] == "failure" and sorted(joint["slugs"]) == ["me/one", "me/two"]
-    # Order must not matter: the failure wins whichever kernel was listed first.
     statuses = collect.statuses_from(list(reversed(records)))
     assert next(s for s in statuses if s["sha"] == "abcdef01")["state"] == "failure"
 
@@ -871,9 +807,6 @@ def test_a_description_is_one_line():
         "reason": "a\nb\tc",
     }
     assert collect.statuses_from([record])[0]["description"] == "fail: a b c"
-
-
-# ------------------------------------ the evidence decides, and only complete evidence
 
 
 def _terminal_entry():
@@ -897,10 +830,7 @@ def test_an_incomplete_download_judges_nothing_and_keeps_the_kernel(tmp_path, mo
         lambda slug, dest, deadline = None: {"notebooks": ["a"], "truncated": True},
     )
     monkeypatch.setattr(launch, "extract_reports", lambda dest: [{"passed": True}])
-    monkeypatch.setattr(
-        launch, "delete_kernel", lambda slug, deadline = None: deleted.append(slug) or True
-    )
-    api = _StubApi([], {"me/unsloth-t4-ci-nabcdef01-1111": "COMPLETE"})
+    api = _shared_setup_3(deleted, monkeypatch)
     record = collect.collect_one(api, _terminal_entry(), tmp_path, expect = 1, max_age_hours = 3.0)
     assert record["verdict"] == "pending", record
     assert deleted == []
@@ -922,10 +852,7 @@ def test_a_kernel_another_collector_finished_first_posts_nothing(tmp_path, monke
 
     deleted: list[str] = []
     monkeypatch.setattr(launch, "fetch_evidence", _gone)
-    monkeypatch.setattr(
-        launch, "delete_kernel", lambda slug, deadline = None: deleted.append(slug) or True
-    )
-    api = _StubApi([], {"me/unsloth-t4-ci-nabcdef01-1111": "COMPLETE"})
+    api = _shared_setup_3(deleted, monkeypatch)
     record = collect.collect_one(api, _terminal_entry(), tmp_path, expect = 1, max_age_hours = 3.0)
     assert record["verdict"] == "gone", record
     assert deleted == [] and collect.statuses_from([record]) == []
@@ -982,7 +909,6 @@ def test_the_expected_report_count_travels_inside_the_kernel(tmp_path, monkeypat
     record = collect.collect_one(api, _terminal_entry(), tmp_path, expect = 1, max_age_hours = 3.0)
     assert record["expected"] == 5
     assert record["verdict"] == "partial", record
-    # And with no sentinel the caller's number stands.
     (tmp_path / "plain").mkdir()
     assert collect.expected_reports(tmp_path / "plain", 3) == 3
 
@@ -1011,9 +937,6 @@ def test_the_scheduled_collector_no_longer_guesses_the_payload_count():
     assert (
         "--expect" not in body
     ), "the scheduled collector still applies one flat --expect to every kernel"
-
-
-# ------------------------------------------------------------- the reaper's reach
 
 
 def test_a_kernel_far_past_the_ceiling_is_still_seen(monkeypatch):
@@ -1084,7 +1007,6 @@ def test_the_listing_walk_ends_at_a_page_past_the_horizon_with_none_of_ours():
     api = _PagedApi(pages, {})
     assert collect.find_ours(api, now = now) == []
     assert api.pages_asked == [1, 2], "the walk did not stop at the first page past the horizon"
-    # A page past the horizon that still carries one of ours keeps the walk going.
     pages[1][50] = _StubKernel("me/unsloth-t4-ci-nabcdef012345-3333", last_run_time = ancient)
     api = _PagedApi(pages, {})
     found = collect.find_ours(api, now = now)
@@ -1178,9 +1100,6 @@ def test_a_malformed_neighbour_notebook_does_not_hide_a_failing_report(tmp_path,
     assert "report_error" not in record
 
 
-# ------------------------------------------------------- who is allowed to be quiet
-
-
 def test_the_scheduled_collector_fails_loudly_when_it_cannot_authenticate(
     tmp_path, monkeypatch, capsys
 ):
@@ -1200,10 +1119,7 @@ def test_the_scheduled_collector_fails_loudly_when_it_cannot_authenticate(
 
 
 def test_an_unconfigured_collector_account_warns_and_passes(tmp_path, monkeypatch, capsys):
-    """The matrix is static, so a repository with one Kaggle account leaves the
-    second secret unset; that leg used to go red every ten minutes for an
-    account that does not exist. An empty token is an absent account, warned
-    about and green; a token present and refused is still red."""
+    """An empty Kaggle token is an absent account: warn and pass, but a token that is refused stays red."""
 
     def _no(*a, **k):
         raise OSError("Could not find kaggle.json")
@@ -1243,9 +1159,6 @@ def test_the_collector_installs_the_client_the_gpu_workflows_install():
     ), f"the workflows disagree on the kaggle client: {pins}"
 
 
-# -------------------------------------------------- what a dispatch is allowed to be
-
-
 def test_dispatch_refuses_a_ref_that_is_not_a_commit(monkeypatch, capsys):
     """`slug_name` falls back to the legacy unattributable form for anything not
     hex, so a branch here pushes a kernel that runs, bills and reports to
@@ -1283,8 +1196,7 @@ def test_the_studio_workflow_resolves_its_ref_to_a_commit_before_dispatching():
         ), f"{path.name}: the gate does not resolve refs"
         step = next(s for _j, n, s in _steps(wf) if n == "Resolve the ref under test")
         run = step["run"]
-        # Resolved ONCE, by the gate, and reused: a branch re-resolved after
-        # the job queued can name a commit the gate never keyed anything on.
+        # Resolved once by the gate: re-resolving a branch later can name a different commit.
         assert step["env"]["GATE_SHA"] == "${{ needs.gate.outputs.head_sha }}"
         assert (
             'RESOLVED="$GATE_SHA"' in run and "$(git ls-remote" not in run
@@ -1293,9 +1205,7 @@ def test_the_studio_workflow_resolves_its_ref_to_a_commit_before_dispatching():
         assert (
             "exit 1" in run or "stand_down=true" in run
         ), f"{path.name} dispatches on an unresolved ref"
-        # A full SHA passes the shape test whether or not the repository has it;
-        # only fetching the object says it is there. Without this the Studio leg
-        # spent a session on a commit no status could be posted to.
+        # Only fetching the object proves the repo has the SHA.
         assert (
             "git fetch --quiet --depth=1 https://github.com/unslothai/unsloth" in run
         ), f"{path.name} dispatches a full SHA without checking the repository serves it"
@@ -1336,17 +1246,13 @@ def test_resolve_sha_separates_missing_from_unknown(monkeypatch):
     answers["repos/o/r/commits/bb"] = (1, "", "gh: No commit found for SHA: bb (HTTP 422)")
     answers["repos/o/r/commits/cc"] = (1, "", "gh: HTTP 502 Bad Gateway")
     answers["repos/o/r/commits/dd"] = (1, "", "")
-    # The status code alone is not the answer: 404 is also an unreadable
-    # repository, 422 also an ambiguous abbreviation.
+    # 404 can also mean an unreadable repo, and 422 an ambiguous abbreviation.
     answers["repos/o/r/commits/ee"] = (1, "", "gh: Not Found (HTTP 404)")
     answers["repos/o/r/commits/ff"] = (1, "", "gh: Validation Failed (HTTP 422)")
     assert post_statuses.resolve_sha("o/r", "aa") == ("ok", "a" * 40)
     assert post_statuses.resolve_sha("o/r", "bb") == ("missing", None)
     for sha in ("cc", "dd", "ee", "ff"):
         assert post_statuses.resolve_sha("o/r", sha) == ("error", None), sha
-
-
-# ------------------------------------------ the terminal path is for known states only
 
 
 _ENTRY = {
@@ -1396,7 +1302,6 @@ def test_a_downloaded_file_that_is_not_a_notebook_does_not_wedge_the_collector(
     assert collect.expected_reports(dest, 4) == 4
     record = collect.collect_one(api, dict(_ENTRY), tmp_path, expect = 4, max_age_hours = 3.0)
     assert record["verdict"] == "infra", record
-    # A notebook kernel with no expected-count record has an UNKNOWN plan.
     assert record["expected"] is None
 
 
@@ -1423,13 +1328,9 @@ def test_the_evidence_download_is_clamped_to_the_pass_deadline(tmp_path, monkeyp
         api, dict(_ENTRY), tmp_path, expect = 1, max_age_hours = 3.0, deadline = pass_deadline
     )
     assert seen and seen[0] <= pass_deadline
-    # And the collector's loop hands its deadline down at the one call site.
     source = (CI_DIR / "collect.py").read_text(encoding = "utf-8")
     body = source[source.index("deadline = time.time() + BUDGET_SEC") :]
     assert "deadline = deadline," in body[: body.index("statuses_from")]
-
-
-# ---------------------------------------- collect BEFORE the recheck, never between
 
 
 @pytest.mark.parametrize("path", (NOTEBOOK_WF, STUDIO_WF), ids = ("notebook", "studio"))
@@ -1444,13 +1345,9 @@ def test_collection_runs_before_the_recheck_so_the_recheck_is_last_before_the_pu
     launch_i = names.index("Dispatch to Kaggle")
     assert collect_i < recheck_i < launch_i, names[collect_i : launch_i + 1]
     assert "steps.recheck" not in (steps[collect_i][1].get("if") or "")
-    # Nothing that takes BUDGET_SEC sits between the recheck and the push.
     between = [n for n in names[recheck_i + 1 : launch_i]]
     assert not any("collect.py" in (s.get("run") or "") for n, s in steps if n in between), between
     assert "steps.recheck.outputs.should_run == 'true'" in steps[launch_i][1]["if"]
-
-
-# ------------------------------------- collected Studio evidence is unpacked too
 
 
 @pytest.mark.parametrize("path", (NOTEBOOK_WF, STUDIO_WF), ids = ("notebook", "studio"))
@@ -1463,8 +1360,7 @@ def test_the_unpack_step_reads_the_tree_a_collected_kernel_lands_in(path):
     assert "kaggle_evidence/**/*_output.ipynb" in step["if"]
     run = step["run"]
     assert "kaggle_collected/*/" in run and "kaggle_evidence/*/" in run
-    # One kernel per call: chunks are numbered per bundle, so a walk over two
-    # would splice them together.
+    # One kernel per call: chunks are numbered per bundle.
     assert '--evidence "$dir"' in run and 'studio_evidence/$(basename "$dir")' in run
 
 
@@ -1675,10 +1571,7 @@ def test_the_scheduled_collector_uploads_once_and_reports_real_deletions():
 def test_a_kernel_whose_status_record_was_rejected_is_kept(tmp_path, monkeypatch):
     """The poster refuses a malformed record and posts nothing for it. Keeping
     only the refused posts released that kernel with no status delivered."""
-    deleted: list[str] = []
-    monkeypatch.setattr(
-        launch, "delete_kernel", lambda slug, deadline = None: deleted.append(slug) or True
-    )
+    deleted = _shared_setup_1(monkeypatch)
     slug = "me/unsloth-t4-ci-nabcdef012345-1111"
     result = tmp_path / "collect_result.json"
     result.write_text(
@@ -1754,7 +1647,6 @@ def test_a_notebook_kernel_without_its_expected_count_is_never_a_pass(tmp_path, 
     monkeypatch.setattr(launch, "extract_reports", lambda dest: [{"passed": False, "payload": "x"}])
     record = collect.collect_one(api, dict(_ENTRY), tmp_path, expect = 1, max_age_hours = 3.0)
     assert record["verdict"] == "fail"
-    # Studio kernels carry exactly one report and keep the default.
     monkeypatch.setattr(launch, "extract_reports", lambda dest: [{"passed": True}])
     studio = dict(_ENTRY, kind = "studio", slug = "me/unsloth-t4-ci-sabcdef01-1111")
     api = _StubApi([], {studio["slug"]: "COMPLETE"})
@@ -1764,10 +1656,7 @@ def test_a_notebook_kernel_without_its_expected_count_is_never_a_pass(tmp_path, 
 
 
 def test_every_gate_budget_covers_the_reaper_window():
-    """Nothing deletes the kernel now, so one that ignores its own timeout bills
-    until the collector reaps it, up to a schedule interval and a job timeout
-    late. The gate admits a run when `remaining >= budget + reserve`, so a
-    budget below that window lets a wedged kernel bill into the reserve."""
+    """A gate budget shorter than the reaper window lets a wedged kernel bill into the reserve."""
     collect_wf = _wf(COLLECT_WF)
     job = collect_wf["jobs"]["collect"]
     on = collect_wf.get("on") or collect_wf.get(True) or {}  # PyYAML reads a bare `on:` as True

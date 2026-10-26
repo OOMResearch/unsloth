@@ -1,21 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-/**
- * VRAM estimate for one downloaded model, for the picker's memory bar.
- *
- * Per row, because the rows are spread across a dozen render sites. The work is
- * shared though: `/kv-cache-estimate` reads GGUF metadata off disk, so answers
- * are cached by the inputs that change them and duplicate requests fold into
- * one. Ten rows of the same model cost one read.
- */
+/** Answers are cached by their inputs since `/kv-cache-estimate` reads GGUF metadata off disk. */
 
-// Deep paths, not the `@/features/chat` barrel, and that is load-bearing. The barrel
-// reaches this file back: chat -> apply-inference-status-to-store -> model-picker ->
-// model-selector -> pickers -> here. Importing the barrel closed that ring, and under
-// dev's unbundled ESM the app died on a blank page with "Cannot access
-// 'CHAT_GPU_MEMORY_MODE_KEY' before initialization". Production builds hid it, because
-// the bundler hoists the declarations into one module and the ordering stops mattering.
+// Deep paths, not the `@/features/chat` barrel: the barrel imports this file back, and the cycle
+// blanks the page under dev's unbundled ESM.
 import { estimateKvCache } from "@/features/chat/api/chat-api";
 import {
   CHAT_GPU_MEMORY_MODE_KEY,
@@ -48,25 +37,18 @@ import {
   extraArgsAddResidentFiles,
   extraArgsOwnPlacement,
   extraArgsShapeKvCache,
+  memoryBarWeightsBytes,
 } from "@/lib/model-memory";
 import { useInferenceGpuInfo } from "./use-gpu-info";
 import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 
-/** The on-disk model a row would load. */
 export interface ModelMemorySource {
   repoId: string;
   quant: string;
   /** Size from the listing, so the bar draws before the estimate arrives. */
   sizeBytes?: number | null;
-  /**
-   * The concrete thing this row loads, when the listing resolved one.
-   *
-   * Selecting the row loads this, while the estimate resolved by repo id alone,
-   * so on a duplicate or recovered HF cache the two could pick different copies
-   * of the same quant and the bar would describe a model the click does not
-   * open. Falls back to the repo id upstream, so sending it changes nothing for
-   * an ordinary row.
-   */
+  lookupTableBytes?: number | null;
+  /** What selecting the row loads, so a duplicate HF cache cannot price a different copy. */
   loadId?: string | null;
 }
 
@@ -74,52 +56,37 @@ interface Estimate {
   kvBytes: number | null;
   weightsBytes: number | null;
   specBytes: number | null;
-  /** Context the KV figure was computed at, for the per-token rate. */
   nCtx: number;
-  /** Vision projector footprint, resident alongside the weights. */
   projectorBytes: number | null;
-  /** The host-heap share of kvBytes (SWA checkpoint snapshots), never on the card. */
+  /** Host-heap share of kvBytes (SWA checkpoints), never on the card. */
   kvCheckpointBytes: number | null;
-  /** The share of specBytes no shorter context can reduce (the drafter's weights). */
+  /** The drafter's weights, which no shorter context reduces. */
   specFixedBytes: number | null;
-  /** llama.cpp's compute buffers, which every launch reserves. */
   computeBytes: number | null;
-  /** False only when the loader is free to shrink the context to fit. */
+  /** False only when the loader may shrink the context to fit. */
   contextIsPinned: boolean | null;
-  /** An inherited LLAMA_ARG_DEVICE confines the launch to fewer cards than the
-   *  aggregate budget credits. */
+  /** An inherited LLAMA_ARG_DEVICE confines the launch to fewer cards than the budget credits. */
   inheritedDevicePin: boolean | null;
-  /** The planner's own GPU-resident total, which supersedes the segment sum. */
+  /** Supersedes the segment sum. */
   gpuTotalBytes: number | null;
-  /** What the planner still reserves at the shortest context. */
   gpuFloorBytes: number | null;
-  /** The configured drafter could not be priced, so the total is a floor. */
+  /** The drafter could not be priced, so the total is a floor. */
   specUnpriced: boolean;
 }
 
 const CACHE = new Map<string, Estimate>();
 const IN_FLIGHT = new Map<string, Promise<Estimate>>();
 
-/**
- * Cap on remembered answers. A session can browse a lot of models, and each
- * entry is keyed by settings as well as identity, so the key space is larger
- * than the model count. Oldest-first eviction; a re-fetch costs one disk read.
- */
+/** Keys include settings, so the key space exceeds the model count. Oldest-first eviction. */
 const CACHE_LIMIT = 256;
 
-/**
- * How long a failure is remembered. Failures are cached so an unsizable model
- * doesn't re-request on every reopen, but the common cause is the backend being
- * briefly unavailable -- without expiry those rows would stay blank for the rest
- * of the session.
- */
+/** Expires so a briefly unavailable backend does not leave rows blank all session. */
 const FAILURE_TTL_MS = 30_000;
 
 const failedAt = new Map<string, number>();
 
 function remember(cacheKey: string, estimate: Estimate, failed: boolean): void {
-  // Only a new key grows the map, so re-pricing an existing one must not evict
-  // an unrelated row to make room it does not need.
+  // Re-pricing an existing key must not evict another row.
   if (CACHE.size >= CACHE_LIMIT && !CACHE.has(cacheKey)) {
     const oldest = CACHE.keys().next().value;
     if (oldest !== undefined) {
@@ -160,15 +127,8 @@ const MISS: Estimate = {
   specUnpriced: false,
 };
 
-/**
- * Re-read saved settings whenever any of them are written.
- *
- * Two sources, because a model with no override follows the standing
- * preference: the per-model configs, which announce themselves, and the
- * standing GPU-memory mode and speculative type, which live in localStorage and
- * so raise no same-tab event of their own. The runtime store changes in lockstep
- * with those writes in-session, so it stands in as their notification.
- */
+/** Per-model configs announce themselves; the standing mode and speculative type live in
+ * localStorage, so the runtime store stands in as their notification. */
 function subscribeToConfigChanges(onChange: () => void): () => void {
   if (typeof window === "undefined") return () => {};
   const onConfigWrite = () => {
@@ -176,14 +136,10 @@ function subscribeToConfigChanges(onChange: () => void): () => void {
     onChange();
   };
   window.addEventListener(PER_MODEL_CONFIG_UPDATED_EVENT, onConfigWrite);
-  // The custom event above is same-tab only, by construction: the native
-  // storage event fires in every OTHER document sharing the origin and never in
-  // the one that made the write. So settings edited in a second Studio tab
-  // arrive here as a storage event and nowhere else, and without this a mounted
-  // bar kept its old fit or OOM verdict indefinitely.
+  // The storage event fires only in OTHER tabs; that is how a second tab's edits arrive.
   const onStorage = (event: Event) => {
     const key = (event as StorageEvent).key;
-    // A null key means the whole store was cleared, which counts.
+    // A null key means the whole store was cleared.
     if (key == null || watchedStorageKeys().includes(key)) onConfigWrite();
   };
   window.addEventListener("storage", onStorage);
@@ -195,56 +151,30 @@ function subscribeToConfigChanges(onChange: () => void): () => void {
   };
 }
 
-/**
- * localStorage keys whose cross-tab writes change what the bar should show.
- *
- * A function, not a module-scope array. This module is in an import cycle
- * through features/chat, so it can be evaluated while chat-runtime-store is
- * still initializing; naming these keys at module scope then reads a `const`
- * in its temporal dead zone and throws at import time, taking the page down.
- * By call time every module has finished loading.
- */
+/** A function, not a module array: an import cycle means chat-runtime-store's consts can be in
+ * their TDZ here. */
 const watchedStorageKeys = () => [
   PER_MODEL_CONFIG_STORAGE_KEY,
   CHAT_GPU_MEMORY_MODE_KEY,
   CHAT_SPECULATIVE_TYPE_KEY,
 ];
 
-/** Subscriber for a disabled bar: nothing to watch, nothing to unwatch. */
 const subscribeNothing = () => () => {};
 
-/** Snapshot for a disabled bar. Constant, so it can never force a re-render. */
+/** Constant, so it can never force a re-render. */
 const readZeroEpoch = () => 0;
 
 let configEpoch = 0;
 let lastConfigSignature = "";
 let lastPrefSignature = "";
-// Serialising every saved config is the expensive half, and only a config write
-// can change it. The store ticks on every streamed token, so doing that work on
-// each tick would put an O(all configs) stringify in the render path.
+// The store ticks per streamed token, so only re-serialise configs after a write.
 let configsDirty = true;
 
-/**
- * A value that changes whenever any saved config does, so the estimate can be
- * re-keyed. The settings sheet sits directly beside these rows, and without
- * this a context change leaves the bar showing the old KV segment.
- */
+/** Re-keys the estimate on any config change, e.g. a context edit beside these rows. */
 function readConfigEpoch(): number {
-  // The standing GPU-memory mode and speculative type matter as much as the
-  // saved configs: a model with no override follows them. Without them,
-  // switching the global mode to Manual left every mounted bar drawn against a
-  // budget the load would no longer use, and turning MTP on globally left the
-  // draft reserve missing, until the row happened to remount. Both are two
-  // short strings, so they are cheap to check on every read.
-  // The session GPU pin belongs here because budgetIsMeaningful reads it. It
-  // lives in the runtime store rather than in a saved config, so a preset or a
-  // session-only load configuration changes it with no config write: the
-  // whole-store subscription did fire, but this snapshot did not move, so
-  // useSyncExternalStore suppressed the rerender and a bar stayed drawn against
-  // aggregate multi-GPU VRAM after the launch had been pinned to one card.
+  // The standing mode, speculative type and session GPU pin also change the budget without a config
+  // write, so fold them in.
   const pin = useChatRuntimeStore.getState();
-  // The session speculative mode belongs here for the same reason: it is read
-  // above and never written to a config, so nothing else would move the epoch.
   const pinSignature = `${(pin.selectedGpuIds ?? []).join(",")} ${pin.selectedGpuIndexKind ?? ""} ${pin.speculativeType ?? ""}`;
   const prefSignature = `${readPersistedGpuMemoryMode()} ${readPersistedSpeculativeType()} ${pinSignature}`;
   if (prefSignature !== lastPrefSignature) {
@@ -262,18 +192,7 @@ function readConfigEpoch(): number {
   return configEpoch;
 }
 
-/**
- * The user's saved settings for this exact variant, if any.
- *
- * Variant-exact only, matching `resolveInitialConfig`: the load path looks up
- * (modelId, ggufVariant) and drops to defaults when there's no hit. Falling back
- * to a model-level entry here would size the bar from settings the variant will
- * never load with.
- *
- * Keys are stored normalized, which lower-cases hub repo ids, so comparing raw
- * strings would miss every mixed-case repo and quietly use defaults instead of
- * the context length and KV dtype the user chose.
- */
+/** Variant-exact like `resolveInitialConfig`; keys are normalized (hub repo ids lower-cased). */
 function configFor(source: ModelMemorySource): PerModelConfig | undefined {
   const wantId = normalizeModelIdentity(source.repoId);
   const wantVariant = normalizeGgufVariantIdentity(source.quant);
@@ -284,47 +203,24 @@ function configFor(source: ModelMemorySource): PerModelConfig | undefined {
   )?.config;
 }
 
-/** A context the user pinned, or undefined to let the model use its own. */
 function pinnedContext(config: PerModelConfig | undefined): number | undefined {
   return config?.customContextLength || config?.maxSeqLength || undefined;
 }
 
-/**
- * Whether the budget we're handed still describes where this model will load.
- *
- * Callers pass the total across visible GPUs. Pin the model to a subset, or
- * offload layers to CPU, and that total stops being the ceiling the model is
- * judged against -- charting against it would call a 30 GB quant "fits" on a
- * 2x24 GB host pinned to one card. Better to draw nothing than to mislead.
- *
- * The "at default" tests mirror `gpuFieldsAtDefault` in per-model-config: note
- * that a negative gpuLayers is the runtime's Auto value, not an override, so a
- * truthiness check here would hide the bar for ordinary saved configs. GPU mode
- * falls back to the standing preference, which is what the loader does when a
- * model has no override of its own.
- */
+/** False when a pin or CPU offload means the visible-GPU total is not the ceiling. A negative
+ * gpuLayers is Auto, as in `gpuFieldsAtDefault`. */
 function budgetIsMeaningful(config: PerModelConfig | undefined): boolean {
   const mode = config?.gpuMemoryMode ?? readPersistedGpuMemoryMode();
   if (mode === "manual") return false;
-  // A session pin lives in the runtime store rather than in a saved config, so
-  // a user who pinned cards without ever saving a per-model override reached
-  // none of the tests below and was charted against the whole multi-GPU sum.
+  // A session pin lives in the runtime store, not a saved config.
   const sessionPin = useChatRuntimeStore.getState().selectedGpuIds;
   if (sessionPin != null && sessionPin.length > 0) return false;
   if (!config) return true;
-  // Pass-through args are appended after Unsloth's own flags, so an -ngl or a
-  // device pin in that box is what the launch actually uses. Reading only the
-  // structured fields left the bar charting a CPU-offloaded run against every
-  // GPU on the host.
+  // Pass-through args follow Unsloth's flags, so an -ngl or device pin there wins.
   if (extraArgsOwnPlacement(config.llamaExtraArgs)) return false;
-  // Same reasoning one term over: these do not move the cache, they resize it.
-  // The estimate is built from the structured controls, so a --swa-full in the
-  // box has the launch reserve a full-context cache while the bar priced the
-  // compact sliding window, and the row reads as a comfortable fit.
+  // These resize the cache (e.g. --swa-full).
   if (extraArgsShapeKvCache(config.llamaExtraArgs)) return false;
-  // And these add resident files nothing here priced -- a LoRA, a control
-  // vector, a hand-named drafter. The total would be short by whatever they
-  // weigh, with no sign of it in the bar.
+  // These add resident files nothing here priced (LoRA, control vector, drafter).
   if (extraArgsAddResidentFiles(config.llamaExtraArgs)) return false;
   return (
     config.selectedGpuIds == null &&
@@ -333,20 +229,11 @@ function budgetIsMeaningful(config: PerModelConfig | undefined): boolean {
   );
 }
 
-/**
- * The speculative mode the load will actually use. A null per-model value means
- * "follow the standing preference", which is where the loader looks too --
- * sending nothing would omit the draft reserve until a per-model override is
- * saved.
- */
+/** null per-model means the standing preference, which the loader also follows. */
 function effectiveSpeculativeType(
   config: PerModelConfig | undefined,
 ): string | undefined {
-  // The live runtime value before the persisted one. Forced modes (mtp,
-  // mtp+ngram, dspark, dflash) are deliberately session-only and are never
-  // returned by readPersistedSpeculativeType, so a model loaded with one of them
-  // but not remembered was priced as auto -- and auto drops MTP on an MLA target
-  // while the forced load engages it and opens another full cache.
+  // The live runtime value first: forced modes are session-only and never persisted.
   return (
     config?.speculativeType ??
     useChatRuntimeStore.getState().speculativeType ??
@@ -378,7 +265,11 @@ async function fetchEstimate(
     .then((r) => {
       const estimate: Estimate = {
         kvBytes: r.kv_bytes,
-        weightsBytes: r.weights_bytes,
+        // weights_bytes is the whole file; its lookup tables never reach the GPU.
+        weightsBytes:
+          r.weights_bytes == null
+            ? null
+            : Math.max(0, r.weights_bytes - (r.lookup_table_bytes ?? 0)),
         specBytes: r.spec_bytes,
         nCtx: r.n_ctx ?? 0,
         projectorBytes: r.projector_bytes ?? null,
@@ -391,14 +282,11 @@ async function fetchEstimate(
         gpuFloorBytes: r.gpu_floor_bytes ?? null,
         specUnpriced: r.spec_unpriced === true,
       };
-      // A 200 that could size nothing arrives down the success path, so
-      // remembering it as a success pinned the row blank for the rest of the
-      // session, which is exactly what FAILURE_TTL_MS exists to stop.
+      // A 200 that sized nothing is remembered as a failure so it expires.
       remember(cacheKey, estimate, estimateIsUnsized(estimate));
       return estimate;
     })
-    // A model we can't size still draws its weights. The miss is remembered
-    // briefly so a long list doesn't retry on every reopen, then expires.
+    // The miss is remembered briefly, then expires.
     .catch(() => {
       remember(cacheKey, MISS, true);
       return MISS;
@@ -409,35 +297,21 @@ async function fetchEstimate(
   return run;
 }
 
-/**
- * Bar geometry for one row. Pass no source for rows that aren't on disk; the
- * hook then does nothing and reports "unknown", which draws nothing.
- */
+/** No source (not on disk) does nothing and reports "unknown". */
 export function useModelMemory(
   source: ModelMemorySource | undefined,
   gpuGb?: number | null,
 ): ModelMemorySegments {
-  // Held with its key so a source change invalidates the old answer by
-  // comparison rather than by clearing state from inside an effect.
+  // Held with its key so a source change invalidates by comparison, not by an effect.
   const [entry, setEntry] = useState<{
     key: string;
     estimate: Estimate;
   } | null>(null);
-  // Opt-in, off by default. Checked here rather than at each render site so a
-  // disabled bar also costs no request.
+  // Opt-in; checked here so a disabled bar costs no request.
   const enabled = useChatRuntimeStore((state) => state.showMemoryBar);
 
-  // Read before the subscription below, because that subscription is not free:
-  // subscribeToConfigChanges watches the whole chat runtime store, which ticks on
-  // every streamed token. Every row in the list mounts this hook, so subscribing
-  // unconditionally meant each token woke every mounted row to re-read a snapshot
-  // it would not use -- including with the feature switched off entirely. Both
-  // branches are module-level constants, so swapping between them resubscribes
-  // once on toggle rather than on every render.
-  // `source` as well as `enabled`: an unselected picker row calls this hook with
-  // no source and can never draw a bar, but it still reached the subscription
-  // and so re-read the epoch -- localStorage included -- on every streamed
-  // token. A long list multiplied each token by the number of mounted rows.
+  // Gate before subscribing: the store ticks per streamed token, and an unconditional subscription
+  // woke every row. Both branches are module constants.
   const watching = enabled && source != null;
   const epoch = useSyncExternalStore(
     watching ? subscribeToConfigChanges : subscribeNothing,
@@ -445,44 +319,27 @@ export function useModelMemory(
     () => 0,
   );
 
-  // Whether the number the caller handed us is a dedicated VRAM pool at all.
-  // On a Vulkan iGPU the backend reports free shared system RAM minus a host
-  // reserve, so the same model flips between "fits" and "OOM likely" as the
-  // desktop's RAM moves; on Apple the figure is the entire machine's RAM, which
-  // says "fits" for almost anything Metal would refuse. Neither is a VRAM
-  // ceiling, so the bar declines to draw rather than warn against the wrong
-  // pool. Known gap: a ROCm APU reports its whole GTT pool and is not flagged
-  // as shared, which needs a unified-memory signal in hardware.py to fix.
+  // A Vulkan iGPU reports shared RAM and Apple the whole machine, neither a VRAM ceiling, so draw
+  // nothing. Known gap: a ROCm APU's GTT pool is not flagged shared.
   const inferenceGpu = useInferenceGpuInfo();
   const budgetIsDedicatedVram =
     !inferenceGpu.sharedMemory &&
-    // A ROCm APU reports the GTT/system pool, which moves with host usage and is
-    // not an independent ceiling. The backend classifies these positively; it is
-    // reported as its own field rather than through shared_memory, which the
-    // total and free aggregates already act on.
+    // A ROCm APU's pool moves with host usage; reported apart from shared_memory.
     !inferenceGpu.unifiedMemory &&
     inferenceGpu.backend !== "mlx";
 
-  // The loader's own admission fraction, which the user can change. Cached and
-  // shared, so a long list of rows costs one request.
+  // Cached and shared, so a long list costs one request.
   const [budgetFraction, setBudgetFraction] = useState<number | null>(null);
 
   const repoId = source?.repoId;
   const quant = source?.quant;
   const sizeBytes = source?.sizeBytes;
   const loadId = source?.loadId;
-  // Keyed on primitives rather than the object: callers build the source inline,
-  // so a fresh identity each render would loop forever.
+  // Keyed on primitives: callers build the source inline.
   const plan = useMemo(() => {
-    // A direct .gguf selection has no quant label and does not need one: the
-    // path names the weights outright and the route resolves such a file to
-    // itself. Requiring a label here suppressed the bar for exactly the custom
-    // and LM Studio models the direct-file support was added for.
+    // A direct .gguf path names its weights and needs no quant label.
     const isDirectGgufFile = (loadId ?? "").toLowerCase().endsWith(".gguf");
     if (!enabled || !repoId || (!quant && !isDirectGgufFile)) return null;
-    // Empty rather than undefined past this point: a direct file legitimately
-    // has no label, and the route resolves such a path without one, but every
-    // consumer below wants a string it can key and send.
     const quantLabel = quant ?? "";
     const config = configFor({ repoId, quant: quantLabel });
     const nCtx = pinnedContext(config);
@@ -503,27 +360,19 @@ export function useModelMemory(
       tensorParallel: config?.tensorParallel,
     });
     return {
-      // Identity for the request is the row's own load target; the saved config
-      // is still looked up by repo id, which is how it is keyed.
+      // Saved configs are keyed by repo id, the request by the row's load target.
       source: { repoId: loadId || repoId, quant: quantLabel },
       config,
       nCtx,
       cacheKey,
       trustBudget: budgetIsMeaningful(config) && budgetIsDedicatedVram,
     };
-    // `epoch` is a real dependency the linter cannot see: `configFor` reads
-    // localStorage, and epoch is what changes when that storage does. Folding it
-    // into the cache key instead would evict every row's answer on any save.
+    // `epoch` tracks configFor's localStorage; keying the cache on it would evict on any save.
     // biome-ignore lint/correctness/useExhaustiveDependencies: see above
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [enabled, repoId, loadId, quant, sizeBytes, epoch, budgetIsDedicatedVram]);
 
-  // Gated on a real plan, not merely on the feature being on. Every row in the
-  // list mounts this hook, including remote and undownloaded ones that will never
-  // draw a bar, and loadVramBudgetSettings folds only calls that are already in
-  // flight together -- it holds no read-through cache. Gating on `enabled` alone
-  // therefore turned scrolling or filtering a long list into a repeated request
-  // per row that appeared.
+  // Gated on a real plan: every row mounts this hook, and only in-flight calls fold together.
   useEffect(() => {
     if (!plan) return;
     let alive = true;
@@ -536,8 +385,7 @@ export function useModelMemory(
         if (alive && s) setBudgetFraction(s.fraction);
       })
       .catch(() => {
-        // Falls back to the shared headroom ratio, which is what the fit badge
-        // beside the bar already uses.
+        // Falls back to the headroom ratio the fit badge already uses.
       });
     return () => {
       alive = false;
@@ -558,9 +406,7 @@ export function useModelMemory(
     };
   }, [plan]);
 
-  // The dedicated aggregate is the only figure that is VRAM beside system RAM.
-  // Falls back to the supplied total when the inventory reports no shared device
-  // at all, which is the ordinary discrete-card host and the two agree there.
+  // Only the dedicated aggregate is VRAM beside system RAM.
   const budgetGb =
     inferenceGpu.dedicatedMemoryTotalGb > 0 &&
     inferenceGpu.dedicatedMemoryTotalGb < inferenceGpu.memoryTotalGb
@@ -570,26 +416,16 @@ export function useModelMemory(
   return useMemo(() => {
     if (!plan?.trustBudget) return computeModelMemory({});
     const estimate = entry?.key === plan.cacheKey ? entry.estimate : undefined;
-    // A drafter we could not price is the launch's largest single allocation
-    // (a DSpark sidecar runs to about 11 GB). Charting the rest would read as a
-    // comfortable fit for a load that is nothing of the sort, so draw nothing.
+    // An unpriced drafter can be the largest allocation (~11 GB), so draw nothing.
     if (estimate?.specUnpriced) return computeModelMemory({});
-    // The environment can pin the launch to a subset of the cards the aggregate
-    // budget credits, and an automatic launch preserves that pin. budgetIsMeaningful
-    // can only see browser-side pins and saved config, so this is the one placement
-    // override it cannot reach: without it a 30 GiB model reads as fitting 2x24 GiB
-    // while the child is confined to one of them.
+    // An env device pin is the one placement override budgetIsMeaningful cannot see.
     if (estimate?.inheritedDevicePin) return computeModelMemory({});
-    const weights = estimate?.weightsBytes ?? source?.sizeBytes;
+    const weights = memoryBarWeightsBytes(estimate, source);
     return computeModelMemory({
-      // The projector is resident alongside the weights, so it belongs in that
-      // segment rather than as a fourth sliver the eye cannot resolve.
+      // The projector is resident alongside the weights.
       weightsBytes:
         weights == null ? weights : weights + (estimate?.projectorBytes ?? 0),
-      // Context checkpoints are part of the cache, but llama.cpp keeps those
-      // snapshots in host heap: the load planner's GPU figure is
-      // kv_bytes - kv_checkpoint_bytes. Charged against a VRAM bar they warn OOM
-      // over memory that never reaches the card.
+      // Checkpoints live in host heap: the GPU figure is kv_bytes - kv_checkpoint_bytes.
       kvBytes:
         estimate?.kvBytes == null
           ? estimate?.kvBytes
@@ -600,28 +436,16 @@ export function useModelMemory(
       gpuTotalBytes: estimate?.gpuTotalBytes,
       gpuFloorBytes: estimate?.gpuFloorBytes,
       nCtx: estimate?.nCtx,
-      // The dedicated-only aggregate, never the combined one. On a discrete card
-      // beside a Vulkan iGPU the combined total adds the iGPU's allowance, which
-      // is a capped view of free system RAM, so a model would be judged against
-      // 24 GiB of real VRAM plus whatever the desktop happened not to be using.
-      // `sharedMemory` cannot carry this: it is every(), so a mixed host reads
-      // false and the gate above lets exactly this case through.
+      // Dedicated-only: the combined total adds an iGPU's allowance, a view of free RAM. `sharedMemory`
+      // is every(), so a mixed host reads false and reaches here.
       gpuGb: budgetGb,
       budgetFraction,
-      // With no pinned context the estimate is sized at the model's native
-      // length, but a default load sends 0 and the loader auto-reduces to the
-      // largest context that fits. Warning OOM for a length it would never have
-      // tried is the false positive this whole bar exists to avoid, so the
-      // verdict softens and only the weights can still fail outright.
-      // The route's answer when it gave one: only a context nobody pinned gets
-      // auto-fitted, and load_model keeps a positive inherited LLAMA_ARG_CTX_SIZE
-      // rather than fitting it. Reading plan.nCtx alone said "auto-fitted" for
-      // that launch, which suppressed the overage AND drew only the irreducible
-      // floor, so an inherited window over budget reported a comfortable fit.
+      // Unpinned default loads auto-fit the context, so use the route's answer; an inherited positive
+      // LLAMA_ARG_CTX_SIZE is kept, not fitted.
       contextIsAutoFitted:
         estimate?.contextIsPinned == null
           ? plan.nCtx == null
           : !estimate.contextIsPinned,
     });
-  }, [plan, entry, source?.sizeBytes, budgetGb, budgetFraction]);
+  }, [plan, entry, source?.sizeBytes, source?.lookupTableBytes, budgetGb, budgetFraction]);
 }

@@ -1,14 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""
-Unit tests for local reasoning-stream helpers.
-
-Reasoning templates (Qwen3.6-style) end the generation prompt with an open
-``<think>\\n`` so the model starts reasoning immediately. skip_prompt
-streaming drops that opening tag, so the safetensors/MLX paths must re-emit
-it for the frontend's <think> parser to render a thinking block.
-"""
+"""skip_prompt streaming drops the opened <think> tag, so safetensors and MLX must re-emit it."""
 
 import ast
 import json
@@ -36,9 +29,7 @@ from core.inference.chat_template_helpers import (
 )
 
 try:
-    # core.inference.inference imports unsloth at module scope, which requires
-    # unsloth_zoo. The dependency-light backend CI job does not install it, so the
-    # streamer check runs only when the stack is importable.
+    # core.inference.inference imports unsloth (needs unsloth_zoo), absent in light CI.
     from core.inference.inference import (
         ReasoningTextIteratorStreamer as _ReasoningTextIteratorStreamer,
     )
@@ -104,6 +95,14 @@ def test_guard_suppresses_when_close_tag_is_special():
     close tag, so re-emitting the open would leave an unclosed block. Guard off."""
     specials = ["<|im_end|>", "<think>", "</think>"]
     assert detect_think_prefill(QWEN_PROMPT + "<think>\n", specials) == ""
+
+
+def test_guard_follows_the_path_s_rendering_not_the_token_metadata():
+    specials = ["<|im_end|>", "<think>", "</think>"]
+    assert (
+        detect_think_prefill(QWEN_PROMPT + "<think>\n", specials, preserves_think_close = True)
+        == "<think>\n"
+    )
 
 
 def test_guard_emits_when_think_not_special():
@@ -283,8 +282,6 @@ def test_gemma_channel_normalization_is_prefix_monotonic_and_preserves_tools():
     )
 
 
-# --- Muse Glimmer: recipient-addressed assistant channels ---
-
 _MUSE_TEMPLATE = (
     "{%- if message.get('reasoning_content') -%}"
     "{{- '<|start|>assistant to=self<|message|>' + message['reasoning_content'] + '<|eom|>' -}}"
@@ -330,13 +327,7 @@ def test_muse_glimmer_marker_pair_selects_the_recipient_normalizer():
 
 
 def test_recipient_protocol_ignores_a_prompt_derived_open_channel():
-    """A recipient name is not a marker, so the marker-pair rule does not apply to it.
-
-    ``prompt_opens_reasoning_channel`` looks for its opener at the prompt tail, and here
-    that opener is the recipient name "self", which any prompt may end on by chance.
-    Generation resumes at "<|start|>assistant", so this protocol always starts between
-    blocks and the model writes its own header.
-    """
+    """A recipient name like self can end any prompt by chance, so it must not read as an open channel."""
     from core.inference.chat_template_helpers import make_reasoning_normalizer
 
     assert prompt_opens_reasoning_channel("tell me about self", _MUSE_MARKERS)
@@ -375,53 +366,63 @@ def test_muse_glimmer_direct_reply_without_reasoning_is_normalized():
     assert output == "4"
 
 
-def test_muse_glimmer_reasoning_after_a_reply_still_becomes_a_think_block():
-    """A reply closes with <|eom|> like any other block, so the turn can carry
-    on afterwards; treating the reply as the end would leak the rest verbatim."""
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        pytest.param(
+            " to=user<|message|>Partly.<|eom|>"
+            "<|start|>assistant to=self<|message|>Reconsider.<|eom|>"
+            "<|start|>assistant to=user<|message|>Actually four.",
+            "Partly.<think>Reconsider.</think>Actually four.",
+            id = "muse_glimmer_reasoning_after_a_reply_still_becomes_a_think_block",
+        ),
+        # The checkpoint's response_template allows attributes beside `name`; a stricter
+        # reading drops parameters or misses the call entirely.
+        pytest.param(
+            "to=web_search<|message|><atem:function_calls>\n"
+            '<atem:invoke type="function" name="web_search">\n'
+            '<atem:parameter type="string" name="query">FIFA</atem:parameter>\n'
+            "</atem:invoke>\n</atem:function_calls><|eom|>",
+            '<tool_call>{"name": "web_search", "arguments": {"query": "FIFA"}}</tool_call>',
+            id = "muse_glimmer_call_grammar_allows_attributes_beside_the_name",
+        ),
+        pytest.param(
+            "to=web_search<|message|>Looking it up.<atem:function_calls>"
+            '<atem:invoke name="s"><atem:parameter name="q">v</atem:parameter></atem:invoke>'
+            "</atem:function_calls>One moment.<|eom|>",
+            "Looking it up."
+            '<tool_call>{"name": "s", "arguments": {"q": "v"}}</tool_call>'
+            "One moment.",
+            id = "muse_glimmer_text_the_model_wrote_around_a_call_is_kept",
+        ),
+        pytest.param(
+            " to=user<|message|>Checking.<|eom|>"
+            '<|start|>assistant to=web_search<|message|>{"q": 1}<|eom|>'
+            "<|start|>assistant to=user<|message|>Done.<|eot|>",
+            'Checking.{"q": 1}Done.',
+            id = "muse_glimmer_tool_addressed_block_without_a_call_keeps_its_body",
+        ),
+        pytest.param(
+            "to=self<|message|>First.<|eom|>"
+            "<|start|>assistant to=self<|message|>Second.<|eom|>"
+            "<|start|>assistant to=user<|message|>Done.",
+            "<think>First.</think><think>Second.</think>Done.",
+            id = "muse_glimmer_repeated_reasoning_blocks_each_become_a_think_block",
+        ),
+        pytest.param(
+            "to=self<|message|>Need a search.<|eom|>"
+            "<|start|>assistant to=web_search<|message|><atem:function_calls>\n"
+            '<atem:invoke name="web_search">\n<atem:parameter name="query">FIFA',
+            "<think>Need a search.</think>",
+            id = "muse_glimmer_cut_short_tool_call_leaks_no_markup",
+        ),
+    ],
+)
+def test_muse_glimmer_normalizer_rewrites_control_markup(raw, expected):
     parser = _muse_normalizer()
-    output = parser.feed(
-        " to=user<|message|>Partly.<|eom|>"
-        "<|start|>assistant to=self<|message|>Reconsider.<|eom|>"
-        "<|start|>assistant to=user<|message|>Actually four."
-    )
+    output = parser.feed(raw)
     output += parser.finish()
-
-    assert output == "Partly.<think>Reconsider.</think>Actually four."
-
-
-def test_muse_glimmer_call_grammar_allows_attributes_beside_the_name():
-    """The checkpoint's own response_template matches `name` among other attributes;
-    a stricter reading drops parameters or fails to see the call at all."""
-    parser = _muse_normalizer()
-    output = parser.feed(
-        "to=web_search<|message|><atem:function_calls>\n"
-        '<atem:invoke type="function" name="web_search">\n'
-        '<atem:parameter type="string" name="query">FIFA</atem:parameter>\n'
-        "</atem:invoke>\n</atem:function_calls><|eom|>"
-    )
-    output += parser.finish()
-
-    assert output == (
-        '<tool_call>{"name": "web_search", "arguments": {"query": "FIFA"}}</tool_call>'
-    )
-
-
-def test_muse_glimmer_text_the_model_wrote_around_a_call_is_kept():
-    """Only the call syntax and its envelope are framing; prose beside them is the
-    answer, and rewriting the call must not quietly delete it."""
-    parser = _muse_normalizer()
-    output = parser.feed(
-        "to=web_search<|message|>Looking it up.<atem:function_calls>"
-        '<atem:invoke name="s"><atem:parameter name="q">v</atem:parameter></atem:invoke>'
-        "</atem:function_calls>One moment.<|eom|>"
-    )
-    output += parser.finish()
-
-    assert output == (
-        "Looking it up."
-        '<tool_call>{"name": "s", "arguments": {"q": "v"}}</tool_call>'
-        "One moment."
-    )
+    assert output == expected
 
 
 @pytest.mark.parametrize(
@@ -482,10 +483,8 @@ _CANONICAL_CALL = '<tool_call>{"name": "t", "arguments": {"q": "v"}}</tool_call>
         (_CLOSED_CALL + "after", "after", _CANONICAL_CALL + "after"),
         ("before" + _OPEN_CALL, "before", "before"),
         (_CLOSED_CALL + "mid" + _OPEN_CALL, "mid", _CANONICAL_CALL + "mid"),
-        # Where the budget usually runs out: partway through a tag.
         ('<atem:invoke name="web', "", ""),
         ("</atem:function_call", "", ""),
-        # Markup this parser does not own is shown rather than risk deleting an answer.
         ("<atem:unknown>kept</atem:unknown>",) * 3,
         ("<atem:invoker is prose",) * 3,
         ('<atem:parameter name="q">kept',) * 3,
@@ -519,10 +518,7 @@ def test_muse_glimmer_parameter_text_reaches_the_tool_exactly_as_written():
 
 
 def test_muse_glimmer_bare_repeated_invokes_are_calls_without_an_envelope():
-    """The grammar makes <atem:invoke> the call and repeats it; the surrounding
-    <atem:function_calls> is only what the prompt happens to teach. It also fixes
-    where attributes may sit: before `name` on a call, either side of it on a
-    parameter."""
+    """Bare repeated <atem:invoke> blocks are calls; the function_calls envelope is only prompt-taught."""
     parser = _muse_normalizer()
     output = parser.feed(
         "to=t<|message|>"
@@ -535,21 +531,6 @@ def test_muse_glimmer_bare_repeated_invokes_are_calls_without_an_envelope():
 
     assert [call["function"]["name"] for call in calls] == ["a", "b"]
     assert [json.loads(call["function"]["arguments"])["q"] for call in calls] == [1, 2]
-
-
-def test_muse_glimmer_tool_addressed_block_without_a_call_keeps_its_body():
-    """A tool block holding no call at all is not reshaped into something downstream
-    might run: its body is content. The block closed, though, so the turn keeps
-    parsing rather than shipping every later block as raw control markup."""
-    parser = _muse_normalizer()
-    output = parser.feed(
-        " to=user<|message|>Checking.<|eom|>"
-        '<|start|>assistant to=web_search<|message|>{"q": 1}<|eom|>'
-        "<|start|>assistant to=user<|message|>Done.<|eot|>"
-    )
-    output += parser.finish()
-
-    assert output == 'Checking.{"q": 1}Done.'
 
 
 def test_muse_glimmer_a_call_free_block_does_not_disable_later_reasoning():
@@ -566,18 +547,6 @@ def test_muse_glimmer_a_call_free_block_does_not_disable_later_reasoning():
 
     assert output == '<think>First.</think>{"q": 1}<think>Second.</think>Answer.'
     assert "<|" not in output
-
-
-def test_muse_glimmer_repeated_reasoning_blocks_each_become_a_think_block():
-    parser = _muse_normalizer()
-    output = parser.feed(
-        "to=self<|message|>First.<|eom|>"
-        "<|start|>assistant to=self<|message|>Second.<|eom|>"
-        "<|start|>assistant to=user<|message|>Done."
-    )
-    output += parser.finish()
-
-    assert output == "<think>First.</think><think>Second.</think>Done."
 
 
 @pytest.mark.parametrize("gap", [" ", "\n", "\n\n"])
@@ -675,20 +644,6 @@ def test_muse_glimmer_turn_marker_is_consumed_wherever_it_lands():
         assert streamed == expected, raw
 
 
-def test_muse_glimmer_cut_short_tool_call_leaks_no_markup():
-    """A call the token budget truncated has no arguments worth executing, and its
-    header is protocol framing, so neither belongs in what the user reads."""
-    parser = _muse_normalizer()
-    output = parser.feed(
-        "to=self<|message|>Need a search.<|eom|>"
-        "<|start|>assistant to=web_search<|message|><atem:function_calls>\n"
-        '<atem:invoke name="web_search">\n<atem:parameter name="query">FIFA'
-    )
-    output += parser.finish()
-
-    assert output == "<think>Need a search.</think>"
-
-
 def test_muse_glimmer_call_closed_inside_a_cut_short_block_survives_finish():
     """The block never got its terminator, but this call did close, so the answer the
     user waited for is not thrown away with the half-written one after it."""
@@ -707,10 +662,7 @@ def test_muse_glimmer_call_closed_inside_a_cut_short_block_survives_finish():
 
 
 def test_muse_glimmer_cancelling_promotes_no_call():
-    """drain() is the cancellation path. A call still held there is one the block never
-    terminated, and promoting it would let cancelling a turn be the thing that starts a
-    tool running. A block that did terminate settled during feed(), before there was
-    anything to cancel, so the two cases are asserted together."""
+    """Cancelling must not promote a call the block never terminated, since that would start a tool."""
     held = (
         "to=web_search<|message|><atem:function_calls>\n"
         '<atem:invoke name="web_search">\n'
@@ -719,7 +671,7 @@ def test_muse_glimmer_cancelling_promotes_no_call():
     call = '<tool_call>{"name": "web_search", "arguments": {"query": "first"}}</tool_call>'
 
     cancelled = _muse_normalizer()
-    assert cancelled.feed(held) == ""  # nothing settles while the block is open
+    assert cancelled.feed(held) == ""
     assert cancelled.drain() == ""
 
     terminated = _muse_normalizer()
@@ -754,15 +706,11 @@ def test_muse_glimmer_unterminated_reasoning_block_is_closed_at_finish():
 @pytest.mark.parametrize(
     "raw, expected",
     [
-        # A fragment that can only be framing goes, whether the budget ended inside a
-        # header or inside a terminator: showing it is the leak, not the fix.
         ("to=self<|message|>Done.<|eom|><|start|>assis", "<think>Done.</think>"),
-        # Cut anywhere in a later header, not just in its first few characters.
         ("to=self<|message|>Done.<|eom|><|start|>assistant to=us", "<think>Done.</think>"),
         ("to=self<|message|>Done.<|eom|><|start|>assistant to=user<|mess", "<think>Done.</think>"),
         ("to=user<|message|>Answer.<|eo", "Answer."),
         ("to=user<|message|>Answer.<", "Answer."),
-        # Prose that merely looks like a header tail is text and stays.
         ("to=user<|message|>set auto=true", "set auto=true"),
         ("to=user<|message|>5 is < 7", "5 is < 7"),
     ],
@@ -827,9 +775,7 @@ def test_muse_glimmer_snapshot_stream_normalizes_both_channels():
 
     turn = "to=self<|message|>Reason<|eom|><|start|>assistant to=user<|message|>Reply"
     assert normalized(turn) == "<think>Reason</think>Reply"
-    # The transformers streamer keeps special tokens and Transformers emits the EOS
-    # token before its stopping check fires, so a completed answer really does end
-    # with the turn marker. Consume it rather than showing it.
+    # Transformers emits EOS before its stopping check, so the marker must be consumed.
     assert normalized(turn + "<|eot|>") == "<think>Reason</think>Reply"
 
 
@@ -860,16 +806,13 @@ GEMMA_POST_TOOL_PROMPT = "<|turn>model\n" + GEMMA_TOOL_TAIL + "<|channel>thought
 def test_prompt_opens_reasoning_channel_tracks_generation_prompt_state():
     """Open only when nothing but whitespace follows the prompt's last opener."""
     assert prompt_opens_reasoning_channel(GEMMA_POST_TOOL_PROMPT, GEMMA_MARKERS)
-    # History closes its own channel before the post-tool opener.
     assert prompt_opens_reasoning_channel(
         "<|turn>model\n<|channel>thought\nearlier\n<channel|>" + GEMMA_POST_TOOL_PROMPT,
         GEMMA_MARKERS,
     )
-    # Ordinary turn: the model emits the opener itself.
     assert not prompt_opens_reasoning_channel(
         "<|turn>user\nhi<turn|>\n<|turn>model\n", GEMMA_MARKERS
     )
-    # Thinking disabled: no opener at all.
     assert not prompt_opens_reasoning_channel("<|turn>model\n" + GEMMA_TOOL_TAIL, GEMMA_MARKERS)
     assert not prompt_opens_reasoning_channel(
         "<|turn>model\n<|channel>thought\nearlier\n<channel|>done<turn|>\n", GEMMA_MARKERS
@@ -880,15 +823,7 @@ def test_prompt_opens_reasoning_channel_tracks_generation_prompt_state():
 
 
 def test_unclosed_opener_in_history_cannot_forge_the_channel_state():
-    """An assistant turn keeps channel markup, so only the prompt tail may decide.
-
-    Neutralization strips these markers from user / system / tool turns but leaves
-    an assistant turn's own markup intact, so a template that renders assistant
-    content verbatim can carry a client-supplied unclosed opener into the prompt.
-    (Gemma's own template also strips it, but a marker-aware override need not.)
-    Trusting the last opener anywhere would start the parser inside reasoning on an
-    ordinary turn and hide the whole answer in a think block.
-    """
+    """Only the prompt tail may set channel state, since history keeps a forged unclosed opener."""
     forged = "<|turn>model\nok <|channel>thought<turn|>\n<|turn>user\nagain?<turn|>\n<|turn>model\n"
     assert not prompt_opens_reasoning_channel(forged, GEMMA_MARKERS)
 
@@ -899,12 +834,7 @@ def test_unclosed_opener_in_history_cannot_forge_the_channel_state():
 
 
 def test_continued_turn_never_reads_channel_state_from_its_tail():
-    """A continued turn ends inside the client's assistant text, not template markup.
-
-    ``continue_final_message`` splices the caller's partial onto the prompt, so a
-    partial ending on the opener would otherwise look exactly like a template that
-    opened the channel, and capture the entire continuation as reasoning.
-    """
+    """A continued turn's partial ends in client text, so a trailing opener must not open reasoning."""
     for tail in ("<|channel>thought", "<|channel>thought\n", "<|channel>thought   "):
         spliced = "<|turn>model\nLet me think. " + tail
         assert not prompt_opens_reasoning_channel(spliced, GEMMA_MARKERS, True)
@@ -918,14 +848,7 @@ def test_continued_turn_never_reads_channel_state_from_its_tail():
 
 
 def test_tool_loop_pass_of_a_continued_turn_still_reads_the_prompt():
-    """The request flag outlives the continuation; the render it describes does not.
-
-    A continued turn that calls a tool keeps ``continue_final_message`` set for the
-    next pass, but that pass renders an ordinary post-tool generation prompt. Suppressing
-    detection on the request flag alone would put the post-tool reasoning back in the
-    visible answer, so the effective signal is whether a trailing assistant turn was
-    actually resumed.
-    """
+    """Request flag outlives the turn; skip detection only if a trailing assistant turn was resumed."""
     resumed = [{"role": "user", "content": "q"}, {"role": "assistant", "content": "partial"}]
     post_tool = [
         {"role": "user", "content": "q"},
@@ -939,7 +862,6 @@ def test_tool_loop_pass_of_a_continued_turn_still_reads_the_prompt():
     effective = lambda msgs: bool(trailing_assistant_text(msgs))
 
     assert effective(resumed) is True
-    # The tool result is the trailing turn now, so nothing was resumed.
     assert effective(post_tool) is False
     assert prompt_opens_reasoning_channel(
         GEMMA_POST_TOOL_PROMPT, GEMMA_MARKERS, effective(post_tool)
@@ -951,7 +873,6 @@ def test_prompt_opened_channel_normalizes_post_tool_reasoning():
     parser = ReasoningChannelNormalizer(*GEMMA_MARKERS, in_reasoning = True)
     output = ""
     snapshots = []
-    # Split across chunks, as a token stream splits it.
     for chunk in ("The search ", "returned 18C.", "<chan", "nel|>", "It is 18C in Paris."):
         delta = parser.feed(chunk)
         if delta:
@@ -963,8 +884,7 @@ def test_prompt_opened_channel_normalizes_post_tool_reasoning():
     assert "<channel|>" not in output
     assert all(later.startswith(earlier) for earlier, later in zip(snapshots, snapshots[1:]))
 
-    # Streaming X from a prompt-opened channel must match generating the opener plus X:
-    # a streamed leading newline is content, unlike the protocol newline after an opener.
+    # A streamed leading newline is content, unlike the protocol newline after an opener.
     for streamed, expected in (
         ("reasoned<channel|>answer", "<think>reasoned</think>answer"),
         ("\nreasoned<channel|>answer", "<think>\nreasoned</think>answer"),
@@ -985,7 +905,6 @@ def test_prompt_opened_channel_without_generated_text_emits_no_think_block():
     assert empty.finish() == ""
 
     cancelled = ReasoningChannelNormalizer(*GEMMA_MARKERS, in_reasoning = True)
-    # Hold back a partial closing marker, so drain() has real buffered text.
     assert cancelled.feed("partial reasoning<chan") == "<think>partial reasoning"
     assert cancelled.drain() == "<chan"
 
@@ -1006,7 +925,6 @@ def test_normalize_reasoning_snapshots_derives_state_from_prompt():
     )
     assert post_tool[-1] == "<think>reasoning</think>answer"
 
-    # Without a prompt-opened channel the model supplies both markers as before.
     first_turn = list(
         normalize_reasoning_snapshots(
             _stream(["<|channel>thought\n", "reasoning", "<channel|>", "answer"]),
@@ -1114,7 +1032,6 @@ def test_muse_glimmer_opening_newline_is_framing_on_either_line_ending(body, exp
         ("to=user<|mess", ""),
         ("to=self<|m", ""),
         ("to=web.search<|message", ""),
-        # Still ambiguous, so still text.
         ("to=user", "to=user"),
         ("to=", "to="),
         ("set auto=true", "set auto=true"),

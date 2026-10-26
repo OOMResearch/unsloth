@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+import { useAppShellReadySignal } from "@/components/app-readiness";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -30,6 +31,7 @@ import { OPEN_LEARNING_RECIPES_ON_ARRIVAL_KEY } from "@/lib/navigation-intents";
 import { toastError } from "@/shared/toast";
 import {
   Album02Icon,
+  BookOpen01Icon,
   CodeIcon,
   CookBookIcon,
   Database02Icon,
@@ -43,7 +45,7 @@ import {
 import { HugeiconsIcon } from "@hugeicons/react";
 import { useNavigate } from "@tanstack/react-router";
 import type { ReactElement } from "react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   createRecipeDraft,
   createRecipeFromLearningRecipe,
@@ -52,6 +54,8 @@ import {
   useRecipes,
 } from "../data/recipes-db";
 import { LEARNING_RECIPES } from "../learning-recipes";
+import { GuidedTour, useGuidedTourController } from "@/features/tour";
+import { buildDataRecipesTourSteps } from "../tour";
 
 type TemplateCard = {
   title: string;
@@ -177,6 +181,22 @@ const TEMPLATE_CARDS: TemplateCard[] = [
     ],
     learningRecipeId: "github-support-bot",
   },
+  {
+    title: "Books & Documents to Text",
+    description:
+      "Extract EPUB, MOBI, PDF, Word, Excel, PowerPoint and more into a text dataset for continued pretraining.",
+    icon: BookOpen01Icon,
+    difficulty: "Easy",
+    learningBadges: ["Unstructured", "Ebooks", "Expression"],
+    surfaceClassName:
+      "from-rose-500/15 via-pink-500/5 to-transparent dark:from-rose-400/20 dark:via-pink-400/10 dark:to-rose-950/16",
+    shineColor: [
+      "rgb(244 63 94 / 0.45)",
+      "rgb(236 72 153 / 0.4)",
+      "rgb(251 113 133 / 0.45)",
+    ],
+    learningRecipeId: "books-and-documents",
+  },
 ];
 
 const LEARNING_RECIPE_BY_ID = new Map(
@@ -218,7 +238,7 @@ function LearningRecipeCards({
   loadingTemplateId: string | null;
 }): ReactElement {
   return (
-    <div className="grid w-full gap-4 sm:grid-cols-2 xl:grid-cols-3">
+    <div className="grid w-full gap-4 sm:grid-cols-2 xl:grid-cols-3 4xl:grid-cols-4">
       {TEMPLATE_CARDS.map((template) => {
         const learningRecipe = template.learningRecipeId
           ? LEARNING_RECIPE_BY_ID.get(template.learningRecipeId)
@@ -239,7 +259,7 @@ function LearningRecipeCards({
             type="button"
             disabled={isDisabled}
             onClick={() => onSelect(template)}
-            className={`group shadow-border relative overflow-hidden rounded-2xl bg-gradient-to-br dark:bg-white/[0.05] text-left transition-transform ${template.surfaceClassName} enabled:cursor-pointer enabled:hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-70`}
+            className={`group shadow-border relative overflow-hidden rounded-2xl bg-gradient-to-br dark:bg-[rgb(255_255_255_/_calc(0.05*var(--contrast-wash-gain,1)))] text-left transition-transform ${template.surfaceClassName} enabled:cursor-pointer enabled:hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-70`}
           >
             <ShineBorder
               borderWidth={1.2}
@@ -255,7 +275,7 @@ function LearningRecipeCards({
               >
                 {template.difficulty}
               </Badge>
-              <div className="inline-flex size-10 items-center justify-center rounded-xl border border-foreground/10 bg-background/80">
+              <div className="inline-flex size-10 items-center justify-center rounded-md border border-[color-mix(in_oklab,var(--foreground)_calc(10%*var(--contrast-edge-gain,1)),transparent)] bg-background/80">
                 <HugeiconsIcon
                   icon={template.icon}
                   className="size-5 text-foreground/90"
@@ -269,7 +289,7 @@ function LearningRecipeCards({
                   {template.description}
                 </p>
               </div>
-              <div className="flex items-center gap-1 overflow-hidden whitespace-nowrap">
+              <div className="flex items-center gap-1 overflow-hidden whitespace-nowrap max-xl:flex-wrap max-xl:gap-y-1">
                 {isLoading ? (
                   <Badge variant="outline">Loading...</Badge>
                 ) : (
@@ -311,6 +331,7 @@ function LearningRecipeCards({
 }
 
 export function DataRecipesPage(): ReactElement {
+  const signalReady = useAppShellReadySignal();
   const navigate = useNavigate();
   const { recipes, ready } = useRecipes();
   const [creatingRecipe, setCreatingRecipe] = useState(false);
@@ -319,14 +340,22 @@ export function DataRecipesPage(): ReactElement {
     null,
   );
   const reloadReadySent = useRef(false);
+  const tourSteps = useMemo(
+    () => buildDataRecipesTourSteps({ ready, hasRecipes: recipes.length > 0 }),
+    [ready, recipes.length],
+  );
+  const tour = useGuidedTourController({
+    id: "data-recipes",
+    steps: tourSteps,
+  });
 
   useEffect(() => {
     if (!ready || reloadReadySent.current) {
       return;
     }
     reloadReadySent.current = true;
-    window.dispatchEvent(new Event("unsloth:app-shell-ready"));
-  }, [ready]);
+    signalReady();
+  }, [ready, signalReady]);
 
   useEffect(() => {
     if (sessionStorage.getItem(OPEN_LEARNING_RECIPES_ON_ARRIVAL_KEY) !== "1") {
@@ -407,19 +436,20 @@ export function DataRecipesPage(): ReactElement {
 
   return (
     <div className="min-h-[calc(100dvh-var(--studio-titlebar-height,0px))] bg-background">
-      <main className="mx-auto w-full max-w-7xl px-5 py-8 sm:px-9">
+      <main className="mx-auto w-full max-w-7xl 3xl:max-w-[calc(1440px*var(--ui-space-scale,1))] 4xl:max-w-[calc(1760px*var(--ui-space-scale,1))] px-5 py-8 max-sm:px-4 sm:px-9">
+        <GuidedTour {...tour.tourProps} />
         <div className="flex items-center justify-between gap-4">
           <div>
             <h1 className="text-ui-30 font-semibold leading-[1.04] tracking-[-0.028em] text-foreground sm:text-ui-34">
               Data Recipes
             </h1>
-            <p className="mt-1 text-sm text-muted-foreground">
+            <p className="mt-0.5 text-sm text-muted-foreground">
               Create and manage local recipe workflows.
             </p>
           </div>
           <DropdownMenu>
             <DropdownMenuTrigger asChild={true}>
-              <Button type="button" disabled={isBusy}>
+              <Button variant="secondary" type="button" data-tour="recipes-new" disabled={isBusy}>
                 <HugeiconsIcon icon={PlusSignIcon} className="size-4" />
                 New Recipe
                 <HugeiconsIcon
@@ -451,7 +481,10 @@ export function DataRecipesPage(): ReactElement {
 
         {ready ? (
           recipes.length === 0 ? (
-            <Empty className="mt-8 border border-dashed border-border/70 dark:border-none">
+            <Empty
+              data-tour="recipes-templates"
+              className="mt-8 border border-dashed border-border/70 dark:border-none"
+            >
               <EmptyHeader>
                 <EmptyMedia variant="icon">
                   <HugeiconsIcon icon={CookBookIcon} className="size-5" />
@@ -462,17 +495,7 @@ export function DataRecipesPage(): ReactElement {
                   workflows work.
                 </EmptyDescription>
               </EmptyHeader>
-              <EmptyContent className="max-w-6xl items-stretch">
-                {/*<Button*/}
-                {/*  type="button"*/}
-                {/*  variant="secondary"*/}
-                {/*  className="mx-auto"*/}
-                {/*  onClick={() => setLearningDialogOpen(true)}*/}
-                {/*  disabled={isBusy}*/}
-                {/*>*/}
-                {/*  <HugeiconsIcon icon={CookBookIcon} className="size-4" />*/}
-                {/*  Start Tutorial*/}
-                {/*</Button>*/}
+              <EmptyContent className="max-w-6xl 4xl:max-w-none items-stretch">
                 <LearningRecipeCards
                   onSelect={(template) => {
                     openLearningRecipe(template).catch(() => undefined);
@@ -482,18 +505,18 @@ export function DataRecipesPage(): ReactElement {
               </EmptyContent>
             </Empty>
           ) : (
-            <div className="mt-8 space-y-2">
+            <div data-tour="recipes-list" className="mt-8 space-y-2">
               {recipes.map((recipe) => (
                 <div
                   key={recipe.id}
-                  className="flex items-center gap-3 rounded-xl border bg-card px-4 py-3"
+                  className="flex items-center gap-3 rounded-lg border bg-card px-4 py-3"
                 >
                   <button
                     type="button"
                     className="flex min-w-0 flex-1 items-center gap-3 text-left"
                     onClick={() => openRecipe(recipe)}
                   >
-                    <div className="flex size-9 shrink-0 items-center justify-center rounded-lg border border-border/70 bg-muted/20">
+                    <div className="flex size-9 shrink-0 items-center justify-center rounded-md border border-border/70 bg-muted/20">
                       <HugeiconsIcon
                         icon={CookBookIcon}
                         className="size-4 text-muted-foreground"
@@ -545,7 +568,7 @@ export function DataRecipesPage(): ReactElement {
       <Dialog open={learningDialogOpen} onOpenChange={setLearningDialogOpen}>
         <DialogContent
           className="sm:max-w-5xl"
-          overlayClassName="bg-background/45 supports-backdrop-filter:backdrop-blur-[1px]"
+          overlayClassName="bg-background/45"
         >
           <DialogHeader>
             <DialogTitle>Learning Recipes</DialogTitle>

@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import base64
 import io
+import math
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +51,14 @@ def _to_pil_from_hf_image_dict(value: Any) -> Any | None:
 
     path_value = value.get("path")
     if isinstance(path_value, str) and path_value.strip():
+        # Row cells are user data: a managed account may only preview files it could read itself.
+        from fastapi import HTTPException
+        from core.training.account_jobs import account_path
+
+        try:
+            account_path(path_value)
+        except (HTTPException, OSError, RuntimeError, ValueError, TypeError):
+            return None
         try:
             from PIL import Image  # type: ignore
             with Image.open(Path(path_value)) as image:
@@ -59,6 +69,27 @@ def _to_pil_from_hf_image_dict(value: Any) -> Any | None:
     return None
 
 
+# Resolved once: importing pandas per value cost 30%. Sentinel, since None is a real value.
+_NO_SENTINEL = object()
+_PANDAS_NA: Any = _NO_SENTINEL
+_PANDAS_NAT: Any = _NO_SENTINEL
+_PANDAS_SENTINELS_READY = False
+
+
+def _is_pandas_missing(value: Any) -> bool:
+    """pandas' own missing sentinels. Identity rather than ``pd.isna``, which answers element-wise
+    for a list or an array; these two are singletons."""
+    global _PANDAS_NA, _PANDAS_NAT, _PANDAS_SENTINELS_READY
+    if not _PANDAS_SENTINELS_READY:
+        try:
+            import pandas as pd  # type: ignore
+            _PANDAS_NA, _PANDAS_NAT = pd.NA, pd.NaT
+        except ImportError:  # pragma: no cover
+            _PANDAS_NA = _PANDAS_NAT = _NO_SENTINEL
+        _PANDAS_SENTINELS_READY = True
+    return value is _PANDAS_NA or value is _PANDAS_NAT
+
+
 def to_jsonable(value: Any) -> Any:
     """Convert numpy/pandas-ish values into plain JSON-safe values."""
     try:
@@ -66,11 +97,25 @@ def to_jsonable(value: Any) -> Any:
     except ImportError:  # pragma: no cover
         np = None  # type: ignore
 
+    # Ahead of everything below: NaT isoformat()s to "NaT" and NA hits the str() fallback.
+    if _is_pandas_missing(value):
+        return None
+
+    # DuckDB hands a DECIMAL back as a float and pyarrow as a Decimal: 1.2 against "1.20".
+    if isinstance(value, Decimal):
+        return float(value)
+
     if np is not None:
         if isinstance(value, np.ndarray):
             return value.tolist()
         if isinstance(value, np.generic):
-            return value.item()
+            value = value.item()
+            if not isinstance(value, float):
+                return value
+
+    # pandas' missing number is NaN; Starlette refuses NaN/inf, so one blank cell 500'd the page.
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
 
     if isinstance(value, dict):
         return {str(k): to_jsonable(v) for k, v in value.items()}
@@ -117,3 +162,12 @@ def to_preview_jsonable(value: Any) -> Any:
     if isinstance(converted, (bytes, bytearray)):
         return base64.b64encode(bytes(converted)).decode("ascii")
     return str(converted)
+
+
+def to_preview_jsonable_row(row: Any) -> Any:
+    """Per column: a row with bytes or path keys looks like one image and replaces every column."""
+    if isinstance(row, list):
+        return [to_preview_jsonable_row(item) for item in row]
+    if not isinstance(row, dict):
+        return to_preview_jsonable(row)
+    return {str(key): to_preview_jsonable(value) for key, value in row.items()}

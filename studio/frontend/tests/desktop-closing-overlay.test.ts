@@ -2,11 +2,8 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-// The overlay itself is JSX, which cannot be imported here. So: drive the store the
-// app-closing events write to, then assert the three call sites read and write it.
 import {
   APP_CLOSING_CANCELLED_EVENT,
   APP_CLOSING_EVENT,
@@ -16,11 +13,8 @@ import {
   subscribeAppClosing,
 } from "../src/components/tauri/closing-signal.ts";
 
-function source(path: string): Promise<string> {
-  return readFile(new URL(`../src/${path}`, import.meta.url), "utf8");
-}
+import { readSrc, readText } from "./helpers/kit.ts";
 
-/** The ClosingContent body, up to whatever component is declared after it. */
 function closingContent(screen: string): string {
   const start = screen.indexOf("function ClosingContent()");
   if (start < 0) {
@@ -69,7 +63,7 @@ test("an unsubscribed listener stops hearing about quits", () => {
 });
 
 test("the backend hook routes both quit events into the store", async () => {
-  const hook = await source("hooks/use-tauri-backend.ts");
+  const hook = await readSrc("hooks/use-tauri-backend.ts");
 
   assert.match(
     hook,
@@ -81,8 +75,6 @@ test("the backend hook routes both quit events into the store", async () => {
     /register<void>\(APP_CLOSING_CANCELLED_EVENT,\s*\(\) => \{\s*clearAppClosing\(\);/,
     "a cancelled quit would strand the overlay over a running app",
   );
-  // Subscribed, not mirrored into state: the listener lives inside the long event effect,
-  // which has no way back to a setState from the render that registered it.
   assert.match(
     hook,
     /const closing = useSyncExternalStore\(subscribeAppClosing, isAppClosing\);/,
@@ -95,10 +87,8 @@ test("the backend hook routes both quit events into the store", async () => {
 });
 
 test("the overlay covers the app instead of replacing it", async () => {
-  const provider = await source("app/provider.tsx");
+  const provider = await readSrc("app/provider.tsx");
 
-  // Unmounting the app subtree would cancel in-flight generations and drop debounced
-  // drafts, and a declined quit has to give all of that back.
   assert.match(provider, /\{shell\}\s*\{closing && <ClosingScreen \/>\}/);
   assert.doesNotMatch(
     provider,
@@ -106,7 +96,7 @@ test("the overlay covers the app instead of replacing it", async () => {
     "the overlay is back to replacing the app it should be covering",
   );
 
-  const screen = await source("components/tauri/startup-screen.tsx");
+  const screen = await readSrc("components/tauri/startup-screen.tsx");
   const closingScreen = screen.slice(
     screen.indexOf("export function ClosingScreen()"),
   );
@@ -118,16 +108,12 @@ test("the overlay covers the app instead of replacing it", async () => {
 });
 
 test("the overlay survives a modal's body pointer-events lockout", async () => {
-  const screen = await source("components/tauri/startup-screen.tsx");
+  const screen = await readSrc("components/tauri/startup-screen.tsx");
   const closingScreen = screen.slice(
     screen.indexOf("export function ClosingScreen()"),
   );
 
-  // Radix parks pointer-events:none on <body> for as long as any modal layer is open,
-  // and pointer-events inherits. A quit raised from the titlebar controls, the tray or
-  // Alt+F4 never closes that layer, so without an explicit auto the overlay is
-  // click-through onto the dialog it is hiding, and clicks meant for a screen that says
-  // the app is closing land on buttons the user can no longer see.
+  // Radix sets pointer-events:none on body while a modal is open; the overlay needs explicit auto.
   assert.match(
     closingScreen,
     /className="pointer-events-auto /,
@@ -136,10 +122,8 @@ test("the overlay survives a modal's body pointer-events lockout", async () => {
 });
 
 test("the close button leaves the overlay to Rust", async () => {
-  const titlebar = await source("components/tauri/window-titlebar.tsx");
+  const titlebar = await readSrc("components/tauri/window-titlebar.tsx");
 
-  // Raising it here would put it behind the quit confirmations, one of which asks whether
-  // to keep training. Rust raises it only once those have passed.
   assert.doesNotMatch(
     titlebar,
     /markAppClosing/,
@@ -149,34 +133,22 @@ test("the close button leaves the overlay to Rust", async () => {
 });
 
 test("the overlay is presentation only, with no way out of a wedged reap", async () => {
-  const signal = await source("components/tauri/closing-signal.ts");
-  const screen = await source("components/tauri/startup-screen.tsx");
+  const signal = await readSrc("components/tauri/closing-signal.ts");
+  const screen = await readSrc("components/tauri/startup-screen.tsx");
   const body = closingContent(screen);
 
-  // A wedged teardown has no escape, and did not have one before this overlay either: a
-  // second close press, Alt+F4 and the taskbar all land on request_quit, which begin_quit
-  // has already turned into a silent no-op for the life of the reap. The overlay does not
-  // take an escape away, it explains the freeze that was already there.
   assert.doesNotMatch(
     signal,
     /force_quit|forceQuit/,
     "a force quit command is process management this overlay does not need",
   );
   assert.doesNotMatch(body, /Force quit/);
-  // No timer either: nothing in the overlay changes with time, so nothing may schedule
-  // work that outlives a declined quit.
   assert.doesNotMatch(body, /setTimeout|useState/);
 });
 
 test("a quit with no window on screen raises no overlay", async () => {
-  const rust = await readFile(
-    new URL("../../src-tauri/src/main.rs", import.meta.url),
-    "utf8",
-  );
+  const rust = readText("../../src-tauri/src/main.rs");
 
-  // Tray Quit reaches request_quit without going through the main window, and an autostart
-  // launch passes --hidden, whose window is built "visible": false and never shown. The
-  // overlay explains a frozen window, so with no window on screen there is nothing to say.
   assert.match(
     rust,
     /fn quit_raises_the_overlay\(/,
@@ -184,25 +156,21 @@ test("a quit with no window on screen raises no overlay", async () => {
   );
   assert.match(
     rust,
-    /app\.get_webview_window\("main"\)\s*\.map\(\|window\| window\.is_visible\(\)/,
+    /app\.get_window\("main"\)\s*\.map\(\|window\| window\.is_visible\(\)/,
   );
 });
 
 test("the overlay names the wait it is covering", async () => {
-  const screen = await source("components/tauri/startup-screen.tsx");
+  const screen = await readSrc("components/tauri/startup-screen.tsx");
   const body = closingContent(screen);
 
   assert.match(body, /Closing Unsloth Desktop\.\.\./);
   assert.match(body, /Shutting down the backend\./);
-  // A still screen reads as the freeze it is there to explain.
   assert.match(body, /<Spinner className="size-6 text-primary" \/>/);
 });
 
 test("both sides agree on the event names", async () => {
-  const rust = await readFile(
-    new URL("../../src-tauri/src/main.rs", import.meta.url),
-    "utf8",
-  );
+  const rust = readText("../../src-tauri/src/main.rs");
 
   assert.match(
     rust,

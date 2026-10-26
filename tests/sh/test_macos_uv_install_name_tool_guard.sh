@@ -1,27 +1,13 @@
 #!/bin/bash
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
-# Regression coverage for uv's unconditional macOS install_name_tool patch. A consumer
-# Mac without CLT must never execute Apple's developer-tool shim, while a selected CLT
-# or full Xcode installation must retain uv's real libpython patch.
+# A Mac without CLT must never execute Apple's install_name_tool shim, while a selected CLT
+# or Xcode must keep uv's real libpython patch.
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$SCRIPT_DIR/_harness.sh"
 INSTALL_SH="$SCRIPT_DIR/../../install.sh"
-PASS=0
-FAIL=0
-
-assert_eq() {
-    _label="$1"; _expected="$2"; _actual="$3"
-    if [ "$_actual" = "$_expected" ]; then
-        echo "  PASS: $_label"
-        PASS=$((PASS + 1))
-    else
-        echo "  FAIL: $_label (expected '$_expected', got '$_actual')"
-        FAIL=$((FAIL + 1))
-    fi
-}
-
 assert_empty() {
     _label="$1"; _path="$2"
     if [ ! -s "$_path" ]; then
@@ -80,8 +66,6 @@ exit "${FAKE_UV_RC:-0}"
 UV_EOF
 chmod +x "$_BIN/xcode-select" "$_BIN/install_name_tool" "$_BIN/uv"
 
-# Each named layout owns its expected uv status and real-tool count; callers pass only
-# the shell and scenario rather than a positional clump of correlated expectations.
 run_case() {
     _shell="$1"; _layout="$2"
     _uv_rc=0; _expected_rc=0; _expected_tool=0; _developer_override=""; _dev=""
@@ -179,7 +163,6 @@ for _sh in sh bash; do
     run_case "$_sh" clt
     run_case "$_sh" xcode
 done
-
 
 echo "=== exact generic/user and non-macOS forwarding ==="
 for _sh in sh bash; do
@@ -280,7 +263,6 @@ for _sh in sh bash; do
         FAIL=$((FAIL + 1))
     fi
 done
-
 
 echo ""
 echo "Passed: $PASS, Failed: $FAIL"

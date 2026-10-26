@@ -17,6 +17,12 @@ export type WindowSizeBounds = {
 };
 
 export const MINIMUM_APP_WINDOW_SIZE: LogicalWindowSize = {
+  width: 460,
+  height: 480,
+};
+
+/** Separate from the resize floor: shrinking the floor must not shrink the opened window. */
+export const NOMINAL_APP_WINDOW_SIZE: LogicalWindowSize = {
   width: 900,
   height: 600,
 };
@@ -31,7 +37,6 @@ export const DEFAULT_APP_WINDOW_SIZE_BOUNDS: WindowSizeBounds = {
   minimum: MINIMUM_APP_WINDOW_SIZE,
 };
 
-// Leave resize room when the nominal minimum does not fit.
 const RELAXED_MINIMUM_RATIO = 0.85;
 const FIRST_WINDOW_WIDTH_RATIO = 0.75;
 const FIRST_WINDOW_HEIGHT_RATIO = 0.85;
@@ -42,18 +47,23 @@ function relaxMinimum(preferred: number, maximum: number): number {
   return Math.max(1, Math.floor(maximum * RELAXED_MINIMUM_RATIO));
 }
 
-/** Bounds a frameless window to the monitor work area. */
+/** `logicalPerCssPx` keeps the floor in CSS pixels under Windows text scaling. */
 export function calculateWindowSizeBounds(
   workAreaSize: LogicalWindowSize,
+  logicalPerCssPx = 1,
 ): WindowSizeBounds {
   const maximum = {
     width: Math.max(1, Math.floor(workAreaSize.width)),
     height: Math.max(1, Math.floor(workAreaSize.height)),
   };
+  const floor = {
+    width: Math.round(MINIMUM_APP_WINDOW_SIZE.width * logicalPerCssPx),
+    height: Math.round(MINIMUM_APP_WINDOW_SIZE.height * logicalPerCssPx),
+  };
   return {
     minimum: {
-      width: relaxMinimum(MINIMUM_APP_WINDOW_SIZE.width, maximum.width),
-      height: relaxMinimum(MINIMUM_APP_WINDOW_SIZE.height, maximum.height),
+      width: relaxMinimum(floor.width, maximum.width),
+      height: relaxMinimum(floor.height, maximum.height),
     },
     maximum,
   };
@@ -74,20 +84,30 @@ export function calculateFirstAppWindowSize(
   { minimum, maximum }: WindowSizeBounds,
   cssSafeLogicalWidth?: number,
 ): LogicalWindowSize {
-  if (!maximum) return minimum;
+  if (!maximum) return NOMINAL_APP_WINDOW_SIZE;
 
+  // A first window floors at the nominal size, relaxed (never below the floor) on small work areas.
+  const nominal = {
+    width: Math.max(
+      minimum.width,
+      relaxMinimum(NOMINAL_APP_WINDOW_SIZE.width, maximum.width),
+    ),
+    height: Math.max(
+      minimum.height,
+      relaxMinimum(NOMINAL_APP_WINDOW_SIZE.height, maximum.height),
+    ),
+  };
   const width = Math.max(
-    minimum.width,
+    nominal.width,
     Math.round(maximum.width * FIRST_WINDOW_WIDTH_RATIO),
     Math.min(cssSafeLogicalWidth ?? 0, maximum.width),
   );
-  // Preserve requested height when the work area is short.
   const heightCap = Math.max(
-    MINIMUM_APP_WINDOW_SIZE.height,
+    NOMINAL_APP_WINDOW_SIZE.height,
     Math.round(maximum.height * FIRST_WINDOW_HEIGHT_RATIO),
   );
   const height = Math.max(
-    minimum.height,
+    nominal.height,
     Math.min(Math.round(width / FIRST_WINDOW_ASPECT_RATIO), heightCap),
   );
   return fitWindowSize({ width, height }, maximum);
@@ -111,7 +131,6 @@ export function constrainWindowSize(
   );
 }
 
-/** Centers a physical window size inside the work area. */
 export function calculateCenteredPosition(
   workArea: PhysicalWindowRect,
   windowSize: { width: number; height: number },

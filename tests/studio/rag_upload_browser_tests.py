@@ -27,7 +27,6 @@ def request(path, body = None):
 
 
 def wait_state(predicate):
-    # Same contention as the browser waits below: three engines on a two-core runner.
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         state = request("/__state")
@@ -35,6 +34,24 @@ def wait_state(predicate):
             return state
         time.sleep(0.02)
     raise AssertionError(f"Server condition was not reached: {state}")
+
+
+def _snapshot(page):
+    """Capture page and fixture state on failure; a timed-out wait does not show which side stalled."""
+    snapshot = {}
+    try:
+        snapshot["page"] = page.evaluate(
+            "({documents: window.sim.documents, uploading: window.sim.uploading, "
+            "hasIndexing: window.sim.hasIndexing, errors: window.errors, "
+            "pageErrors: window.pageErrors, url: location.href})"
+        )
+    except Exception as exc:  # noqa: BLE001 - a snapshot must not replace the real failure
+        snapshot["page"] = f"unreadable: {exc}"
+    try:
+        snapshot["server"] = request("/__state")
+    except Exception as exc:  # noqa: BLE001 - same
+        snapshot["server"] = f"unreadable: {exc}"
+    return snapshot
 
 
 def run_case(browser, mode, action):
@@ -49,13 +66,16 @@ def run_case(browser, mode, action):
         action(page)
         assert not errors, errors
         assert not page.evaluate("window.pageErrors"), "Unexpected browser error"
+    except Exception as exc:
+        exc.rag_snapshot = _snapshot(page)
+        raise
     finally:
         request("/__release", {})
         context.close()
 
 
 def complete(page):
-    # Three engines share a 2-core runner, so this waits on scheduling, not on the app.
+    # Three engines share a 2-core runner, so this waits on scheduling, not the app.
     page.wait_for_function(
         "window.sim.documents.length>0 && window.sim.documents.every(d=>d.status==='completed') && !window.sim.uploading && !window.sim.hasIndexing",
         timeout = 30000,
@@ -107,7 +127,10 @@ def error(page):
         timeout = 30000,
     )
     assert not page.evaluate("window.sim.hasIndexing || window.sim.uploading")
-    assert page.evaluate("window.sim.documents") == []
+    # The failed row stays, with its reason, so it can be retried or removed.
+    documents = page.evaluate("window.sim.documents")
+    assert [(d["filename"], d["status"]) for d in documents] == [("report.pdf", "failed")]
+    assert documents[0]["error"].startswith("simulated ")
 
 
 def failed_scope(page):
@@ -270,6 +293,9 @@ def main():
                         "status": "failed",
                         "error": str(exc),
                     }
+                    snapshot = getattr(exc, "rag_snapshot", None)
+                    if snapshot is not None:
+                        record["snapshot"] = snapshot
                 record["seconds"] = round(time.monotonic() - start, 3)
                 print(json.dumps(record), flush = True)
                 records.append(record)

@@ -10,7 +10,6 @@ import {
 } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
 import {
   Table,
   TableBody,
@@ -61,8 +60,6 @@ type ExecutionOverviewTabProps = {
   terminalLines: string[];
   terminalRef: RefObject<HTMLDivElement | null>;
   onTerminalScroll: (event: UIEvent<HTMLDivElement>) => void;
-  canPublish: boolean;
-  onOpenPublish: () => void;
 };
 
 export function ExecutionOverviewTab({
@@ -80,8 +77,6 @@ export function ExecutionOverviewTab({
   terminalLines,
   terminalRef,
   onTerminalScroll,
-  canPublish,
-  onOpenPublish,
 }: ExecutionOverviewTabProps): ReactElement {
   const sourceProgress = execution.source_progress;
 
@@ -89,19 +84,6 @@ export function ExecutionOverviewTab({
     <div className="mt-3 space-y-3">
       {showSummaryCards && (
         <div className="space-y-3">
-          {canPublish && (
-            <div className="flex flex-col gap-3 rounded-xl border border-border/60 bg-card/55 p-3 sm:flex-row sm:items-center sm:justify-between">
-              <div className="space-y-1">
-                <p className="text-sm font-medium text-foreground">Next step</p>
-                <p className="text-xs text-muted-foreground">
-                  This run is complete. Publish the generated dataset to Hugging Face.
-                </p>
-              </div>
-              <Button type="button" variant="outline" size="sm" onClick={onOpenPublish}>
-                Publish to Hugging Face
-              </Button>
-            </div>
-          )}
           <div className="grid gap-3 md:grid-cols-2">
             <div className="h-full rounded-xl border border-border/60 bg-card/55 p-3">
               <div className="mb-2 flex items-center justify-between">
@@ -192,7 +174,7 @@ export function ExecutionOverviewTab({
             </div>
           </div>
           {(llmColumnCount > 0 || modelUsageRows.length > 0) && (
-            <div className="rounded-xl border border-border/60 bg-card/55 p-3">
+            <div className="rounded-lg border border-border/60 bg-card/55 p-3">
               <div className="mb-2 flex items-center justify-between">
                 <p className="text-xs text-muted-foreground">Model usage</p>
                 <HugeiconsIcon icon={Flag02Icon} className="size-4 text-muted-foreground" />
@@ -200,7 +182,7 @@ export function ExecutionOverviewTab({
               {modelUsageRows.length === 0 ? (
                 <p className="text-xs text-muted-foreground">No model usage yet.</p>
               ) : (
-                <div className="overflow-hidden rounded-lg border border-border/60 bg-card/50">
+                <div className="overflow-hidden rounded-md border border-border/60 bg-card/50">
                   <Table>
                     <TableHeader>
                       <TableRow>
@@ -212,7 +194,7 @@ export function ExecutionOverviewTab({
                     <TableBody>
                       {modelUsageRows.map((usage) => (
                         <TableRow key={usage.model}>
-                          <TableCell className="max-w-[320px] truncate">{usage.model}</TableCell>
+                          <TableCell className="max-w-[calc(320px*var(--ui-space-scale,1))] truncate">{usage.model}</TableCell>
                           <TableCell className="text-right">
                             {formatMetricValue(usage.input)}
                           </TableCell>
@@ -230,7 +212,7 @@ export function ExecutionOverviewTab({
         </div>
       )}
       {sourceProgress?.source === "github" && (
-        <div className="rounded-xl border border-border/60 bg-card/55 p-3">
+        <div className="rounded-lg border border-border/60 bg-card/55 p-3">
           <div className="mb-2 flex items-center justify-between">
             <p className="text-xs text-muted-foreground">Source data</p>
             <HugeiconsIcon icon={GithubIcon} className="size-4 text-muted-foreground" />

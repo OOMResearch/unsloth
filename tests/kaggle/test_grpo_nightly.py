@@ -1,28 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""GRPO runs nightly, and the reason is a measurement rather than a preference.
-
-Over nine T4 sessions the leg hit an intermittent illegal memory access in
-vLLM's standby sleep on Turing in FOUR of them. Everything else about it is
-sound -- 0.95 utilisation confirmed on both Colab and Kaggle, sleep/wake
-surviving three cycles, a non-zero ``reward_std`` on every step once the reward
-function stopped saturating -- but a 44% red in front of every PR, for a race no
-reader can act on, is exactly how a check gets switched off before the day it is
-right. At nightly cadence a clean run still arrives most days and a red one
-costs nobody a merge.
-
-So the rules here are about the SHAPE that makes that possible:
-
-* the schedule exists and fires the GRPO leg specifically;
-* a leg list REPLACES ``--all-kernels`` rather than filtering after it, because
-  the kernel plan and the expected payload count come out of the same call and
-  a filter applied afterwards leaves the launcher waiting on payloads nobody
-  built;
-* the schedule bypasses the sampling gate. A nightly sampled at 15% is a
-  weekly, and the difference is invisible until someone goes looking for a
-  result that never existed.
-"""
+"""GRPO runs nightly: vLLM standby sleep on Turing hit an illegal memory access in 4 of 9 sessions."""
 
 from __future__ import annotations
 
@@ -31,6 +10,7 @@ import sys
 from pathlib import Path
 
 import yaml
+import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "kaggle-t4-notebook-ci.yml"
@@ -59,58 +39,40 @@ def test_the_nightly_does_not_pile_onto_the_hour_mark():
 
 def _nightly_legs():
     """The leg names the schedule actually selects, read off the workflow."""
-    # Anchored on LEG_LIST, not on the schedule fallback in general. The gate
-    # bypass a few lines above reads `github.event_name == 'schedule' && 'true'`
-    # and a loose pattern picks THAT up: the first version of this helper
-    # reported the nightly leg set as ["true"].
+    # Anchored on LEG_LIST: a loose pattern matches the gate bypass `... && 'true'` above it.
     match = re.search(r"LEG_LIST:.*github\.event_name == 'schedule' && '([a-z_,]+)'", TEXT)
     assert match, "the schedule selects no leg list at all"
     return [name for name in match.group(1).split(",") if name]
 
 
-def test_the_schedule_runs_the_grpo_leg():
-    assert "grpo" in _nightly_legs(), (
-        "the schedule must select the leg; a nightly that runs the wired set "
-        "is just another copy of the per-PR run"
-    )
-
-
-def test_the_schedule_also_runs_the_multi_gpu_leg():
-    """multi_gpu is here for a different reason from grpo and the distinction
-    is worth keeping: grpo is nightly because it CRASHES 44% of the time,
-    multi_gpu because it costs makespan. It passes on hardware -- the ab3 A/B
-    has it green in both arms -- and the brief it was built to was multi-GPU
-    coverage at no wall-clock cost, which it measurably is not (+172.4s and
-    +39.7s over two same-commit pairs, slower in both).
-
-    Nightly is where that coverage is free. Without this the DEVICE_COUNT > 1
-    bindings in unsloth's kernels go back to being tested nowhere at all, which
-    is the state this leg was written to end."""
-    assert "multi_gpu" in _nightly_legs(), (
-        "the nightly no longer runs multi_gpu, so unsloth's DEVICE_COUNT > 1 "
-        "code path is covered by nothing: every other leg is pinned to one card"
-    )
-
-
-def test_the_schedule_also_runs_the_latest_compile_leg():
-    """Third reason again, and the distinction is the point: grpo is nightly
-    because it crashes 44% of sessions, multi_gpu because it costs makespan at
-    the margin, latest_compile because it does not FIT.
-
-    Its DONE record is 1323.0s (unsloth-probe-lcleg-tmpdir-ac53ca) and at
-    12.73GB peak it admits no co-tenant, so it wants a whole card for 22
-    minutes. The per-PR kernel's only slack is gpu1's 776.3s idle block while
-    Studio holds gpu0. 1323 does not go into 776.
-
-    Without this the leg is wired nowhere and gemma-4-E2B-it on the newest
-    transformers and trl -- the only thing that caught zoo #1103 -- is tested
-    by nothing. That is the state it was built to end, and the reason the leg
-    is nightly rather than deleted."""
-    assert "latest_compile" in _nightly_legs(), (
-        "the nightly no longer runs latest_compile, so nothing anywhere loads "
-        "gemma-4-E2B-it on the newest transformers and trl, which is the "
-        "pairing that found unsloth-zoo #1103"
-    )
+@pytest.mark.parametrize(
+    "leg, why",
+    [
+        pytest.param(
+            "grpo",
+            "the schedule must select the leg; a nightly that runs the wired set "
+            "is just another copy of the per-PR run",
+            id = "the_schedule_runs_the_grpo_leg",
+        ),
+        # multi_gpu is nightly for makespan cost, not instability.
+        pytest.param(
+            "multi_gpu",
+            "the nightly no longer runs multi_gpu, so unsloth's DEVICE_COUNT > 1 "
+            "code path is covered by nothing: every other leg is pinned to one card",
+            id = "the_schedule_also_runs_the_multi_gpu_leg",
+        ),
+        # latest_compile is nightly because it needs a whole card for too long.
+        pytest.param(
+            "latest_compile",
+            "the nightly no longer runs latest_compile, so nothing anywhere loads "
+            "gemma-4-E2B-it on the newest transformers and trl, which is the "
+            "pairing that found unsloth-zoo #1103",
+            id = "the_schedule_also_runs_the_latest_compile_leg",
+        ),
+    ],
+)
+def test_the_schedule_runs_the_nightly_only_legs(leg, why):
+    assert leg in _nightly_legs(), why
 
 
 def test_every_leg_the_nightly_names_exists():
@@ -130,10 +92,7 @@ def test_the_nightly_set_fits_in_one_kernel():
 
 
 def test_no_nightly_leg_is_ALSO_in_the_per_pr_set():
-    """The whole point, and it applies to each of them. If grpo were wired into
-    KERNELS the 44% crash rate would be back in front of every PR; if multi_gpu
-    were, the makespan it was moved here to avoid would be back too. Either way
-    the nightly becomes a second copy of the per-PR run."""
+    """A nightly leg wired into per-PR too makes the nightly a second copy of the per-PR run."""
     wired = {name for kernel in legs.KERNELS for name in kernel}
     both = sorted(set(_nightly_legs()) & wired)
     assert not both, (
@@ -169,15 +128,8 @@ def test_the_leg_list_default_survives_a_schedule_event():
     assert "inputs.legs || (github.event_name == 'schedule'" in TEXT
 
 
-# ------------------------------------------------- the command line it composes
-
-# Every rule above reads the workflow as TEXT, each was true, and the nightly
-# still never ran: the build step also emitted --with-studio unconditionally,
-# which build_kernel.py refuses next to --legs, so runs 33587255856 and
-# 33716011285 (every scheduled run there has ever been) died on
-# `--with-studio requires --all-kernels`. Two guards, neither able to see the
-# other. So the rules below run the step's own shell body and hand the argv it
-# composes to the real parser.
+# Text rules alone missed that the build step emitted --with-studio next to --legs, which
+# build_kernel.py refuses. So run the step's shell body and parse the argv it composes.
 
 
 def _build_step():
@@ -196,21 +148,14 @@ def _compose_argv(
     studio_concurrent = "",
     github_output = "",
 ):
-    """Run the build step's shell body and return the argv it would invoke.
-
-    Executed by bash, not pattern-matched, so the branches decide what is
-    emitted exactly as on a runner. The only substitution is `python`, a stub
-    on PATH that records its arguments.
-    """
+    """Runs the build step's shell under bash, stubbing only python, so its branches pick the argv."""
     import json
     import os
     import shlex
     import subprocess
 
     step = _build_step()
-    # `inputs` is null on push and on a schedule, so every input expression is
-    # empty on both triggers modelled here. Only LEG_LIST differs, and it comes
-    # from the workflow's own fallback rather than a copy kept here.
+    # `inputs` is null on push and schedule; only LEG_LIST differs, from the workflow's fallback.
     nightly = ",".join(_nightly_legs())
     env_values = {
         "LEG_LIST": legs_input or (nightly if event == "schedule" else ""),
@@ -222,7 +167,6 @@ def _compose_argv(
         assert key in env_values, f"the build step gained {key}, which this rule does not model"
 
     body = step["run"]
-    # `steps.*.outputs.*` are refs the builder only echoes, so any hex will do.
     body = body.replace("${{ steps.ref.outputs.ref }}", "0" * 40)
     body = body.replace("${{ steps.pins.outputs.zoo_ref }}", "1" * 40)
     body = body.replace("${{ inputs.shared_wheels }}", "")
@@ -241,9 +185,8 @@ def _compose_argv(
     (bindir / "python").chmod(0o755)
 
     env = dict(os.environ, PATH = f"{bindir}{os.pathsep}{os.environ['PATH']}", **env_values)
-    # A real file, so the rules read what the step published, not what it printed.
     env["GITHUB_OUTPUT"] = github_output or str(tmp_path / "github_output")
-    # `bash -e`, which is what GitHub runs a `run:` block under on Linux.
+    # `bash -e` is what GitHub uses for `run:` blocks on Linux.
     proc = subprocess.run(
         ["bash", "-e", "-c", body],
         cwd = ROOT,
@@ -273,11 +216,7 @@ def _run_builder(argv, tmp_path):
 
 
 def test_the_nightly_command_line_is_one_the_builder_accepts(tmp_path):
-    """THE RULE THAT WOULD HAVE CAUGHT IT.
-
-    Not "the flags look right": the step's own shell composes the argv and the
-    real builder is handed it.
-    """
+    """The real builder must accept the argv the nightly step's shell composes, not a flags check."""
     argv, log, printed = _compose_argv("schedule", tmp_path)
     proc = _run_builder(argv, tmp_path)
     assert proc.returncode == 0, (
@@ -345,13 +284,7 @@ def test_an_explicit_leg_dispatch_takes_the_same_path_as_the_nightly(tmp_path):
 
 
 def test_studio_concurrent_false_actually_removes_the_flag(tmp_path):
-    """The OTHER half of the input, which the text rules cannot see.
-
-    A branch that hardcoded the flag instead of reading the variable would
-    still contain every string they look for. Only running it with the input
-    `false` and finding the flag gone says the switch works, and that dispatch
-    is the only way Studio's own two-card device selection is under test.
-    """
+    """Dispatches with studio_concurrent=false: a hardcoded flag would pass the text rules but not this."""
     off, _, printed = _compose_argv("workflow_dispatch", tmp_path, studio_concurrent = "false")
     assert "--studio-concurrent" not in off, (
         f"studio_concurrent=false still shares a card, so the two-card Studio "
@@ -368,14 +301,8 @@ def test_studio_concurrent_false_actually_removes_the_flag(tmp_path):
 
 
 def test_the_studio_reporter_is_told_when_studio_is_not_aboard(tmp_path):
-    """The build step publishes whether it packed Studio; the reporter gates
-    on it.
-
-    `own_verdict` answers an EMPTY `studio-gpu` report set with `partial`,
-    carrying the notebook kernel's reason, so an ungated reporter renders
-    "Unsloth GPU smoke: PARTIAL" on every leg-list run about a payload that was
-    never aboard. Not red, which is worse: it reads like a result.
-    """
+    """Without this gate, an empty studio-gpu report set renders PARTIAL on runs that never packed
+    Studio."""
     for event, expected in (("schedule", "false"), ("push", "true")):
         outfile = tmp_path / f"out_{event}"
         outfile.write_text("", encoding = "utf-8")

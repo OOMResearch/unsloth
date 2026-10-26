@@ -2,6 +2,7 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import {
+  CPT_LORA_HYPERPARAMS,
   CPT_TARGET_MODULES,
   DEFAULT_HYPERPARAMS,
   LR_DEFAULT_CPT,
@@ -13,10 +14,12 @@ import { stageLegacyHfTokenForMigration } from "@/features/hub/stores/hf-token-s
 import { isTrainingMethod } from "@/types/training";
 import type { DatasetFormat } from "@/types/training";
 import type {
+  LoraVariant,
   TrainingConfigState,
   TrainingConfigStore,
   TrainingMethodProvenance,
 } from "../types/config";
+import { drafterStateFrom } from "../lib/drafter-config";
 import {
   createHfBrowseDatasetSelection,
   createUploadBrowseDatasetSelection,
@@ -24,7 +27,7 @@ import {
 } from "./training-config-policy";
 
 export const TRAINING_CONFIG_PERSISTENCE_NAME = "unsloth_training_config_v1";
-export const TRAINING_CONFIG_PERSISTENCE_VERSION = 21;
+export const TRAINING_CONFIG_PERSISTENCE_VERSION = 23;
 
 const NON_PERSISTED_STATE_KEYS: ReadonlySet<keyof TrainingConfigState> =
   new Set([
@@ -39,8 +42,11 @@ const NON_PERSISTED_STATE_KEYS: ReadonlySet<keyof TrainingConfigState> =
     "manualDatasetOptionsValid",
     "trainOnCompletionsDefaultPendingFor",
     "maxPositionEmbeddings",
+    "decisionCheckpoints",
+    "decisionLayout",
     "s3Config",
     "wandbToken",
+    "drafterCapability",
   ]);
 
 export function partializeTrainingConfig(
@@ -132,7 +138,7 @@ function migrateThroughVersion12(
     if (legacyToken) {
       stageLegacyHfTokenForMigration(legacyToken);
     }
-    // Keep the legacy value persisted until authenticated migration confirms the backend write.
+    // Keep the legacy value until authenticated migration confirms the backend write.
   }
 }
 
@@ -223,6 +229,10 @@ function migrateThroughVersion19(
       modelAdapterLearningRate: null,
       datasetFormatBeforeCpt: null,
       targetModulesBeforeCpt: null,
+      loraRankBeforeCpt: null,
+      loraAlphaBeforeCpt: null,
+      loraVariantBeforeCpt: null,
+      trainOnCompletionsBeforeCpt: null,
     } satisfies TrainingMethodProvenance;
   }
 }
@@ -232,10 +242,75 @@ function migrateThroughVersion21(
   version: number,
 ): void {
   if (version < 21) {
-    // currentStep belonged to the onboarding wizard and was persisted, so without
-    // this it survives every rehydrate and partialize writes it straight back.
+    // currentStep belonged to the removed onboarding wizard and would otherwise persist forever.
     Reflect.deleteProperty(state, "currentStep");
   }
+}
+
+// Recover the pre-CPT slots from the defaults advancedSettingsBaseline froze.
+function migrateThroughVersion22(
+  state: PersistedTrainingConfig,
+  version: number,
+): void {
+  if (version >= 22 || state.trainingMethod !== "cpt") return;
+  const provenance = state.trainingMethodProvenance;
+  if (typeof provenance !== "object" || provenance === null) return;
+  // mergeTrainingConfig's own identity test, empty string included.
+  if (
+    typeof state.modelDefaultsAppliedFor !== "string" ||
+    state.modelDefaultsAppliedFor.length === 0 ||
+    state.modelDefaultsAppliedFor !== state.selectedModel
+  ) {
+    return;
+  }
+  const baseline = state.advancedSettingsBaseline;
+  if (typeof baseline !== "object" || baseline === null) return;
+  const { loraRank, loraAlpha, loraVariant } = baseline as Record<
+    string,
+    unknown
+  >;
+  // Exactly the CPT triple: captured after CPT applied, so it says nothing.
+  if (
+    loraRank === CPT_LORA_HYPERPARAMS.loraRank &&
+    loraAlpha === CPT_LORA_HYPERPARAMS.loraAlpha &&
+    loraVariant === CPT_LORA_HYPERPARAMS.loraVariant
+  ) {
+    return;
+  }
+  // Gaps only: a real pre-CPT edit outranks the defaults the baseline froze.
+  const record = provenance as Record<string, unknown>;
+  if (positiveIntOrNull(record.loraRankBeforeCpt) === null) {
+    record.loraRankBeforeCpt = positiveIntOrNull(loraRank);
+  }
+  if (positiveIntOrNull(record.loraAlphaBeforeCpt) === null) {
+    record.loraAlphaBeforeCpt = positiveIntOrNull(loraAlpha);
+  }
+  if (!isLoraVariant(record.loraVariantBeforeCpt)) {
+    record.loraVariantBeforeCpt = isLoraVariant(loraVariant)
+      ? loraVariant
+      : null;
+  }
+}
+
+// Drafter training arrived in 23: older state has no drafter keys, and a hand-edited or
+// partially written one must never turn the phase on.
+function migrateThroughVersion23(
+  state: PersistedTrainingConfig,
+  version: number,
+): void {
+  if (version >= 23) return;
+  Object.assign(
+    state,
+    drafterStateFrom({
+      enabled: state.drafterEnabled,
+      strategy: state.drafterStrategy,
+      data_source: state.drafterDataSource,
+      max_examples: state.drafterMaxExamples,
+      epochs: state.drafterEpochs,
+      learning_rate: state.drafterLearningRate,
+      draft_steps: state.drafterDraftSteps,
+    }),
+  );
 }
 
 function isDatasetFormat(value: unknown): value is DatasetFormat {
@@ -246,6 +321,21 @@ function isDatasetFormat(value: unknown): value is DatasetFormat {
     value === "sharegpt" ||
     value === "raw"
   );
+}
+
+function isLoraVariant(value: unknown): value is LoraVariant {
+  return (
+    value === "lora" ||
+    value === "rslora" ||
+    value === "loftq" ||
+    value === "dora"
+  );
+}
+
+function positiveIntOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isInteger(value) && value > 0
+    ? value
+    : null;
 }
 
 function normalizeTrainingMethodProvenance(
@@ -259,6 +349,7 @@ function normalizeTrainingMethodProvenance(
   const modelAdapterLearningRate = provenance.modelAdapterLearningRate;
   const datasetFormatBeforeCpt = provenance.datasetFormatBeforeCpt;
   const targetModulesBeforeCpt = provenance.targetModulesBeforeCpt;
+  const wasCpt = persistedState.trainingMethod === "cpt";
   return {
     learningRateManuallySet:
       typeof provenance.learningRateManuallySet === "boolean"
@@ -271,18 +362,42 @@ function normalizeTrainingMethodProvenance(
         ? modelAdapterLearningRate
         : null,
     datasetFormatBeforeCpt:
-      persistedState.trainingMethod === "cpt" &&
+      wasCpt &&
       isDatasetFormat(datasetFormatBeforeCpt) &&
       datasetFormatBeforeCpt !== "raw"
         ? datasetFormatBeforeCpt
         : null,
     targetModulesBeforeCpt:
-      persistedState.trainingMethod === "cpt" &&
+      wasCpt &&
       Array.isArray(targetModulesBeforeCpt) &&
       targetModulesBeforeCpt.length > 0
         ? [...targetModulesBeforeCpt]
         : null,
+    loraRankBeforeCpt: wasCpt
+      ? positiveIntOrNull(provenance.loraRankBeforeCpt)
+      : null,
+    loraAlphaBeforeCpt: wasCpt
+      ? positiveIntOrNull(provenance.loraAlphaBeforeCpt)
+      : null,
+    loraVariantBeforeCpt:
+      wasCpt && isLoraVariant(provenance.loraVariantBeforeCpt)
+        ? provenance.loraVariantBeforeCpt
+        : null,
+    trainOnCompletionsBeforeCpt:
+      wasCpt && typeof provenance.trainOnCompletionsBeforeCpt === "boolean"
+        ? provenance.trainOnCompletionsBeforeCpt
+        : null,
   };
+}
+
+function normalizeSettingsBeforeDecision(
+  value: unknown,
+): TrainingConfigState["settingsBeforeDecision"] {
+  if (value === null || typeof value !== "object") return null;
+  const { trainingMethod, datasetStreaming } = value as Record<string, unknown>;
+  return isTrainingMethod(trainingMethod)
+    ? { trainingMethod, datasetStreaming: datasetStreaming === true }
+    : null;
 }
 
 export function migrateTrainingConfig(
@@ -297,6 +412,8 @@ export function migrateTrainingConfig(
   migrateThroughVersion18(state, version);
   migrateThroughVersion19(state, version);
   migrateThroughVersion21(state, version);
+  migrateThroughVersion22(state, version);
+  migrateThroughVersion23(state, version);
   return state as unknown as TrainingConfigStore;
 }
 
@@ -348,6 +465,10 @@ export function mergeTrainingConfig(
     trainingMethod: isTrainingMethod(persistedState.trainingMethod)
       ? persistedState.trainingMethod
       : current.trainingMethod,
+    settingsBeforeDecision: normalizeSettingsBeforeDecision(
+      persistedState.settingsBeforeDecision,
+    ),
+    trainAsDecision: persistedState.trainAsDecision === true,
   };
   return {
     ...merged,

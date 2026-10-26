@@ -5,9 +5,6 @@ import assert from "node:assert/strict";
 import { readFile, readdir } from "node:fs/promises";
 import test from "node:test";
 
-// The marker module is import-free, so it needs no bundler resolver. The hook around it is
-// a React hook that cannot be rendered here, so its call sites are asserted against source,
-// the way the rest of the desktop startup tests do it.
 import {
   USER_STOPPED_KEY,
   clearServerStopIntent,
@@ -15,13 +12,16 @@ import {
   markServerStopIntent,
 } from "../src/hooks/server-stop-intent.ts";
 
+import { readSrc } from "./helpers/kit.ts";
+
+const USE_TAURI_BACKEND = readSrc("hooks/use-tauri-backend.ts");
+
 type Storage = {
   getItem: (key: string) => string | null;
   setItem: (key: string, value: string) => void;
   removeItem: (key: string) => void;
 };
 
-/** An in-memory sessionStorage installed under the name the module reads it by. */
 function installSessionStorage(): Map<string, string> {
   const store = new Map<string, string>();
   const storage: Storage = {
@@ -37,7 +37,6 @@ function installSessionStorage(): Map<string, string> {
   return store;
 }
 
-/** Storage that throws on every access, as an opaque origin's does. */
 function installThrowingSessionStorage(): void {
   const boom = () => {
     throw new DOMException("The operation is insecure.", "SecurityError");
@@ -51,13 +50,6 @@ function uninstallSessionStorage(): void {
   Reflect.deleteProperty(globalThis, "sessionStorage");
 }
 
-function hookSource(): Promise<string> {
-  return readFile(
-    new URL("../src/hooks/use-tauri-backend.ts", import.meta.url),
-    "utf8",
-  );
-}
-
 test("a fresh session carries no stop intent", () => {
   installSessionStorage();
   assert.equal(hasServerStopIntent(), false);
@@ -69,7 +61,6 @@ test("a marked stop reads back, and clearing drops it", () => {
 
   markServerStopIntent();
   assert.equal(hasServerStopIntent(), true);
-  // Written under the one key, so a reload of the same webview finds it.
   assert.deepEqual([...store.keys()], [USER_STOPPED_KEY]);
 
   clearServerStopIntent();
@@ -90,9 +81,6 @@ test("marking twice is not two stops to clear", () => {
 test("storage that throws never reaches the caller", () => {
   installThrowingSessionStorage();
 
-  // An opaque origin throws SecurityError on every access. The read runs before the
-  // startup screen has any state to fall back on, so a throw would strand it on
-  // "checking"; the writes sit in front of the stop invoke, which has to happen anyway.
   assert.equal(
     hasServerStopIntent(),
     false,
@@ -107,16 +95,13 @@ test("storage that throws never reaches the caller", () => {
 test("storage missing entirely reads as a fresh session", () => {
   uninstallSessionStorage();
 
-  // Not a hypothetical: bare node has no web storage, and neither does a webview with
-  // storage disabled. A ReferenceError has to be absorbed the same as a SecurityError.
   assert.equal(hasServerStopIntent(), false);
   assert.doesNotThrow(() => markServerStopIntent());
   assert.doesNotThrow(() => clearServerStopIntent());
 });
 
 test("the marker key belongs to nothing else in the app", async () => {
-  // Kept as URLs. A file: URL's pathname is "/D:/..." on Windows, and readFile treats that
-  // as drive-relative, so it opened "D:\D:\..." and the walk found no owner at all.
+  // Kept as URLs: a file URL pathname is "/D:/..." on Windows, which readFile misreads.
   const files: URL[] = [];
   async function walk(dir: URL) {
     for (const entry of await readdir(dir, { withFileTypes: true })) {
@@ -136,14 +121,10 @@ test("the marker key belongs to nothing else in the app", async () => {
   const owners: string[] = [];
   for (const file of files) {
     if ((await readFile(file, "utf8")).includes(`"${USER_STOPPED_KEY}"`)) {
-      // pathname, not fileURLToPath: it is "/" separated on every platform, which is what
-      // the assertion below slices on.
       owners.push(file.pathname);
     }
   }
 
-  // One declaration and no second reader: a key two features write would let an unrelated
-  // preference reset put the desktop server on the stopped screen.
   assert.deepEqual(
     owners.map((f) => f.slice(f.indexOf("/src/"))),
     ["/src/hooks/server-stop-intent.ts"],
@@ -151,11 +132,8 @@ test("the marker key belongs to nothing else in the app", async () => {
 });
 
 test("the hook reaches storage only through the guarded helpers", async () => {
-  const hook = await hookSource();
+  const hook = USE_TAURI_BACKEND;
 
-  // A raw sessionStorage call in the hook is the bug this module exists to prevent: the
-  // read in checkInstallAndStart sits outside its try, so a SecurityError there rejects
-  // the mount effect's floating promise and the startup screen never leaves "checking".
   assert.doesNotMatch(
     hook,
     /sessionStorage/,
@@ -168,7 +146,7 @@ test("the hook reaches storage only through the guarded helpers", async () => {
 });
 
 test("a persisted stop is honored before preflight runs", async () => {
-  const hook = await hookSource();
+  const hook = USE_TAURI_BACKEND;
 
   const body = hook.slice(
     hook.indexOf("async function checkInstallAndStart()"),
@@ -180,10 +158,7 @@ test("a persisted stop is honored before preflight runs", async () => {
   );
 
   assert.ok(guard > 0 && preflight > 0);
-  // desktop_preflight is not a query: adopt_backend clears intentional_stop and bumps the
-  // generation, and the command then arms a health watchdog for it, which later fires
-  // server-crashed over the stopped screen. So the check has to come first, not just
-  // before the start.
+  // desktop_preflight has side effects (clears intentional_stop), so the check must come first.
   assert.ok(
     guard < preflight,
     "the stop check moved behind preflight, whose adoption side effects it exists to skip",
@@ -196,14 +171,13 @@ test("a persisted stop is honored before preflight runs", async () => {
 });
 
 test("stopping records the intent before the shutdown it can outlive", async () => {
-  const hook = await hookSource();
+  const hook = USE_TAURI_BACKEND;
   const body = hook.slice(
     hook.indexOf("async function stopServer()"),
     hook.indexOf("async function startInstall()"),
   );
 
-  // Reaping the backend blocks for up to ~15s. A reload inside that window has to find
-  // the marker already written, so the order here is load bearing.
+  // Reaping can block ~15s, so the marker must be written before it; order is load bearing.
   const mark = body.indexOf("markServerStopIntent();\n    try {");
   const invoke = body.indexOf('await invoke("stop_server")');
   assert.ok(
@@ -211,16 +185,12 @@ test("stopping records the intent before the shutdown it can outlive", async () 
     "the marker is written after the stop it must survive",
   );
 
-  // A stop that failed left the backend up, so the marker has to come back off or the
-  // next reload shows a stopped screen over a running server.
   assert.match(
     body,
     /catch \(e\) \{\s*clearServerStopIntent\(\);\s*throw e;\s*\}/,
     "a failed stop keeps a marker it did not earn",
   );
 
-  // The detached branch has no process to kill, but the reload still has to keep the UI
-  // off the user's external server rather than re-attaching to it.
   const external = body.slice(0, body.indexOf("const { invoke }"));
   assert.match(
     external,
@@ -229,11 +199,8 @@ test("stopping records the intent before the shutdown it can outlive", async () 
 });
 
 test("a second stop cannot run while the first is in flight", async () => {
-  const hook = await hookSource();
+  const hook = USE_TAURI_BACKEND;
 
-  // The tray item stays enabled while the server runs and the toggle branches on
-  // statusRef, which stays "running" for the whole invoke, so two Stop clicks reach
-  // stopServer concurrently.
   const tray = hook.slice(hook.indexOf('register<void>("tray-toggle-server"'));
   assert.match(
     tray.slice(0, tray.indexOf("});")),
@@ -245,9 +212,6 @@ test("a second stop cannot run while the first is in flight", async () => {
     hook.indexOf("async function runStopServer()"),
   );
 
-  // Two concurrent stops both mark the intent, and on an adopted backend the loser can
-  // fail against the port the winner is taking down. Its rollback then drops the marker
-  // the winner earned, so the next reload starts a server the user asked to stop.
   assert.match(
     guard,
     /if \(stoppingRef\.current\) return;\s*stoppingRef\.current = true;/,
@@ -261,7 +225,7 @@ test("a second stop cannot run while the first is in flight", async () => {
 });
 
 test("every deliberate start drops the marker", async () => {
-  const hook = await hookSource();
+  const hook = USE_TAURI_BACKEND;
 
   const managed = hook.slice(
     hook.indexOf("async function startManagedServer()"),
@@ -274,7 +238,6 @@ test("every deliberate start drops the marker", async () => {
     "a re-entrant start returns with the marker still set",
   );
 
-  // Retry is the only way off the error screen and the tray's way back on from stopped.
   const retry = hook.slice(
     hook.indexOf("const retry = useCallback"),
     hook.indexOf("const retryInstall"),

@@ -13,6 +13,38 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import importlib
+import types
+from unittest.mock import MagicMock
+
+
+# inference.py imports unsloth; stub explicitly, the source scan misses this path.
+_STUBBED: list[str] = []
+
+
+def _stub_if_missing(name, attrs):
+    """Stub a dep the backend test matrix does not install, or collection fails and takes the job down."""
+    if name in sys.modules:
+        return
+    try:
+        importlib.import_module(name)
+        return
+    except Exception:  # noqa: BLE001 - unusable here either way, so stub it
+        pass
+    _STUBBED.append(name)
+    mod = types.ModuleType(name)
+    mod.__spec__ = None
+    for attr in attrs:
+        setattr(mod, attr, MagicMock())
+    sys.modules[name] = mod
+    parent, _, child = name.rpartition(".")
+    if parent and parent in sys.modules:
+        setattr(sys.modules[parent], child, mod)
+
+
+_stub_if_missing("unsloth", ("FastLanguageModel", "FastVisionModel", "is_bfloat16_supported"))
+_stub_if_missing("unsloth.chat_templates", ("get_chat_template",))
+
 from core.inference.native_audio import (
     HIGGS_TTS2_CODEC_REPO,
     HIGGS_TTS3_CODEC_REPO,
@@ -27,6 +59,12 @@ from core.inference.native_audio import (
     native_audio_security_targets,
     native_audio_type_from_local_path,
 )
+
+# Bind under the stubs, then drop them: leftover stubs make _shared_policy return None.
+import core.inference.inference  # noqa: F401,E402 - imported to bind it under the stubs
+
+for _name in reversed(_STUBBED):
+    sys.modules.pop(_name, None)
 
 
 def _backend(audio_type: str, **entry):

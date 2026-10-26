@@ -1,16 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-Present the Unsloth team. See /studio/LICENSE.AGPL-3.0
 
-"""Regression tests for docker/unsloth_nb_pip_magic.py.
-
-The input transformer rewrites `!<python> -m pip|uv ...` to `!pip|uv ...` so it
-resolves to the PATH shim. Transformers see the RAW cell text (brace expansion
-happens later, in the system() path), so the braced and absolute-interpreter forms
-notebooks use to target the running kernel must be rewritten too.
-"""
+"""Transformers see raw cell text, so braced and absolute-interpreter pip/uv forms need rewriting too."""
 
 import importlib.util
 import pathlib
+import pytest
 
 _MOD_PATH = pathlib.Path(__file__).resolve().parents[2] / "docker" / "unsloth_nb_pip_magic.py"
 _spec = importlib.util.spec_from_file_location("unsloth_nb_pip_magic", _MOD_PATH)
@@ -22,40 +17,56 @@ def _rewrite(line):
     return magic._rewrite_python_dash_m([line])[0]
 
 
-def test_literal_python_rewritten():
-    assert _rewrite("!python -m pip install peft\n") == "!pip install peft\n"
-
-
-def test_literal_python_version_rewritten():
-    assert _rewrite("!python3.12 -m pip install peft") == "!pip install peft"
-
-
-def test_sys_executable_braces_rewritten():
-    assert _rewrite("!{sys.executable} -m pip install peft\n") == "!pip install peft\n"
-
-
-def test_sys_executable_braces_quoted_rewritten():
-    assert _rewrite('!"{sys.executable}" -m pip install peft') == "!pip install peft"
-
-
-def test_sys_executable_braces_spaced_rewritten():
-    assert _rewrite("!{ sys.executable } -m pip install peft") == "!pip install peft"
-
-
-def test_absolute_interpreter_path_rewritten():
-    assert _rewrite("!/opt/unsloth-venv/bin/python -m pip install peft\n") == "!pip install peft\n"
-
-
-def test_absolute_interpreter_versioned_path_rewritten():
-    assert _rewrite("!/usr/bin/python3.11 -m uv pip install peft") == "!uv pip install peft"
-
-
-def test_quoted_interpreter_path_rewritten():
-    assert _rewrite('!"/opt/unsloth venv/bin/python" -m pip install peft') == "!pip install peft"
-
-
-def test_indent_preserved():
-    assert _rewrite("    !{sys.executable} -m pip install peft") == "    !pip install peft"
+@pytest.mark.parametrize(
+    "line, expected",
+    [
+        pytest.param(
+            "!python -m pip install peft\n", "!pip install peft\n", id = "literal_python_rewritten"
+        ),
+        pytest.param(
+            "!python3.12 -m pip install peft",
+            "!pip install peft",
+            id = "literal_python_version_rewritten",
+        ),
+        pytest.param(
+            "!{sys.executable} -m pip install peft\n",
+            "!pip install peft\n",
+            id = "sys_executable_braces_rewritten",
+        ),
+        pytest.param(
+            '!"{sys.executable}" -m pip install peft',
+            "!pip install peft",
+            id = "sys_executable_braces_quoted_rewritten",
+        ),
+        pytest.param(
+            "!{ sys.executable } -m pip install peft",
+            "!pip install peft",
+            id = "sys_executable_braces_spaced_rewritten",
+        ),
+        pytest.param(
+            "!/opt/unsloth-venv/bin/python -m pip install peft\n",
+            "!pip install peft\n",
+            id = "absolute_interpreter_path_rewritten",
+        ),
+        pytest.param(
+            "!/usr/bin/python3.11 -m uv pip install peft",
+            "!uv pip install peft",
+            id = "absolute_interpreter_versioned_path_rewritten",
+        ),
+        pytest.param(
+            '!"/opt/unsloth venv/bin/python" -m pip install peft',
+            "!pip install peft",
+            id = "quoted_interpreter_path_rewritten",
+        ),
+        pytest.param(
+            "    !{sys.executable} -m pip install peft",
+            "    !pip install peft",
+            id = "indent_preserved",
+        ),
+    ],
+)
+def test_pip_magic_rewrites_interpreter_prefixes(line, expected):
+    assert _rewrite(line) == expected
 
 
 def test_python_script_not_rewritten():

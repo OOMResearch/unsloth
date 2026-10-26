@@ -17,9 +17,13 @@ import {
 } from "@/components/ui/tooltip";
 import { usePlatformStore } from "@/config/env";
 import { HfTokenIndicator } from "@/features/hub";
-import { useSettingsDialogStore } from "@/features/settings";
+import {
+  DECISION_MODEL_LABELS,
+  useSettingsDialogStore,
+} from "@/features/settings";
 import { TrainModelSelector } from "@/features/train-model-picker";
 import {
+  type DecisionCheckpoint,
   TRAINING_METHOD_META,
   TRAINING_METHOD_ORDER,
   isTrainingMethodSupportedOnDevice,
@@ -32,7 +36,7 @@ import {
   AiBrain01Icon,
   Database02Icon,
   FloppyDiskIcon,
-  Settings05Icon,
+  Settings02Icon,
 } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon, type IconSvgElement } from "@hugeicons/react";
 import type { CSSProperties, ReactNode } from "react";
@@ -66,8 +70,20 @@ function SectionBox({
       className="@container/train-card elevated-card flex flex-col gap-7 bg-card p-5 pb-7"
     >
       {title && (
-        <div className="flex flex-col items-stretch gap-3 @md/train-card:flex-row @md/train-card:items-center @md/train-card:justify-between">
-          <div className="flex min-w-0 items-center gap-3">
+        <div
+          className={cn(
+            "flex flex-col items-stretch gap-3 @md/train-card:flex-row @md/train-card:justify-between",
+            description
+              ? "@md/train-card:items-start"
+              : "@md/train-card:items-center",
+          )}
+        >
+          <div
+            className={cn(
+              "flex min-w-0 gap-3",
+              description ? "items-start" : "items-center",
+            )}
+          >
             {icon && (
               <span
                 className="train-section-chip inline-flex size-9 shrink-0 items-center justify-center rounded-full"
@@ -80,7 +96,7 @@ function SectionBox({
                 <HugeiconsIcon
                   icon={icon}
                   strokeWidth={1.5}
-                  className="size-[18px]"
+                  className="size-[calc(18px*var(--ui-space-scale,1))]"
                 />
               </span>
             )}
@@ -96,7 +112,14 @@ function SectionBox({
             </div>
           </div>
           {titleAction && (
-            <div className="w-full min-w-0 @md/train-card:w-auto @md/train-card:shrink-0">
+            <div
+              className={cn(
+                "w-full min-w-0 @md/train-card:w-auto @md/train-card:shrink-0",
+                // Top edge on the h2's cap top (13.5px at leading 18px; Hellix: 0.289em).
+                description &&
+                  "@md/train-card:mt-[calc(var(--text-ui-13p5)*0.289)]",
+              )}
+            >
               {titleAction}
             </div>
           )}
@@ -131,7 +154,7 @@ function ParamModeToggle({
         options={options}
         ariaLabel={t("studio.params.mode.ariaLabel")}
         size="compact"
-        className="@md/train-card:w-[180px]"
+        className="@md/train-card:w-[calc(180px*var(--ui-space-scale,1))]"
       />
     </Tabs>
   );
@@ -161,6 +184,13 @@ function TrainingMethodSelect() {
   const t = useT();
   const trainingMethod = useTrainingConfigStore((s) => s.trainingMethod);
   const setTrainingMethod = useTrainingConfigStore((s) => s.setTrainingMethod);
+  const isDecision = useTrainingConfigStore((s) => s.modelType === "decision");
+  // Clef and LLM decision models have an LLM backbone, so they take QLoRA; Laya does not.
+  const decisionTakesQlora = useTrainingConfigStore(
+    (s) =>
+      s.modelType === "decision" &&
+      (s.decisionLayout === "clef" || s.decisionLayout === "llm"),
+  );
   const deviceType = usePlatformStore((state) => state.deviceType);
   const activeMeta = TRAINING_METHOD_META[trainingMethod];
   const activeLabel = activeMeta ? t(activeMeta.labelKey) : trainingMethod;
@@ -173,7 +203,7 @@ function TrainingMethodSelect() {
         aria-label={`${t("studio.wizard.methodLabel")}: ${activeLabel}`}
         className={cn(
           PICKER_TRIGGER_CLASS,
-          "w-full min-w-[148px] justify-between",
+          "w-full min-w-[calc(148px*var(--ui-space-scale,1))] justify-between",
         )}
         data-tour="studio-method"
       >
@@ -195,9 +225,15 @@ function TrainingMethodSelect() {
         side="bottom"
         align="start"
         sideOffset={8}
-        className="rounded-[14px] ring-0"
+        className="rounded-xl ring-0"
       >
-        {TRAINING_METHOD_ORDER.map((method) => {
+        {TRAINING_METHOD_ORDER.filter(
+          (method) =>
+            !isDecision ||
+            method === "lora" ||
+            method === "full" ||
+            (decisionTakesQlora && method === "qlora"),
+        ).map((method) => {
           const meta = TRAINING_METHOD_META[method];
           const unsupportedOnMlx = !isTrainingMethodSupportedOnDevice(
             method,
@@ -227,7 +263,7 @@ function TrainingMethodSelect() {
               <TooltipContent
                 side="right"
                 sideOffset={10}
-                className="max-w-[220px] text-ui-11p5 leading-snug"
+                className="max-w-[calc(220px*var(--ui-space-scale,1))] text-ui-11p5 leading-snug"
               >
                 {unsupportedOnMlx
                   ? t("studio.params.notSupportedAppleSilicon")
@@ -241,9 +277,111 @@ function TrainingMethodSelect() {
   );
 }
 
+function TrainAsSelect() {
+  const t = useT();
+  const trainAsDecision = useTrainingConfigStore((s) => s.trainAsDecision);
+  const setTrainAsDecision = useTrainingConfigStore(
+    (s) => s.setTrainAsDecision,
+  );
+  const value = trainAsDecision ? "decision" : "language";
+  const label = (option: string) =>
+    option === "decision"
+      ? t("studio.wizard.trainAsDecision")
+      : t("studio.wizard.trainAsLanguage");
+  return (
+    <Select
+      value={value}
+      onValueChange={(next) => setTrainAsDecision(next === "decision")}
+    >
+      <SelectTrigger
+        aria-label={`${t("studio.wizard.trainAsLabel")}: ${label(value)}`}
+        className={cn(PICKER_TRIGGER_CLASS, "w-full justify-between")}
+      >
+        <span className="truncate font-medium text-foreground">
+          {label(value)}
+        </span>
+      </SelectTrigger>
+      <SelectContent
+        position="popper"
+        side="bottom"
+        align="start"
+        sideOffset={8}
+        className="rounded-xl ring-0"
+      >
+        {["language", "decision"].map((option) => (
+          <SelectItem key={option} value={option}>
+            {label(option)}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  );
+}
+
+function CheckpointSelect({
+  checkpoints,
+}: {
+  checkpoints: DecisionCheckpoint[];
+}) {
+  const t = useT();
+  const modelSubfolder = useTrainingConfigStore((s) => s.modelSubfolder);
+  const setModelSubfolder = useTrainingConfigStore((s) => s.setModelSubfolder);
+  const active =
+    checkpoints.find((checkpoint) => checkpoint.subfolder === modelSubfolder) ??
+    checkpoints[0];
+  const checkpointLabel = (checkpoint: DecisionCheckpoint) =>
+    DECISION_MODEL_LABELS[checkpoint.name]
+      ? t(DECISION_MODEL_LABELS[checkpoint.name])
+      : checkpoint.name;
+  return (
+    <Select
+      value={active.name}
+      onValueChange={(name) => {
+        const next = checkpoints.find((checkpoint) => checkpoint.name === name);
+        if (next) {
+          setModelSubfolder(next.subfolder);
+        }
+      }}
+    >
+      <SelectTrigger
+        aria-label={`${t("studio.wizard.checkpointLabel")}: ${checkpointLabel(active)}`}
+        className={cn(PICKER_TRIGGER_CLASS, "w-full justify-between")}
+      >
+        <span className="truncate font-medium text-foreground">
+          {checkpointLabel(active)}
+        </span>
+      </SelectTrigger>
+      <SelectContent
+        position="popper"
+        side="bottom"
+        align="start"
+        sideOffset={8}
+        className="rounded-xl ring-0"
+      >
+        {checkpoints.map((checkpoint) => (
+          <SelectItem key={checkpoint.name} value={checkpoint.name}>
+            {checkpointLabel(checkpoint)}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  );
+}
+
 function ModelPanel() {
   const t = useT();
   const openSettings = useSettingsDialogStore((s) => s.openDialog);
+  const decisionCheckpoints = useTrainingConfigStore((s) =>
+    s.modelType === "decision" ? s.decisionCheckpoints : null,
+  );
+  // Text and vision LLMs can also train as decision models; Laya, Clef, audio and embeddings cannot.
+  const canTrainAsDecision = useTrainingConfigStore(
+    (s) =>
+      s.selectedModel !== null &&
+      (s.decisionLayout === "llm" ||
+        s.modelType === "text" ||
+        s.modelType === "vision"),
+  );
   return (
     <div className="grid grid-cols-1 gap-4 @md/train-section:grid-cols-2 @2xl/train-section:grid-cols-[minmax(0,1fr)_180px_200px]">
       <div className="@md/train-section:col-span-2 @2xl/train-section:col-span-1">
@@ -269,6 +407,22 @@ function ModelPanel() {
           onOpenSettings={() => openSettings("general")}
         />
       </SetupField>
+      {canTrainAsDecision ? (
+        <SetupField
+          label={t("studio.wizard.trainAsLabel")}
+          hint={t("studio.wizard.trainAsTooltip")}
+        >
+          <TrainAsSelect />
+        </SetupField>
+      ) : null}
+      {decisionCheckpoints && decisionCheckpoints.length > 0 ? (
+        <SetupField
+          label={t("studio.wizard.checkpointLabel")}
+          hint={t("studio.wizard.checkpointTooltip")}
+        >
+          <CheckpointSelect checkpoints={decisionCheckpoints} />
+        </SetupField>
+      ) : null}
     </div>
   );
 }
@@ -296,7 +450,7 @@ export function TrainingWizard({
         title={t("studio.wizard.datasetTitle")}
         description={t("studio.wizard.datasetDescription")}
         icon={Database02Icon}
-        chipTint="var(--chart-4)"
+        chipTint="var(--chart-1)"
         dataTour="studio-dataset"
         titleAction={<DatasetSourceToggleAction />}
       >
@@ -306,8 +460,8 @@ export function TrainingWizard({
       <SectionBox
         title={t("studio.wizard.paramsTitle")}
         description={t("studio.wizard.paramsDescription")}
-        icon={Settings05Icon}
-        chipTint="var(--chart-5)"
+        icon={Settings02Icon}
+        chipTint="var(--chart-1)"
         dataTour="studio-params"
         titleAction={
           <ParamModeToggle mode={paramMode} onChange={onParamModeChange} />
@@ -320,7 +474,7 @@ export function TrainingWizard({
         title={t("studio.wizard.configTitle")}
         description={t("studio.wizard.configDescription")}
         icon={FloppyDiskIcon}
-        chipTint="var(--chart-3)"
+        chipTint="var(--chart-1)"
       >
         <ConfigActions />
       </SectionBox>

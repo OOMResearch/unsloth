@@ -1,13 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-// Find in page. What has to hold is that the flat index and the document agree: every offset
-// the search reports lands on the character a reader sees. There is no DOM library here, so
-// the runner is `node --test` over a hand-rolled document.
-
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
@@ -42,14 +37,23 @@ import {
   startPositionAt,
 } from "../src/features/find-in-page/lib/find-text-index.ts";
 
-/** The feature's component module as one string. */
+import { readSrc, readSrcAsync } from "./helpers/kit.ts";
+
+const FIND_BAR = readSrc("features/find-in-page/components/find-bar.tsx");
+const FIND_IN_PAGE = readSrc(
+  "features/find-in-page/components/find-in-page.tsx",
+);
+const USE_FIND_IN_PAGE = readSrc(
+  "features/find-in-page/hooks/use-find-in-page.ts",
+);
+const FIND_DOM = readSrc("features/find-in-page/lib/find-dom.ts");
+const FIND_TEXT_INDEX = readSrc("features/find-in-page/lib/find-text-index.ts");
+const USE_SHORTCUT = readSrc("features/settings/hooks/use-shortcut.ts");
+const INDEX = readSrc("index.css");
+
 async function readComponentSource(): Promise<string> {
-  return await readFile(
-    new URL(
-      "../src/features/find-in-page/components/find-in-page.tsx",
-      import.meta.url,
-    ),
-    "utf8",
+  return await readSrcAsync(
+    "features/find-in-page/components/find-in-page.tsx",
   );
 }
 
@@ -159,8 +163,6 @@ test("KaTeX indexes its painted tree instead of its clipped accessibility mirror
   assert.equal(endPositionAt(index.segments, match.end)?.node, paintedText);
 });
 
-// --- offsets -----------------------------------------------------------------------------------
-
 test("an offset maps back to the node and character it came from", () => {
   const first = text("Unsloth ");
   const second = text("Studio");
@@ -173,7 +175,6 @@ test("an offset maps back to the node and character it came from", () => {
   const end = endPositionAt(index.segments, match.end);
   assert.equal(start?.node, second);
   assert.equal(start?.offset, 0);
-  // The end boundary is the node's length: the one offset no segment holds.
   assert.equal(end?.node, second);
   assert.equal(end?.offset, 6);
 });
@@ -221,11 +222,9 @@ test("dotted I folds to a plain i, and the offsets still hold", () => {
 });
 
 test("an expanding fold does not change the letters around it", () => {
-  // The fold of a run is not the folds of its code points strung together.
   const dottedI = String.fromCharCode(0x0130); // Turkish dotted I, whose fold is two units
-  const greek = `\u039f\u0394\u039f\u03a3 ${dottedI} \u039f\u03a3`; // "ΟΔΟΣ İ ΟΣ"
+  const greek = `\u039f\u0394\u039f\u03a3 ${dottedI} \u039f\u03a3`;
   const index = buildTextIndex(el("DIV", [el("P", [text(greek)])]));
-  // The length has to hold, or every offset after it maps to the wrong character.
   assert.equal(index.text.length, greek.length);
   assert.equal(index.segments[0].length, greek.length);
   assert.equal(findMatches(index, "\u039f\u03a3").length, 2);
@@ -252,14 +251,14 @@ test("several dotted I in a run fold without drift", () => {
 });
 
 test("either sigma finds the other, whichever one is on screen", () => {
-  // `toLowerCase` picks the final form by position, so half the spellings folded the other way.
+  // `toLowerCase` picks the Greek final sigma form by position.
   const index = buildTextIndex(
     el("DIV", [el("P", [text("\u039f\u0394\u039f\u03a3 \u039f\u03a3")])]),
   );
   for (const query of [
-    "\u03bf\u03c3", // medial, which is what a keyboard gives mid-word
-    "\u03bf\u03c2", // final, which is what it gives at the end of one
-    "\u039f\u03a3", // and the uppercase the document itself is written in
+    "\u03bf\u03c3",
+    "\u03bf\u03c2",
+    "\u039f\u03a3",
   ]) {
     assert.equal(
       findMatches(index, query).length,
@@ -274,7 +273,7 @@ test("either sigma finds the other, whichever one is on screen", () => {
 });
 
 test("a non-breaking space answers to the space key", () => {
-  // Spelled with a char code: a literal U+00A0 in source looks like a space to every reader.
+  // A literal U+00A0 in source looks like a space to every reader.
   const nbsp = String.fromCharCode(0x00a0);
   const index = buildTextIndex(
     el("DIV", [el("P", [text(`Unsloth${nbsp}Studio`)])]),
@@ -312,7 +311,6 @@ test("an oversized node does not take the whole budget with it", () => {
 });
 
 test("a popover over a document at the ceiling is still searchable", () => {
-  // A workspace filling the budget used to end the walk, leaving the portal unindexed.
   const filler = Array.from({ length: 50 }, () =>
     el("P", [text("x".repeat(MAX_NODE_CHARS))]),
   );
@@ -376,7 +374,6 @@ test("an empty query matches nothing", () => {
 });
 
 test("a pasted separator cannot match across a block boundary", () => {
-  // A paste could carry one, and it would match the very boundary the separator keeps closed.
   const index = buildTextIndex(
     el("DIV", [el("P", [text("a")]), el("P", [text("b")])]),
   );
@@ -385,7 +382,6 @@ test("a pasted separator cannot match across a block boundary", () => {
 });
 
 test("content-visibility skipping is not treated as invisibility", () => {
-  // Such a subtree is SKIPPED, not hidden, and nothing would put it back.
   const asked: unknown[] = [];
   const probe = {
     ...el("DIV", [text("readme")]),
@@ -407,7 +403,6 @@ test("content-visibility skipping is not treated as invisibility", () => {
 });
 
 test("both spellings of every visibility option are asked for", () => {
-  // An engine reads only the name it knows, and Web IDL drops an unknown member silently.
   const seen: Record<string, unknown>[] = [];
   const probe = {
     ...el("DIV", [text("readme")]),
@@ -434,7 +429,7 @@ test("both spellings of every visibility option are asked for", () => {
 });
 
 test("an engine that honours only the historic option names still hides hidden text", () => {
-  // Chrome 105-120 / Firefox 106-121: `checkVisibility` exists, but ignores the modern names.
+  // Chrome 105-120 / Firefox 106-121: `checkVisibility` ignores the modern option names.
   const legacyEngine = (style: { visibility?: string }) => ({
     checkVisibility: (options?: Record<string, unknown>) =>
       !(options?.checkVisibilityCSS === true && style.visibility === "hidden"),
@@ -448,7 +443,6 @@ test("an engine that honours only the historic option names still hides hidden t
 });
 
 test("an inline SVG is skipped despite reporting a lowercase tag", () => {
-  // SVG and MathML keep their source casing, so `<svg>` answers "svg".
   const svg = el("svg", [el("text", [text("mermaid label")])]);
   const index = buildTextIndex(el("DIV", [svg, el("P", [text("prose")])]));
   assert.equal(index.text.includes("mermaid"), false);
@@ -481,7 +475,6 @@ test("a portaled surface with nothing to contribute leaves no separator behind",
   assert.equal(index.text, "only");
 });
 
-/** Run `body` with `getComputedStyle` answering from `styles`, and `{}` for anything else. */
 function withStyles(
   styles: Map<
     unknown,
@@ -505,10 +498,8 @@ function withStyles(
   }
 }
 
-/** The two bits of `Element` the filter touches, so a record can be handed over without a DOM. */
 function skipNode(options: {
   skipped?: boolean;
-  /** Whatever takes this element out of the index, spelled as the selector spells it. */
   mark?: string;
   parent?: ReturnType<typeof skipNode> | null;
 }): {
@@ -550,19 +541,14 @@ function record(
 }
 
 test("the selection fallback hands the caret back to the field", async () => {
-  // The caret goes with the selection on WebKit and Blink: the field still reports as active
-  // while every keystroke is swallowed.
-  const engine = await readFile(
-    new URL("../src/features/find-in-page/lib/find-dom.ts", import.meta.url),
-    "utf8",
-  );
-  const fallback = engine.slice(
-    engine.indexOf("export function selectRangeFallback"),
+  // On WebKit and Blink the caret goes with the selection, so the field stays active
+  // but swallows every keystroke.
+  const fallback = FIND_DOM.slice(
+    FIND_DOM.indexOf("export function selectRangeFallback"),
   );
   const body = fallback.slice(0, fallback.indexOf("\n}"));
   assert.match(body, /holdCaret\(\)/);
   assert.match(body, /releaseCaret\(/);
-  // The caret has to be taken BEFORE the selection moves, or there is nothing left to restore.
   assert.ok(
     body.indexOf("holdCaret()") < body.indexOf("selection.addRange"),
     "the caret must be captured before the selection is moved",
@@ -574,7 +560,6 @@ test("the selection fallback hands the caret back to the field", async () => {
 });
 
 test("a workspace generating off-route does not rebuild the index", () => {
-  // The shell keeps off-route workspaces mounted under `hidden` and `inert` INSIDE the scope.
   for (const mark of ["[inert]", "[hidden]", '[aria-hidden="true"]']) {
     const parked = skipNode({ mark });
     const streamed = skipNode({ parent: parked });
@@ -589,8 +574,6 @@ test("a workspace generating off-route does not rebuild the index", () => {
 });
 
 test("parking a workspace is itself a change, whichever attribute says so", () => {
-  // `closest` matches where it starts, so the record saying a workspace went `inert` answers
-  // "inside skipped content".
   for (const mark of ["[inert]", "[hidden]", '[aria-hidden="true"]']) {
     const parked = skipNode({ mark, parent: skipNode({}) });
     assert.equal(
@@ -602,7 +585,6 @@ test("parking a workspace is itself a change, whichever attribute says so", () =
 });
 
 test("adding the skip attribute is what reindexes, not only removing it", () => {
-  // Same trap: gaining the attribute answers "inside skipped content" and is thrown away.
   const parent = skipNode({});
   const marked = skipNode({ skipped: true, parent });
   assert.equal(
@@ -692,7 +674,6 @@ test("an element child that restores visibility inside a hidden contents wrapper
 });
 
 test("the match window anchor is resolved only once the cap bites", () => {
-  // `viewportOffset` reads layout, and an argument is evaluated whether or not it is wanted.
   const index = buildTextIndex(el("P", [text("a a a a a a a a")]));
 
   let asked = 0;
@@ -711,7 +692,6 @@ test("the match window anchor is resolved only once the cap bites", () => {
 });
 
 test("a decomposed dotted I is found by the ordinary query", () => {
-  // U+0130 decomposes to `I` + a combining dot, which folds to `i` + that dot.
   const decomposed = "\u0049\u0307stanbul";
   assert.equal("\u0069\u0307".normalize("NFC"), "\u0069\u0307");
   const index = buildTextIndex(el("P", [text(`Welcome to ${decomposed}`)]));
@@ -738,7 +718,6 @@ test("a query too large to compile falls back instead of throwing", () => {
 test("a needle longer than the haystack is rejected before any of the work", () => {
   const index = buildTextIndex(el("P", [text("short")]));
   assert.deepEqual(findMatches(index, "x".repeat(500)), []);
-  // A decomposed query is longer than the precomposed text it is meant to find.
   const cafe = buildTextIndex(el("P", [text("caf\u00e9")]));
   assert.equal(findMatches(cafe, "cafe\u0301").length, 1);
   assert.equal(findMatches(index, "short").length, 1);
@@ -754,7 +733,6 @@ test("a numeric anchor still means what it always did", () => {
 });
 
 test("a word matches whichever way either side spells it", () => {
-  // macOS hands back decomposed filenames while a model writes composed prose.
   const composed = "caf\u00e9";
   const decomposed = "cafe\u0301";
   assert.notEqual(composed, decomposed);
@@ -776,8 +754,6 @@ test("a word matches whichever way either side spells it", () => {
 });
 
 test("an occurrence that mixes the two spellings is still one word", () => {
-  // Alternating whole spellings reaches only all-composed or all-decomposed text, and joining
-  // two text nodes joins two sources. Every engine's own find reaches this.
   const composed = "é";
   const decomposed = "é";
   const mixed = `caf${composed}caf${decomposed}`;
@@ -870,10 +846,7 @@ test("an open Hangul syllable cannot match the prefix of a closed one", () => {
 });
 
 test("the jamo boundary holds for Hangul that has only one spelling", () => {
-  // Extended and Old Hangul jamo have no precomposed form, so NFC and NFD spell them the same way.
-  // One spelling used to take the literal scan, which writes no boundary, and the open syllable
-  // painted the first two jamo of a visibly closed one. Modern Hangul always has two spellings and
-  // reached the pattern anyway, so this only ever showed up out here.
+  // Extended and Old Hangul jamo have no precomposed form, so NFC and NFD spell them alike.
   const open = "ꥠힰ";
   const closed = "ꥠힰퟋ";
   assert.equal(open.normalize("NFC"), open);
@@ -910,9 +883,6 @@ test("complete Old Hangul clusters cannot match inside a longer syllable", () =>
 });
 
 test("a half-composed Hangul syllable is found and covered whole", () => {
-  // Hangul composes in two steps, L+V into a syllable and then the trailing jamo into it, and text
-  // can stop after the first. NFC and NFD both write past that spelling, so a document holding one
-  // used to be invisible to every query, its own spelling included.
   const closed = "각";
   const spellings = [closed, closed.normalize("NFD"), `각`];
   for (const written of spellings) {
@@ -924,13 +894,11 @@ test("a half-composed Hangul syllable is found and covered whole", () => {
         `${escape(query)} did not cover ${escape(written)}`,
       );
     }
-    // The open syllable still stops at the trailing jamo, whichever way the closed one is written.
     assert.deepEqual(findMatches(index, "가"), []);
   }
 });
 
 test("the index itself is left in the form the document wrote", () => {
-  // Normalizing the index would change its length, and every offset stands for one character.
   const decomposed = "cafe\u0301";
   const index = buildTextIndex(el("DIV", [el("P", [text(decomposed)])]));
   assert.equal(index.text, decomposed);
@@ -947,8 +915,7 @@ test("spelling variants do not loosen whitespace inside a fence", () => {
 });
 
 test("an engine with no checkVisibility falls back to the computed properties", () => {
-  // `checkVisibility` is undefined on WebKitGTK, and read as "not false" it indexed every
-  // `display: none` subtree.
+  // checkVisibility is undefined on WebKitGTK; read as not false it would index display: none subtrees.
   for (const style of [
     { display: "none" },
     { visibility: "hidden" },
@@ -992,7 +959,6 @@ test("the fallback does not mistake a boxless wrapper for a hidden one", () => {
 });
 
 test("two spans the CSS renders as blocks do not run together", () => {
-  // No tag name says these are blocks, and run together they invent a word on screen nowhere.
   const first = el("SPAN", [text("Open")]);
   const second = el("SPAN", [text("AI models")]);
   withStyles(
@@ -1039,7 +1005,6 @@ test("preserved whitespace is inherited by the nodes inside it", () => {
   const fence = el("PRE", [el("CODE", [text("a   b")])]);
   withStyles(new Map([[fence, { whiteSpace: "pre" }]]), () => {
     const index = buildTextIndex(el("DIV", [fence]));
-    // `CODE` gets `{}` from the fake, so this only passes if the walk carries the mode down.
     assert.equal(index.segments[0].preserved, true);
     assert.deepEqual(findMatches(index, "a b"), []);
   });
@@ -1090,7 +1055,6 @@ test("a query spanning whitespace still cannot cross a block boundary", () => {
 
 test("a regex metacharacter in a query is a literal", () => {
   const index = buildTextIndex(el("DIV", [el("P", [text("a.b and axb c")])]));
-  // Only reaches the pattern path because of the space, which is the point.
   assert.equal(findMatches(index, "a.b and").length, 1);
   assert.deepEqual(findMatches(index, "axb and"), []);
 });
@@ -1106,8 +1070,6 @@ test("a document past the ceiling is flattened as far as it goes and says so", (
 });
 
 test("a clipped node does not run into the next one", () => {
-  // Without a boundary a match across the seam maps back to a Range spanning every discarded
-  // character.
   const clipped = text(
     `${"x".repeat(MAX_NODE_CHARS)}${"discarded ".repeat(500)}`,
   );
@@ -1120,8 +1082,6 @@ test("a clipped node does not run into the next one", () => {
 });
 
 test("the ceiling holds across a block boundary", () => {
-  // A node landing exactly on the ceiling let the next separator push `length` past it, and the
-  // negative `room` made `slice(0, room)` take all but the last character.
   const blocks = Array.from({ length: MAX_INDEX_CHARS / MAX_NODE_CHARS }, () =>
     el("P", [text("x".repeat(MAX_NODE_CHARS))]),
   );
@@ -1157,12 +1117,10 @@ test("a document inside the ceiling is not marked truncated", () => {
   assert.equal(index.truncated, false);
 });
 
-/** One node holding `count` occurrences of "x", each at its own offset. */
 function documentOfMatches(count: number): FindElementLike {
   return el("DIV", [text("x-".repeat(count))]);
 }
 
-/** What `search` does: ask for one over the cap, remember the anchor, then trim. */
 function walkAsTheHookDoes(
   index: ReturnType<typeof buildTextIndex>,
   at: number,
@@ -1261,7 +1219,6 @@ test("the paint window is capped and always holds the active match", () => {
   }
 });
 
-/** The body of one CSS rule, for the tests that pin the bar to the composer. */
 function cssRule(css: string, selector: string): string {
   const at = css.indexOf(`${selector} {`);
   assert.notEqual(at, -1, `${selector} is gone`);
@@ -1269,13 +1226,9 @@ function cssRule(css: string, selector: string): string {
 }
 
 test("the stylesheet paints the two highlights the code registers", async () => {
-  const css = await readFile(
-    new URL("../src/index.css", import.meta.url),
-    "utf8",
-  );
   for (const name of [FIND_HIGHLIGHT, FIND_HIGHLIGHT_ACTIVE]) {
     assert.ok(
-      css.includes(`::highlight(${name})`),
+      INDEX.includes(`::highlight(${name})`),
       `${name} is registered but never painted`,
     );
   }
@@ -1396,33 +1349,14 @@ test("registered ranges are cleared and repainted before deletion or replacement
 });
 
 test("the bar keeps itself out of the region it searches", async () => {
-  const bar = await readFile(
-    new URL(
-      "../src/features/find-in-page/components/find-bar.tsx",
-      import.meta.url,
-    ),
-    "utf8",
-  );
-  assert.match(bar, new RegExp(`${FIND_SKIP_ATTRIBUTE}=`));
-  const engine = await readFile(
-    new URL(
-      "../src/features/find-in-page/hooks/use-find-in-page.ts",
-      import.meta.url,
-    ),
-    "utf8",
-  );
-  assert.match(engine, /FIND_SKIP_ATTRIBUTE/);
+  assert.match(FIND_BAR, new RegExp(`${FIND_SKIP_ATTRIBUTE}=`));
+  assert.match(USE_FIND_IN_PAGE, /FIND_SKIP_ATTRIBUTE/);
 });
 
 test("light mode is the chatbox's background, under a slightly heavier shadow", async () => {
-  const css = await readFile(
-    new URL("../src/index.css", import.meta.url),
-    "utf8",
-  );
-  const composer = cssRule(css, ".unsloth-composer-surface");
-  const bar = cssRule(css, ".find-bar-surface");
+  const composer = cssRule(INDEX, ".unsloth-composer-surface");
+  const bar = cssRule(INDEX, ".find-bar-surface");
 
-  // The composer is the reference, not a copied colour, so a restyle fails here.
   const background = /background-color:\s*(#[0-9a-f]{6});/i.exec(composer);
   assert.ok(background);
   assert.match(bar, new RegExp(`background-color:\\s*${background[1]};`, "i"));
@@ -1440,8 +1374,15 @@ test("light mode is the chatbox's background, under a slightly heavier shadow", 
       alpha: Number(hit[4]),
     };
   };
-  const from = shape(composer);
-  const to = shape(bar);
+  const resolved = (rule: string) => {
+    const ref = /box-shadow:\s*var\((--[\w-]+)\);/.exec(rule);
+    if (!ref) return rule;
+    const value = new RegExp(`\\s${ref[1]}:\\s*([^;]+);`).exec(cssRule(INDEX, ":root"));
+    assert.ok(value, `${ref[1]} has no light value in :root`);
+    return `box-shadow: ${value[1]};`;
+  };
+  const from = shape(resolved(composer));
+  const to = shape(resolved(bar));
   assert.ok(
     to.blur > from.blur,
     `blur ${to.blur} is not wider than ${from.blur}`,
@@ -1466,128 +1407,157 @@ test("light mode is the chatbox's background, under a slightly heavier shadow", 
 });
 
 test("dark mode sits above the cards it floats over", async () => {
-  const css = await readFile(
-    new URL("../src/index.css", import.meta.url),
-    "utf8",
-  );
   const value = (selector: string, property: string) => {
     const hit = new RegExp(`${property}:\\s*([^;]+);`).exec(
-      cssRule(css, selector),
+      cssRule(INDEX, selector),
     );
     assert.ok(hit, `${selector} has no ${property}`);
     return hit[1].trim();
   };
-  const grey = (hex: string) => Number.parseInt(hex.slice(1, 3), 16);
-  // A bar at `--card` dissolves into what scrolls under it; past `--border` it reads as an edge.
-  const bar = grey(value(".dark .find-bar-surface", "background-color"));
-  const card = grey(value(".dark", "--card"));
-  const border = grey(value(".dark", "--border"));
+  const grey = (declaration: string) => {
+    const hex = /#[0-9a-f]{6}/i.exec(declaration);
+    assert.ok(hex, `no colour in ${declaration}`);
+    return Number.parseInt(hex[0].slice(1, 3), 16);
+  };
+  const whiteMix = (declaration: string) => {
+    const hit =
+      /color-mix\(in srgb, var\(--card\), white (\d+(?:\.\d+)?)%\)/.exec(
+        declaration,
+      );
+    assert.ok(hit, `not --card mixed toward white: ${declaration}`);
+    return Number(hit[1]) / 100;
+  };
+  const barDeclaration = value(".dark .find-bar-surface", "background-color");
+  const menuSurface =
+    /\.dark :is\(\.unsloth-plus-menu, \.app-user-menu\)\.sidebar-menu\[data-slot\] \{\s*background-color:\s*([^;]+);/.exec(
+      INDEX,
+    );
+  assert.ok(menuSurface, "the dark sidebar menu has no surface colour");
+  const menuDeclaration = menuSurface[1];
+  const card = grey(value(".dark", "--card-base"));
+  const border = grey(value(".dark", "--border-base"));
+  const lift = (mix: number) => card + (255 - card) * mix;
+  const bar = lift(whiteMix(barDeclaration));
+  const menu = lift(whiteMix(menuDeclaration));
   assert.ok(bar > card, `bar ${bar} is not lighter than --card ${card}`);
   assert.ok(bar < border, `bar ${bar} is not darker than --border ${border}`);
+  assert.ok(
+    bar > menu,
+    `bar ${bar} is not lighter than the sidebar menu ${menu}`,
+  );
+  assert.ok(
+    bar - menu <= 4,
+    `bar ${bar} is more than slightly lighter than ${menu}`,
+  );
   assert.match(
     value(".dark .find-bar-surface", "box-shadow"),
     /var\(--background\)/,
   );
+  assert.match(
+    value("html[data-contrast-adjust]", "--card"),
+    /var\(--contrast-surface-mix\)/,
+  );
 });
 
 test("the bar stays out of a backgrounded scope, and off the document origin", async () => {
-  const bar = await readFile(
-    new URL(
-      "../src/features/find-in-page/components/find-bar.tsx",
-      import.meta.url,
-    ),
-    "utf8",
+  // Read from the backdrop: Radix never sets aria-hidden on the searched region, which holds
+  // live regions (see find-backgrounded.ts).
+  assert.match(FIND_BAR, /if \(isFindScopeBackgrounded\(\)\) return;/);
+  const backgrounded = await readSrcAsync(
+    "features/find-in-page/lib/find-backgrounded.ts",
   );
-  // Every modal, not just Settings: Radix marks the shell aria-hidden for as long as one is up,
-  // and `enabled` is read at render, which a dialog opening need not cause.
+  for (const slot of ["dialog-overlay", "alert-dialog-overlay", "sheet-overlay"]) {
+    assert.ok(backgrounded.includes(`"${slot}"`), `${slot} is not read as a modal`);
+  }
+  assert.match(backgrounded, /:not\(\[data-state="closed"\]\)/);
+  assert.ok(backgrounded.includes(`'[aria-modal="true"]'`));
+  assert.ok(backgrounded.includes('"[data-blocking-screen]"'));
   assert.match(
-    bar,
+    await readSrcAsync("features/tour/components/guided-tour.tsx"),
+    /<DialogPrimitive\.Overlay asChild>\s*<motion\.div[\s\S]*?data-slot="dialog-overlay"/,
+  );
+  assert.match(
+    backgrounded,
     /isSurfaceBackgrounded\(`\[\$\{FIND_SCOPE_ATTRIBUTE\}\]`\)/,
   );
-  // Fixed, not absolute: on a route whose outer container scrolls, an absolute bar scrolls away.
-  const surface = /className="(find-bar-surface[^"]*)"/.exec(bar);
+  const surface = /className="(find-bar-surface[^"]*)"/.exec(FIND_BAR);
   assert.ok(surface);
   assert.match(surface[1], /\bfixed\b/);
   assert.equal(/\babsolute\b/.test(surface[1]), false);
   assert.match(surface[1], /max-w-\[calc\(100vw-2rem\)\]/);
 
-  // The counter grows from `1/2` to `1234/5000+` in a long chat. The pill must keep its nominal
-  // responsive width and let the query field yield that already-reserved room instead of growing.
-  // 22.25/28.25rem is exactly the previous short-counter width: fixed input + 12rem chrome.
-  assert.match(surface[1], /(?:^|\s)w-\[22\.25rem\](?:\s|$)/);
-  assert.match(surface[1], /(?:^|\s)sm:w-\[28\.25rem\](?:\s|$)/);
-  const input = /<input[\s\S]*?className=\{cn\([\s\S]*?"([^"]*)"/.exec(bar);
+  // 22.25/28.25rem is the previous short-counter width: fixed input + 12rem chrome.
+  assert.match(surface[1], /(?:^|\s)w-\[calc\(22\.25rem\*var\(--ui-space-scale,1\)\)\](?:\s|$)/);
+  assert.match(surface[1], /(?:^|\s)sm:w-\[calc\(28\.25rem\*var\(--ui-space-scale,1\)\)\](?:\s|$)/);
+  assert.match(surface[1], /(?:^|\s)data-scoped:w-\[calc\(27\.75rem\*var\(--ui-space-scale,1\)\)\](?:\s|$)/);
+  assert.match(surface[1], /(?:^|\s)sm:data-scoped:w-\[calc\(33\.75rem\*var\(--ui-space-scale,1\)\)\](?:\s|$)/);
+  const input = /<input[\s\S]*?className=\{?(?:cn\()?\s*"([^"]*)"/.exec(
+    FIND_BAR,
+  );
   assert.ok(input);
   assert.match(input[1], /\bflex-1\b/);
   assert.equal(/\bw-(?:40|64)\b/.test(input[1]), false);
 });
 
-test("the reveal looks again while the scroll is still moving", async () => {
-  // Such a subtree contributes placeholder height until it renders, clamping the first scroll
-  // 3415px short on all three engines. The node suite cannot see a scroll.
-  const dom = await readFile(
-    new URL("../src/features/find-in-page/lib/find-dom.ts", import.meta.url),
-    "utf8",
-  );
+const FIND_SURFACE_GEOMETRY =
+  /className="find-bar-surface [^"]*top-\[calc\(var\(--studio-content-top-inset,0px\)\+3\.5rem\)\] [^"]*\bh-13\b/;
+const TOAST_UNDER_FIND_BAR =
+  /offset-top: calc\(var\(--studio-content-top-inset, 0px\) \+ 3\.5rem \+ 3\.25rem \* var\(--ui-space-scale, 1\) \+ 0\.5rem\) !important;\s*--mobile-offset-top: calc\(var\(--studio-content-top-inset, 0px\) \+ 3\.5rem \+ 3\.25rem \* var\(--ui-space-scale, 1\) \+ 0\.5rem\) !important;/;
+
+test("toasts clear the bar while it is open", () => {
+  assert.match(FIND_BAR, FIND_SURFACE_GEOMETRY);
+  assert.match(FIND_IN_PAGE, FIND_SURFACE_GEOMETRY);
+  const toaster = '[data-sonner-toaster][data-y-position="top"]';
+  const rule = cssRule(INDEX, `html[data-find-bar-open] ${toaster}`);
+  assert.match(rule, TOAST_UNDER_FIND_BAR);
   assert.match(
-    dom,
+    readSrc("app/provider.tsx"),
+    /set\("--studio-content-top-inset", usesCustomTitlebar \? "34px" : null\);/,
+  );
+});
+
+test("the reveal looks again while the scroll is still moving", async () => {
+  // Such a subtree has placeholder height until rendered, clamping the first scroll short.
+  assert.match(
+    FIND_DOM,
     /export function scrollRangeIntoView\(range: Range\): boolean/,
   );
-  const reveal = dom.slice(dom.indexOf("function revealPass("));
+  const reveal = FIND_DOM.slice(FIND_DOM.indexOf("function revealPass("));
   const body = reveal.slice(0, reveal.indexOf("\n}\n"));
   assert.match(
     body,
     /if \(!scrollRangeIntoView\(range\) \|\| tries <= 1\) return;/,
   );
   assert.match(body, /tries - 1/);
-  assert.match(dom, /revealRangeWhenPainted\(range: Range, tries = \d\)/);
+  assert.match(FIND_DOM, /revealRangeWhenPainted\(range: Range, tries = \d\)/);
   assert.match(body, /requestAnimationFrame\(/);
   assert.match(body, /range\.startContainer\.isConnected/);
-  const engine = await readFile(
-    new URL(
-      "../src/features/find-in-page/hooks/use-find-in-page.ts",
-      import.meta.url,
-    ),
-    "utf8",
+  assert.match(USE_FIND_IN_PAGE, /revealRangeWhenPainted\(activeRange\)/);
+  assert.equal(
+    /scrollRangeIntoView\(activeRange\)/.test(USE_FIND_IN_PAGE),
+    false,
   );
-  assert.match(engine, /revealRangeWhenPainted\(activeRange\)/);
-  assert.equal(/scrollRangeIntoView\(activeRange\)/.test(engine), false);
 });
 
 test("a dismissed or superseded search abandons its queued reveal passes", async () => {
-  // The workspace stays mounted when the bar closes, so `isConnected` stays true and the old
-  // chain keeps scrolling to a dismissed match.
-  const dom = await readFile(
-    new URL("../src/features/find-in-page/lib/find-dom.ts", import.meta.url),
-    "utf8",
-  );
-  const entry = dom.slice(
-    dom.indexOf("export function revealRangeWhenPainted"),
+  const entry = FIND_DOM.slice(
+    FIND_DOM.indexOf("export function revealRangeWhenPainted"),
   );
   assert.match(
     entry.slice(0, entry.indexOf("\n}\n")),
     /cancelRevealPasses\(\)/,
   );
-  const pass = dom.slice(dom.indexOf("function revealPass("));
+  const pass = FIND_DOM.slice(FIND_DOM.indexOf("function revealPass("));
   assert.match(
     pass.slice(0, pass.indexOf("\n}\n")),
     /if \(generation !== revealGeneration\) return;/,
   );
-  const engine = await readFile(
-    new URL(
-      "../src/features/find-in-page/hooks/use-find-in-page.ts",
-      import.meta.url,
-    ),
-    "utf8",
-  );
-  assert.match(engine, /cancelRevealPasses\(\);/);
+  assert.match(USE_FIND_IN_PAGE, /cancelRevealPasses\(\);/);
 });
 
 test("a query too large to compile falls back instead of throwing on the first scan", () => {
-  // V8 compiles lazily, so guarding the constructor alone left the throw coming out through the
-  // keystroke. Whitespace is what gets a query there: every run becomes `\\s+`.
+  // V8 compiles lazily, so the throw can come from the first scan, not the constructor.
   const index = buildTextIndex(el("DIV", [el("P", [text("b".repeat(60000))])]));
-  // Shorter than the haystack, so the length guard cannot short-circuit it.
   const query = "a ".repeat(10000).trim();
   assert.ok(query.length < index.text.length);
   const escaped = query.replace(/\s+/g, "\\s+");
@@ -1606,8 +1576,6 @@ test("a query too large to compile falls back instead of throwing on the first s
 });
 
 test("a Hangul query finds the syllables it is looking at", () => {
-  // NFD takes a syllable apart into Jamo, no combining marks, so the general rule made three
-  // clusters that each composed back to themselves.
   const index = buildTextIndex(
     el("DIV", [el("P", [text("\uac00\ub098\ub2e4 hello \ud55c\uad6d\uc5b4")])]),
   );
@@ -1629,17 +1597,13 @@ test("a Hangul query finds the syllables it is looking at", () => {
 });
 
 test("a Hangul syllable is matched whole, in every spelling it can be stored in", () => {
-  // Three canonical spellings, not two. Besides fully composed and fully decomposed there is the
-  // half-composed one, an LV syllable followed by a loose trailing Jamo, which is exactly what
-  // joining two text nodes produces when the syllable straddles them.
-  const ga = "\uac00"; // 가
-  const gag = "\uac01"; // 각, the same syllable closed by a trailing consonant
+  const ga = "\uac00";
+  const gag = "\uac01";
   const gagNfd = "\u1100\u1161\u11a8";
   const gagHalf = "\uac00\u11a8";
   const index = (body: string) =>
     buildTextIndex(el("DIV", [el("P", [text(body)])]));
 
-  // Every spelling of the text is reachable from every spelling of the query.
   for (const body of [gag, gagNfd, gagHalf]) {
     for (const query of [gag, gagNfd, gagHalf]) {
       const hits = findMatches(index(body), query, 10);
@@ -1648,18 +1612,13 @@ test("a Hangul syllable is matched whole, in every spelling it can be stored in"
         1,
         `${escape(body)} searched for ${escape(query)}`,
       );
-      // And the highlight covers the whole syllable as that text spells it, never part of it.
       assert.deepEqual(hits[0], { start: 0, end: body.length });
     }
   }
 
-  // An open syllable must not stop short of the trailing Jamo that closes the one on screen.
-  // Decomposed, 가 would otherwise match the first two thirds of 각 and highlight part of a letter,
-  // while composed text never could, since there the whole syllable is one code point.
   for (const body of [gag, gagNfd, gagHalf]) {
     assert.deepEqual(findMatches(index(body), ga, 10), [], escape(body));
   }
-  // The open syllable is still found where it really is open.
   assert.deepEqual(findMatches(index(ga), ga, 10), [{ start: 0, end: 1 }]);
 });
 
@@ -1667,9 +1626,6 @@ test("Hangul clusters keep every Jamo, and only a real syllable is fenced", () =
   const index = (body: string) =>
     buildTextIndex(el("DIV", [el("P", [text(body)])]));
 
-  // A grapheme can carry more than one trailing Jamo. The half-composed spelling has to keep the
-  // whole suffix: dropping all but the first both shortened the match and let it land on text that
-  // lacks the query's final Jamo.
   const twoTrailing = "\uac00\u11a8\u11a8";
   assert.deepEqual(findMatches(index(twoTrailing), twoTrailing, 10), [
     { start: 0, end: 3 },
@@ -1679,14 +1635,11 @@ test("Hangul clusters keep every Jamo, and only a real syllable is fenced", () =
     [{ start: 0, end: 2 }],
     "the same grapheme, spelt half-composed in the text",
   );
-  // ... but never on text that is missing the last Jamo the query asked for.
   assert.deepEqual(
     findMatches(index("\uac00\u11a8"), "\uac00\u11a8\u11a8", 10),
     [],
   );
 
-  // A bare leading Jamo is its own grapheme, not a syllable waiting to be closed, so a trailing
-  // Jamo after one belongs to something else and must not be fenced off.
   assert.deepEqual(
     findMatches(index("\uac00\u1100\u11a8"), "\uac00\u1100", 10),
     [{ start: 0, end: 2 }],
@@ -1696,35 +1649,26 @@ test("Hangul clusters keep every Jamo, and only a real syllable is fenced", () =
 test("a Hangul match starts and stops on grapheme boundaries", () => {
   const index = (body: string) =>
     buildTextIndex(el("DIV", [el("P", [text(body)])]));
-  const gag = "\uac01"; // 각
-  const ga = "\uac00"; // 가
-  const lead = "\u1100"; // a bare leading Jamo
+  const gag = "\uac01";
+  const ga = "\uac00";
+  const lead = "\u1100";
 
-  // Not stopping inside one. A query carrying its own trailing Jamo could still match the prefix
-  // of a grapheme that carries two, so the fence belongs after closed syllables as well as open.
   for (const body of [`${gag}\u11a8`, `${lead}\u1161\u11a8\u11a8`]) {
     assert.deepEqual(findMatches(index(body), gag, 10), [], escape(body));
   }
-  // Nor starting inside one: a grapheme can carry more than one leading Jamo, and a match that
-  // begins at the second highlights only its tail.
   for (const body of [`${lead}${ga}`, `${lead}${lead}\u1161`]) {
     assert.deepEqual(findMatches(index(body), ga, 10), [], escape(body));
   }
-  // The fence is on the first cluster only, so a query that itself opens with a bare leading Jamo
-  // still finds exactly that text.
   assert.deepEqual(findMatches(index(`${lead}${ga}`), `${lead}${ga}`, 10), [
     { start: 0, end: 2 },
   ]);
-  // And an ordinary syllable is still found where it really stands alone.
   assert.deepEqual(findMatches(index(`${ga} hello`), ga, 10), [
     { start: 0, end: 1 },
   ]);
 });
 
 test("an engine without lookbehind falls back rather than throwing", () => {
-  // The grapheme fence uses lookbehind, which JavaScriptCore only shipped in Safari 16.4. The
-  // pattern is built from a string, so an older engine throws at construction, where `matchPattern`
-  // already catches it and hands the search to the literal scan.
+  // Lookbehind shipped in JavaScriptCore only in Safari 16.4; older engines throw at construction.
   const real = globalThis.RegExp;
   const refuseLookbehind = (source: string, flags?: string) => {
     if (typeof source === "string" && source.includes("(?<")) {
@@ -1738,7 +1682,6 @@ test("an engine without lookbehind falls back rather than throwing", () => {
     const index = buildTextIndex(
       el("DIV", [el("P", [text("\uac00\ub098\ub2e4 hello")])]),
     );
-    // Exact queries still work; what is lost is only the flexing the pattern would have added.
     assert.deepEqual(findMatches(index, "\uac00\ub098\ub2e4", 10), [
       { start: 0, end: 3 },
     ]);
@@ -1749,9 +1692,7 @@ test("an engine without lookbehind falls back rather than throwing", () => {
 });
 
 test("no Hangul match ever begins or ends inside a grapheme", () => {
-  // Five rounds of review found five ways to stop or start half way through a Hangul syllable,
-  // each a range that had not been thought of. So this asserts the property rather than the cases,
-  // against `Intl.Segmenter` as the authority on where a grapheme ends.
+  // Asserts the property against `Intl.Segmenter` as the grapheme authority, not hand-picked cases.
   const segmenter = new Intl.Segmenter("ko", { granularity: "grapheme" });
   const boundaries = (body: string) => {
     const edges = new Set([0]);
@@ -1763,7 +1704,6 @@ test("no Hangul match ever begins or ends inside a grapheme", () => {
     return edges;
   };
 
-  // Leading, vowel and trailing Jamo from the main block and from Extended-A and Extended-B.
   const leads = ["\u1100", "\u1101", "\ua960"];
   const vowels = ["\u1161", "\u1162", "\ud7b0"];
   const trails = ["\u11a8", "\u11a9", "\ud7cb"];
@@ -1773,10 +1713,10 @@ test("no Hangul match ever begins or ends inside a grapheme", () => {
     "\uac00\ub098\ub2e4",
     "caf\u00e9",
     "cafe\u0301",
-    "\uac00\u0301", // a syllable and a combining mark are one grapheme
-    "\uac00\u200d\ub098", // ... and so is a joiner between two
-    "\u0600\uac00", // a Prepend joins whatever follows it
-    "\u1100\uac00\ub098", // two leading Jamo, then a second syllable
+    "\uac00\u0301",
+    "\uac00\u200d\ub098",
+    "\u0600\uac00",
+    "\u1100\uac00\ub098",
   ]);
   for (const lead of leads) {
     corpus.add(lead);
@@ -1814,13 +1754,10 @@ test("no Hangul match ever begins or ends inside a grapheme", () => {
         );
       }
     }
-    // And every string still finds itself, which is what a fence is easiest to break.
     assert.ok(
       findMatches(index, body, 10).length >= 1,
       `${escape(body)} cannot find itself`,
     );
-    // A fence that is too eager is the other failure, and it does not show up as a bad range: the
-    // match simply goes missing. Every leading run of whole graphemes must still be findable.
     let prefix = "";
     for (const { segment } of segmenter.segment(index.text)) {
       prefix += segment;
@@ -1835,17 +1772,11 @@ test("no Hangul match ever begins or ends inside a grapheme", () => {
 });
 
 test("the grapheme fences do not depend on lookbehind", async () => {
-  // JavaScriptCore only shipped lookbehind in Safari 16.4, and a pattern using one throws on older
-  // engines straight into the unfenced literal scan, quietly undoing both boundaries. So the start
-  // of the fence is checked in code and the pattern carries none.
-  const source = await readFile(
-    new URL(
-      "../src/features/find-in-page/lib/find-text-index.ts",
-      import.meta.url,
-    ),
-    "utf8",
+  assert.equal(
+    FIND_TEXT_INDEX.includes("(?<"),
+    false,
+    "no lookbehind in the pattern",
   );
-  assert.equal(source.includes("(?<"), false, "no lookbehind in the pattern");
 
   const real = globalThis.RegExp;
   const refuse = (pattern: string, flags?: string) => {
@@ -1871,27 +1802,22 @@ test("the grapheme fences do not depend on lookbehind", async () => {
 });
 
 test("the grapheme boundary is the platform's answer, not a list of ranges", () => {
-  // Enumerating the ranges by hand kept missing one: Hangul Jamo, combining marks, Prepend,
-  // spacing marks, skin tones. The question goes to `Intl.Segmenter` instead, which knows the whole
-  // of UAX 29. These are the cases that were wrong before it did.
   const index = (body: string) =>
     buildTextIndex(el("DIV", [el("P", [text(body)])]));
   for (const [body, query] of [
-    ["\uac00\u093e", "\uac00"], // a spacing mark
-    ["\uac00\u{1f3fb}", "\uac00"], // an astral modifier
-    ["\u{1193f}\uac00", "\uac00"], // a supplementary Prepend
-    ["\uac00\u0301", "\uac00"], // a combining mark
-    ["\u0600\uac00", "\uac00"], // a BMP Prepend
-    ["\uac01\u11a8", "\uac01"], // one trailing Jamo too few
-    ["\u1100\uac00", "\uac00"], // starting after a leading Jamo
+    ["\uac00\u093e", "\uac00"],
+    ["\uac00\u{1f3fb}", "\uac00"],
+    ["\u{1193f}\uac00", "\uac00"],
+    ["\uac00\u0301", "\uac00"],
+    ["\u0600\uac00", "\uac00"],
+    ["\uac01\u11a8", "\uac01"],
+    ["\u1100\uac00", "\uac00"],
   ] as const) {
     assert.deepEqual(findMatches(index(body), query, 10), [], escape(body));
   }
-  // Whitespace ends a grapheme, so a query that ends in a space is not held to what follows it.
   assert.deepEqual(findMatches(index("\uac00 \u11a8"), "\uac00 ", 10), [
     { start: 0, end: 2 },
   ]);
-  // An emoji sequence is one grapheme too, and this was never Hangul-specific.
   assert.deepEqual(
     findMatches(
       index("\u{1f469}\u200d\u{1f469}\u200d\u{1f466}"),
@@ -1903,14 +1829,13 @@ test("the grapheme boundary is the platform's answer, not a list of ranges", () 
 });
 
 test("an engine whose `containing` is off by one is not trusted with it", () => {
-  // WebKit reads 0, 0, 1 over `x` and a thumbs up where Chromium and Firefox read 0, 1, 1, and
-  // the seek budget hides it: past the budget the table comes from the iterator instead.
+  // WebKit reads 0, 0, 1 here where Chromium and Firefox read 0, 1, 1.
   const body = `x${"\u{1f44d}"} and caf\u00e9`;
   const withReal = buildTextIndex(el("DIV", [el("P", [text(body)])]));
   const correct = findMatches(withReal, "x", 10);
   assert.deepEqual(correct, [{ start: 0, end: 1 }]);
 
-  // A fresh process, since the segmenter and the probe are both held for the life of the module.
+  // A fresh process, since the segmenter and the probe are held for the module's lifetime.
   {
     const probe = spawnSync(
       process.execPath,
@@ -1966,80 +1891,55 @@ test("an engine whose `containing` is off by one is not trusted with it", () => 
 });
 
 test("the seek probe is asked once, on a fixture the spec settles", () => {
-  // Once per process: a probe on the hot path is the cost the budget exists to avoid.
-  const source = readFileSync(
-    new URL(
-      "../src/features/find-in-page/lib/find-text-index.ts",
-      import.meta.url,
-    ),
-    "utf8",
-  );
-  assert.match(source, /let seeksBoundaries: boolean \| undefined;/);
+  assert.match(FIND_TEXT_INDEX, /let seeksBoundaries: boolean \| undefined;/);
   assert.match(
-    source,
+    FIND_TEXT_INDEX,
     /if \(seeksBoundaries !== undefined\) return seeksBoundaries;/,
   );
-  // `containing(1)` over a code unit and a surrogate pair is the start of the pair, per the spec.
-  assert.match(source, /probe\.containing\(1\)\?\.index === 1/);
-  // The definition, the seek in `startsGrapheme`, and the junction check a cut asks.
-  assert.equal((source.match(/segmenterSeeksBoundaries\(/g) ?? []).length, 3);
+  assert.match(FIND_TEXT_INDEX, /probe\.containing\(1\)\?\.index === 1/);
+  assert.equal(
+    (FIND_TEXT_INDEX.match(/segmenterSeeksBoundaries\(/g) ?? []).length,
+    3,
+  );
 });
 
 test("a query that needs no pattern is not given one", () => {
-  // Forcing Hangul through the regex path so the fences could apply meant a large paste built a
-  // pattern that V8 accepted and then refused to run, and the throw escaped the search entirely.
-  // With the boundary asked of the segmenter instead, no query needs a pattern it did not earn.
   const body = "\u11a8".repeat(50_000);
   const index = buildTextIndex(el("DIV", [el("P", [text(body)])]));
   assert.deepEqual(findMatches(index, body, 10), [{ start: 0, end: 50_000 }]);
 });
 
 test("plain text does not pay for the boundary check", () => {
-  // The segmenter is asked only where something could actually join, which nothing below U+0300
-  // can. Latin prose therefore costs one comparison per match rather than a segmentation.
-  const source = readFileSync(
-    new URL(
-      "../src/features/find-in-page/lib/find-text-index.ts",
-      import.meta.url,
-    ),
-    "utf8",
+  assert.match(
+    FIND_TEXT_INDEX,
+    /const JOINS_GRAPHEME = \/\[\^\\u0000-\\u02ff\]\//,
   );
-  assert.match(source, /const JOINS_GRAPHEME = \/\[\^\\u0000-\\u02ff\]\//);
-  const guard = source.slice(source.indexOf("function alignsToGraphemes"));
+  const guard = FIND_TEXT_INDEX.slice(
+    FIND_TEXT_INDEX.indexOf("function alignsToGraphemes"),
+  );
   const before = guard.indexOf("JOINS_GRAPHEME");
   const asks = guard.indexOf("graphemeSegmenter()");
   assert.ok(before > 0 && before < asks, "the cheap test comes first");
 });
 
 test("the cheap boundary test looks at both sides of each edge", () => {
-  // The shortcut asked what sat outside the match and not what sat at its edges, so a query that
-  // itself ends in a character joining forwards slipped through: a Prepend at the start of the
-  // text has nothing before it and an ordinary letter after it, and both outside looks passed.
   const index = (body: string) =>
     buildTextIndex(el("DIV", [el("P", [text(body)])]));
   assert.deepEqual(findMatches(index("\u0600a"), "\u0600", 10), []);
-  // The same from the other side, where the match begins with a mark that joins backwards.
   assert.deepEqual(findMatches(index("a\u0301"), "\u0301", 10), []);
 });
 
 test("text with no whitespace for hundreds of characters is still fenced", () => {
-  // The window is anchored at the nearest whitespace or block separator, and where there is none
-  // in reach the match used to be waved through. A log line, a URL or a long identifier has none
-  // for hundreds of characters, which put the original hole straight back.
   const index = (body: string) =>
     buildTextIndex(el("DIV", [el("P", [text(body)])]));
   const run = "a".repeat(257);
   assert.deepEqual(findMatches(index(`${run}\uac01\u11a8`), "\uac01", 10), []);
-  // ... while a match that really is whole is still found out there.
   assert.deepEqual(findMatches(index(`${run}\uac01 x`), "\uac01", 10), [
     { start: 257, end: 258 },
   ]);
 });
 
 test("whitespace is not treated as a grapheme boundary", () => {
-  // A combining mark joins a preceding space and a Prepend joins a following one, so anchoring at
-  // a space cut off the context that decides the join. Only the block separator can be picked up
-  // from, being a control, which UAX 29 breaks on either side unconditionally.
   const index = (body: string) =>
     buildTextIndex(el("DIV", [el("P", [text(body)])]));
   assert.deepEqual(findMatches(index("a \u0301"), "\u0301", 10), []);
@@ -2047,18 +1947,13 @@ test("whitespace is not treated as a grapheme boundary", () => {
 });
 
 test("a long run of regional indicators keeps its parity", () => {
-  // Flags pair off by the parity of the run they sit in, and a run has no length limit, so no
-  // fixed amount of preceding context is enough to work out where the pairs fall.
+  // Flags pair off by run parity and runs are unbounded, so no fixed context suffices.
   const flags = "\u{1f1e6}".repeat(129) + "\u{1f1e8}\u{1f1e9}";
   const index = buildTextIndex(el("DIV", [el("P", [text(flags)])]));
-  // The 129th indicator pairs with the one after it, so the last two are not a grapheme of their own.
   assert.deepEqual(findMatches(index, "\u{1f1e8}\u{1f1e9}", 10), []);
 });
 
 test("a capped search does not pay twice for the same segmentation", () => {
-  // A capped search walks its candidates more than once, to count them and again to take the
-  // window around the viewport. The segmentation is made once and kept for as long as the index
-  // lives, and is asked one offset at a time rather than block by block.
   const body = "\uac00\ub098\ub2e4".repeat(20_000);
   const index = buildTextIndex(el("DIV", [el("P", [text(body)])]));
   const anchor = () => index.text.length - 10;
@@ -2070,7 +1965,6 @@ test("a capped search does not pay twice for the same segmentation", () => {
   const cost = Date.now() - first;
   const second = Date.now();
   findMatches(index, "\uac00", MAX_MATCHES + 1, anchor);
-  // The second search reuses the segmentation, so it cannot be slower than the first was.
   assert.ok(
     Date.now() - second <= cost + 50,
     `second search took ${Date.now() - second}ms against ${cost}ms`,
@@ -2078,18 +1972,12 @@ test("a capped search does not pay twice for the same segmentation", () => {
 });
 
 test("a cluster is offered its longest spelling first", () => {
-  // Both spellings of one cluster, and alternation takes the first that fits. Shortest first, the
-  // bare `i` won, the match ended between the letter and its dot, and the fence threw the whole
-  // occurrence away rather than reaching for the longer spelling.
   const dotted = buildTextIndex(el("DIV", [el("P", [text("İstanbul")])]));
   assert.deepEqual(findMatches(dotted, "i", 10), [{ start: 0, end: 2 }]);
   assert.deepEqual(findMatches(dotted, "istanbul", 10), [{ start: 0, end: 9 }]);
 });
 
 test("a portal is its own surface, whatever the workspace ended on", () => {
-  // Nothing a portal paints carries on from text cut out of the workspace behind it. The block
-  // branch clears the cut leaving any block tag, which covered a `DIV` scope and `DIV` portal and
-  // hid it for everything else: the boundary belongs to the portal, not to the tags either side.
   const index = buildTextIndex(
     el("SPAN", [text(`${"x".repeat(MAX_NODE_CHARS)}\u1100`)]),
     [el("SPAN", [text("\uac00 hello")])],
@@ -2098,9 +1986,6 @@ test("a portal is its own surface, whatever the workspace ended on", () => {
 });
 
 test("the time between two searches is not charged to either", () => {
-  // The budget is wall time, and it is measured in blocks, so a search that ends inside one leaves
-  // the clock running. The next search closes that block and is billed for everything in between,
-  // which is the reader thinking. Two cheap queries and a pause bought a whole-index scan.
   const probe = `
     let scans = 0;
     const Real = Intl.Segmenter;
@@ -2145,10 +2030,6 @@ test("the time between two searches is not charged to either", () => {
 });
 
 test("what a seek is allowed to cost is time, not a number of them", () => {
-  // A seek is not one price: 0.2us into a page of Hangul and 1236us into a page of flags, six
-  // thousand to one on the same length of text, so any count is far too small for one and far too
-  // large for the other. Counting let a flag-heavy page spend twenty thousand of the expensive kind
-  // on its first search. Counted here, since the point is that they stop after a handful.
   const probe = `
     let seeks = 0;
     const Real = Intl.Segmenter;
@@ -2193,9 +2074,6 @@ test("what a seek is allowed to cost is time, not a number of them", () => {
 });
 
 test("a capped search does not segment the whole index to answer its first pass", () => {
-  // The scan that replaces the seeks costs a pass over the whole index, so what it is allowed to
-  // replace matters as much as that it exists. On a flat count a bounded pass reaches the threshold
-  // on a big enough index and buys the whole document to answer ten thousand cheap questions.
   const probe = `
     let scans = 0;
     let seeks = 0;
@@ -2257,19 +2135,19 @@ test("a capped search does not segment the whole index to answer its first pass"
 });
 
 test("a query that matches everywhere stops seeking the segmenter per candidate", () => {
-  // `containing` seeks, which is why it replaced segmenting whole blocks, and a seek per candidate
-  // undoes that: a capped search anchored near the end walks the candidates up to three times, so a
-  // page of one repeated syllable asked for millions. Counted, so the assertion is not the clock.
   const probe = `
     let seeks = 0;
+    let scans = 0;
+    let clock = 1;
+    Object.defineProperty(performance, "now", { value: () => clock });
     const Real = Intl.Segmenter;
     Intl.Segmenter = class {
       constructor(...args) { this.inner = new Real(...args); }
       segment(input) {
         const segments = this.inner.segment(input);
         return {
-          containing: (at) => { seeks += 1; return segments.containing(at); },
-          [Symbol.iterator]: () => segments[Symbol.iterator](),
+          containing: (at) => { seeks += 1; clock += 0.01; return segments.containing(at); },
+          [Symbol.iterator]: () => { scans += 1; return segments[Symbol.iterator](); },
         };
       }
     };
@@ -2290,10 +2168,8 @@ test("a query that matches everywhere stops seeking the segmenter per candidate"
     const index = buildTextIndex(el("DIV", [el("P", nodes)]));
     const found = findMatches(index, "\uac00", MAX_MATCHES, index.text.length);
     if (found.length !== MAX_MATCHES) throw new Error("expected a capped search, got " + found.length);
-    // One pass over the boundaries replaces the seeks, so what is left is what the budget bought
-    // before it. The number is not fixed: the cap is time, and a seek into Hangul is cheap, so
-    // this shape gets tens of thousands where a page of flags would get tens. 1.6M without it.
-    if (seeks > 200000) throw new Error("seeks per candidate: " + seeks);
+    if (scans !== 1) throw new Error("expected one boundary scan, got " + scans);
+    if (seeks > 10000) throw new Error("seeks per candidate: " + seeks);
   `;
   const run = spawnSync(
     process.execPath,
@@ -2304,24 +2180,18 @@ test("a query that matches everywhere stops seeking the segmenter per candidate"
 });
 
 test("a CRLF is one grapheme, which the fast path has to know about", () => {
-  // The fast path rests on nothing below U+0300 joining, and CR before LF is the one thing there
-  // that does (GB3). The sweep that proved the rest excused the line breaks, a collapsed newline
-  // being its own grapheme. In a `<pre>` nothing is collapsed, the pair arrives intact, and every
-  // character the shortcut looks at is ASCII, so it answered without asking anyone.
+  // CR before LF is the one joining pair below U+0300 (GB3), and `<pre>` keeps it intact.
   const fence = el("PRE", [text("line\r\nnext")]);
   withStyles(new Map([[fence, { whiteSpace: "pre" }]]), () => {
     const index = buildTextIndex(fence);
     assert.equal(index.segments[0].preserved, true);
     assert.equal(index.text.includes("\r\n"), true);
-    // The feed alone is the back half of a grapheme, so it is not a match on its own.
     assert.deepEqual(findMatches(index, "\n", 10), []);
     assert.deepEqual(findMatches(index, "\nnext", 10), []);
-    // Asked for whole it is, and so is everything that was findable before.
     assert.equal(findMatches(index, "\r\n", 10).length, 1);
     assert.equal(findMatches(index, "\r\nnext", 10).length, 1);
     assert.equal(findMatches(index, "next", 10).length, 1);
   });
-  // A feed with no return in front of it is its own grapheme and still findable.
   const alone = el("PRE", [text("line\nnext")]);
   withStyles(new Map([[alone, { whiteSpace: "pre" }]]), () => {
     assert.equal(findMatches(buildTextIndex(alone), "\n", 10).length, 1);
@@ -2329,18 +2199,15 @@ test("a CRLF is one grapheme, which the fast path has to know about", () => {
 });
 
 test("a per-node cut does not hand back half a grapheme", () => {
-  // The cut can land between a letter and its mark, where the text says the letter is whole.
   const node = text(`${"z".repeat(MAX_NODE_CHARS - 1)}Q\u0301tail`);
   const index = buildTextIndex(el("DIV", [el("P", [node, text(" after")])]));
   assert.equal(index.truncated, true);
   assert.equal(index.text[MAX_NODE_CHARS - 1], "q");
   assert.deepEqual(findMatches(index, "Q", 10), []);
-  // The far side of the same cut, settled from the text the cut dropped rather than assumed.
   assert.equal(findMatches(index, "after", 10).length, 1);
 });
 
 test("what a clip dropped cannot reach past the end of its block", () => {
-  // A Prepend at the end of the dropped suffix joined the next block's first character.
   const clipped = `${"z".repeat(MAX_NODE_CHARS)}dropped\u0600`;
   const index = buildTextIndex(
     el("SPAN", [el("DIV", [text(clipped)]), text("a")]),
@@ -2351,7 +2218,6 @@ test("what a clip dropped cannot reach past the end of its block", () => {
 });
 
 test("a cut inside a run reads back to an anchor, not to a fixed window", () => {
-  // Indicators pair off from the START of a run, so an ODD run's last 32 units read as even.
   const ri = (n: number) => String.fromCodePoint(0x1f1e6 + n);
   const [a, b, c] = [ri(0), ri(1), ri(2)];
   const node = `x${a.repeat(49_998)}${b}${c}tail`;
@@ -2359,10 +2225,8 @@ test("a cut inside a run reads back to an anchor, not to a fixed window", () => 
     el("DIV", [el("P", [text(node), text(" next")])]),
   );
   assert.equal(index.truncated, true);
-  // The cut lands right after b, and c is dropped -- but the page pairs them.
   assert.equal(index.text.codePointAt(MAX_NODE_CHARS - 3), 0x1f1e7);
   assert.deepEqual(findMatches(index, b, 5), []);
-  // An anchor a few characters back is still read exactly, so an ordinary cut still decides.
   const plain = buildTextIndex(
     el("DIV", [
       el("P", [text(`${"z".repeat(MAX_NODE_CHARS - 1)}Q tail`), text(" next")]),
@@ -2372,7 +2236,6 @@ test("a cut inside a run reads back to an anchor, not to a fixed window", () => 
 });
 
 test("the end of a truncated index is not a boundary by default", () => {
-  // `at === text.length` is the one offset with nothing after it to read, and was accepted flat.
   const kids = [];
   for (let i = 0; i < 39; i += 1) kids.push(text("z".repeat(MAX_NODE_CHARS)));
   kids.push(text(`${"z".repeat(MAX_NODE_CHARS - 1)}Q`));
@@ -2384,9 +2247,6 @@ test("the end of a truncated index is not a boundary by default", () => {
 });
 
 test("a node left out entirely still says whether the end was a boundary", () => {
-  // One code unit of room and a pair next means the whole node goes. That is not a reason to call
-  // the end unknown: the node is still there to be read and its first code point answers it, as in
-  // the ceiling check above. Assuming otherwise threw away the last match in the index.
   const nodes = [];
   for (
     let at = 0;
@@ -2399,36 +2259,26 @@ test("a node left out entirely still says whether the end was a boundary", () =>
   nodes.push(text(`${"z".repeat(MAX_INDEX_CHARS - 2 - used)}Q`));
   nodes.push(text(`${String.fromCodePoint(0x1f600)}tail`));
   const index = buildTextIndex(el("DIV", [el("P", nodes)]));
-  // One unit short of the ceiling, so the pair could not fit and the node was dropped whole.
   assert.equal(index.text.length, MAX_INDEX_CHARS - 1);
   assert.equal(index.truncated, true);
-  // The emoji begins its own grapheme, so what the index ends on is a boundary and stays findable.
   assert.equal(findMatches(index, "Q", 10).length, 1);
-  // And when the next node does join, the end is still unknown.
   const joining = [...nodes.slice(0, -1), text("́tail")];
   const joined = buildTextIndex(el("DIV", [el("P", joining)]));
   assert.deepEqual(findMatches(joined, "Q", 10), []);
 });
 
 test("a mark on a space in the query survives the space flexing", () => {
-  // Whitespace in a query matches any run of it, a soft-wrapped paragraph rendering as one line
-  // while its node holds the newline. A mark on that space is part of the same grapheme and went
-  // with it, so the match ended mid-grapheme and the fence discarded text that is on the page.
   const index = buildTextIndex(el("DIV", [el("P", [text(" ́")])]));
   assert.equal(findMatches(index, " ́", 10).length, 1);
-  // The flexing itself is untouched: a plain space still matches a run of whitespace.
   const wrapped = buildTextIndex(el("DIV", [el("P", [text("one \n two")])]));
   assert.equal(findMatches(wrapped, "one two", 10).length, 1);
 });
 
 test("nothing below U+0300 can join a grapheme, which is what the fast path rests on", () => {
-  // Latin prose skips the segmenter on four comparisons, and every one of them assumes no character
-  // below U+0300 can extend a grapheme or be extended into one. The far side of a cut leans on the
-  // same fact. Asserted over every code point rather than argued from the blocks they sit in.
+  // The fast path assumes nothing below U+0300 extends a grapheme; checked over every code point.
   const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
   const joiners: string[] = [];
   for (let code = 1; code < 0x300; code += 1) {
-    // CR, LF and the other line breaks are their own cluster and never in an index unsplit.
     if (code >= 0x0a && code <= 0x0d) continue;
     const point = String.fromCodePoint(code);
     if (
@@ -2442,126 +2292,80 @@ test("nothing below U+0300 can join a grapheme, which is what the fast path rest
 });
 
 test("a match with no geometry is aimed at through its nearest laid-out ancestor", async () => {
-  const dom = await readFile(
-    new URL("../src/features/find-in-page/lib/find-dom.ts", import.meta.url),
-    "utf8",
-  );
-  // Such text has a collapsed rect while the subtree's own box keeps its placeholder geometry.
   assert.match(
-    dom,
+    FIND_DOM,
     /export function revealRect\(range: Range\): DOMRect \| null/,
   );
-  assert.match(dom, /export function rangeTop\(range: Range\): number \| null/);
-  const engine = await readFile(
-    new URL(
-      "../src/features/find-in-page/hooks/use-find-in-page.ts",
-      import.meta.url,
-    ),
-    "utf8",
+  assert.match(
+    FIND_DOM,
+    /export function rangeTop\(range: Range\): number \| null/,
   );
-  assert.match(engine, /const top = rangeTop\(range\);/);
-  assert.equal(/range\.getBoundingClientRect\(\)/.test(engine), false);
+  assert.match(USE_FIND_IN_PAGE, /const top = rangeTop\(range\);/);
+  assert.equal(
+    /range\.getBoundingClientRect\(\)/.test(USE_FIND_IN_PAGE),
+    false,
+  );
 });
 
 test("a fresh query starts from the scroll container's top, not the window's", async () => {
-  const engine = await readFile(
-    new URL(
-      "../src/features/find-in-page/hooks/use-find-in-page.ts",
-      import.meta.url,
-    ),
-    "utf8",
-  );
-  // The viewport starts below the navbar, so a match clipped off its top still has positive `top`.
-  assert.match(engine, /top >= scrollViewportTop\(range\)/);
-  assert.equal(/top >= 0/.test(engine), false);
+  assert.match(USE_FIND_IN_PAGE, /top >= scrollViewportTop\(range\)/);
+  assert.equal(/top >= 0/.test(USE_FIND_IN_PAGE), false);
 });
 
 test("a pending query clears the previous highlight before the next paint", async () => {
-  const engine = await readFile(
-    new URL(
-      "../src/features/find-in-page/hooks/use-find-in-page.ts",
-      import.meta.url,
-    ),
-    "utf8",
-  );
-  // The input value is committed during the event. A passive effect may run only after the browser
-  // has painted that new value beside the old query's ranges, which is the visible `sta`/`stan`
-  // mismatch this guards. A layout effect clears those ranges in the same commit, before paint.
-  assert.match(engine, /import \{[^}]*useLayoutEffect[^}]*\} from "react";/);
+  // A layout effect clears stale ranges before paint; a passive effect could paint them.
   assert.match(
-    engine,
+    USE_FIND_IN_PAGE,
+    /import \{[^}]*useLayoutEffect[^}]*\} from "react";/,
+  );
+  assert.match(
+    USE_FIND_IN_PAGE,
     /useLayoutEffect\(\(\) => \{\s*if \(queryPending\) \{\s*cancelRevealPasses\(\);\s*clearHighlights\(\);/,
   );
 });
 
 test("re-indexing while the document changes is a throttle, and says so", async () => {
-  const engine = await readFile(
-    new URL(
-      "../src/features/find-in-page/hooks/use-find-in-page.ts",
-      import.meta.url,
-    ),
-    "utf8",
-  );
-  // A debounce would freeze the count for as long as a reply takes to write.
-  assert.match(engine, /REINDEX_INTERVAL_MS/);
-  assert.equal(/REINDEX_DEBOUNCE_MS/.test(engine), false);
-  assert.match(engine, /A throttle rather than a debounce/);
+  assert.match(USE_FIND_IN_PAGE, /REINDEX_INTERVAL_MS/);
+  assert.equal(/REINDEX_DEBOUNCE_MS/.test(USE_FIND_IN_PAGE), false);
+  assert.match(USE_FIND_IN_PAGE, /A throttle rather than a debounce/);
 });
 
 test("the bar has no border, and its buttons have a hover that shows", async () => {
-  const bar = await readFile(
-    new URL(
-      "../src/features/find-in-page/components/find-bar.tsx",
-      import.meta.url,
-    ),
-    "utf8",
-  );
-  const surface = /className="(find-bar-surface[^"]*)"/.exec(bar);
+  const surface = /className="(find-bar-surface[^"]*)"/.exec(FIND_BAR);
   assert.ok(surface, "the bar no longer wears the shared surface class");
   assert.equal(
     /\bborder\b/.test(surface[1]),
     false,
     "the bar took a border back",
   );
-  // The ghost variant's own `--muted/50` hover lands within a shade of this surface.
-  assert.match(bar, /hover:bg-black\/\[0\.06\] dark:hover:bg-white\/10/);
-  assert.equal((bar.match(/className=\{FIND_BUTTON_CLASS\}/g) ?? []).length, 3);
+  assert.match(
+    FIND_BAR,
+    /hover:bg-\[rgb\(0_0_0_\/_calc\(0\.06\*var\(--contrast-wash-gain,1\)\)\)\] dark:hover:bg-\[rgb\(255_255_255_\/_calc\(0\.1\*var\(--contrast-wash-gain,1\)\)\)\]/,
+  );
+  assert.equal(
+    (FIND_BAR.match(/className=\{FIND_BUTTON_CLASS\}/g) ?? []).length,
+    3,
+  );
 });
 
 test("a long query rewinds to its first character when focus leaves", async () => {
-  // Typing past the width of the field scrolls it, and a bar left showing the tail of a word says
-  // nothing about what was searched for.
-  const bar = await readFile(
-    new URL(
-      "../src/features/find-in-page/components/find-bar.tsx",
-      import.meta.url,
-    ),
-    "utf8",
-  );
-  assert.match(bar, /onBlur=\{rewindToStart\}/);
-  assert.match(bar, /input\.setSelectionRange\(0, 0\);/);
-  assert.match(bar, /input\.scrollLeft = 0;/);
-  assert.match(bar, /onMouseDown=\{keepFocusInField\}/);
+  assert.match(FIND_BAR, /onBlur=\{rewindToStart\}/);
+  assert.match(FIND_BAR, /input\.setSelectionRange\(0, 0\);/);
+  assert.match(FIND_BAR, /input\.scrollLeft = 0;/);
+  assert.match(FIND_BAR, /onMouseDown=\{keepFocusInField\}/);
 });
 
 test("the observer watches the attributes a workspace switch flips", async () => {
-  // Switching between kept-alive workspaces flips `inert` rather than mutating children.
-  const engine = await readFile(
-    new URL(
-      "../src/features/find-in-page/hooks/use-find-in-page.ts",
-      import.meta.url,
-    ),
-    "utf8",
+  assert.match(USE_FIND_IN_PAGE, /attributeFilter: \[[^\]]*"inert"/);
+  assert.match(USE_FIND_IN_PAGE, /attributeFilter: \[[^\]]*"open"/);
+  // Scanned, not matched: the comments in between make a regex backtrack badly.
+  const opensAttributes = USE_FIND_IN_PAGE.indexOf("attributes: true,");
+  const opensFilter = USE_FIND_IN_PAGE.indexOf(
+    "attributeFilter:",
+    opensAttributes,
   );
-  assert.match(engine, /attributeFilter: \[[^\]]*"inert"/);
-  // `open` too: it is all a `<details>` changes, while its body goes from visible to not.
-  assert.match(engine, /attributeFilter: \[[^\]]*"open"/);
-  // Not the whole stream: `class` changes on every hover. Scanned, not matched, since the
-  // comments in between make a regex backtrack badly.
-  const opensAttributes = engine.indexOf("attributes: true,");
-  const opensFilter = engine.indexOf("attributeFilter:", opensAttributes);
   assert.ok(opensAttributes !== -1 && opensFilter > opensAttributes);
-  const between = engine.slice(
+  const between = USE_FIND_IN_PAGE.slice(
     opensAttributes + "attributes: true,".length,
     opensFilter,
   );
@@ -2572,10 +2376,9 @@ test("the observer watches the attributes a workspace switch flips", async () =>
     true,
     "nothing else is being observed between the flag and its filter",
   );
-  assert.equal(engine.includes('attributeFilter: ["class"'), false);
+  assert.equal(USE_FIND_IN_PAGE.includes('attributeFilter: ["class"'), false);
 });
 
-/** Stand in for the document `resolvePortalSurfaces` queries: node has no version of one. */
 function withPortals<T>(surfaces: Element[], body: () => T): T {
   const view = globalThis as { document?: unknown };
   const had = "document" in view;
@@ -2589,7 +2392,6 @@ function withPortals<T>(surfaces: Element[], body: () => T): T {
   }
 }
 
-/** A portaled surface, which is asked only what state it is in and what it contains. */
 function surface(state: string | null, children: Element[] = []): Element {
   const node = {
     getAttribute: (name: string) => (name === "data-state" ? state : null),
@@ -2601,7 +2403,6 @@ function surface(state: string | null, children: Element[] = []): Element {
 test("a portaled surface is searched unless it is on its way out", () => {
   const open = surface("open");
   const closing = surface("closed");
-  // A plain menu, which says nothing about its state because it is only rendered while open.
   const plain = surface(null);
   const scope = { contains: () => false } as unknown as Element;
   assert.deepEqual(
@@ -2628,11 +2429,7 @@ test("explicit monitor portals are searched but are not dismissible surfaces", a
     else view.document = undefined;
   }
 
-  const dom = await readFile(
-    new URL("../src/features/find-in-page/lib/find-dom.ts", import.meta.url),
-    "utf8",
-  );
-  assert.match(dom, /export function resolveDismissiblePortalSurfaces/);
+  assert.match(FIND_DOM, /export function resolveDismissiblePortalSurfaces/);
 
   for (const path of [
     "../src/features/api-monitor/api-monitor-overlay.tsx",
@@ -2657,50 +2454,22 @@ test("a surface inside the scope, or inside one already taken, is not indexed tw
 });
 
 test("the observer watches the document, since a portal lands outside the scope", async () => {
-  const engine = await readFile(
-    new URL(
-      "../src/features/find-in-page/hooks/use-find-in-page.ts",
-      import.meta.url,
-    ),
-    "utf8",
-  );
-  // A popover renders to the body: an observer on the scope alone never hears one open or close.
-  assert.match(engine, /scope\?\.ownerDocument\?\.body \?\? scope/);
-  // `data-state` is all a dismissed one changes, and it keeps its box until the animation ends.
-  assert.match(engine, /attributeFilter: \[[^\]]*"data-state"/);
+  assert.match(USE_FIND_IN_PAGE, /scope\?\.ownerDocument\?\.body \?\? scope/);
+  assert.match(USE_FIND_IN_PAGE, /attributeFilter: \[[^\]]*"data-state"/);
 });
 
 test("the rows progressive completion adds are re-anchored, not renumbered", async () => {
-  // Progressive completion PREPENDS, and match 3 of the tail is not match 3 of the thread.
-  const engine = await readFile(
-    new URL(
-      "../src/features/find-in-page/hooks/use-find-in-page.ts",
-      import.meta.url,
-    ),
-    "utf8",
-  );
   assert.match(
-    engine,
+    USE_FIND_IN_PAGE,
     /completeProgressiveMounts\([\s\S]*?\.then\(\(\) => \{[\s\S]*?search\(false, reindex\(\)\);/,
   );
-  // `reindex` answers false when nothing came in, so a settled thread's probe takes back no Enter.
-  assert.equal(engine.includes("rebuild("), false);
+  assert.equal(USE_FIND_IN_PAGE.includes("rebuild("), false);
 });
 
 test("Escape closes the bar from the walk buttons, not just the field", async () => {
-  const bar = await readFile(
-    new URL(
-      "../src/features/find-in-page/components/find-bar.tsx",
-      import.meta.url,
-    ),
-    "utf8",
-  );
-  // On the WINDOW, in the capture phase, for the lifetime of the open bar. A handler on the bar
-  // only reaches presses that started inside it, so clicking a message to read it left a bar
-  // Escape would not close -- and with a tool request waiting, that same unprevented Escape went
-  // on to `declineToolRequest`, which is bare Escape and is not shielded by `isTextEntryFocused`
-  // on a message body. Closing a find bar must not be able to answer a tool request.
-  const effect = bar.slice(bar.indexOf("const onEscape ="));
+  // Window capture phase: a bar-local handler misses presses that started elsewhere, and an
+  // unprevented Escape would reach `declineToolRequest`.
+  const effect = FIND_BAR.slice(FIND_BAR.indexOf("const onEscape ="));
   const body = effect.slice(0, effect.indexOf("window.addEventListener"));
   assert.match(body, /event\.key !== "Escape"/);
   assert.match(body, /event\.preventDefault\(\);/);
@@ -2711,11 +2480,9 @@ test("Escape closes the bar from the walk buttons, not just the field", async ()
     effect,
     /window\.removeEventListener\("keydown", onEscape, true\)/,
   );
-  // A modal above the bar owns Escape, and an open popover is dismissed by its own first.
-  assert.match(body, /isSurfaceBackgrounded\(/);
+  assert.match(body, /isFindScopeBackgrounded\(\)/);
   assert.match(body, /resolveDismissiblePortalSurfaces\(/);
-  // And nothing left on the landmark, which would take the inside presses before the window does.
-  const landmark = bar.slice(bar.indexOf('role="search"'));
+  const landmark = FIND_BAR.slice(FIND_BAR.indexOf('role="search"'));
   assert.equal(
     landmark.slice(0, landmark.indexOf(">")).includes("onKeyDown"),
     false,
@@ -2723,26 +2490,13 @@ test("Escape closes the bar from the walk buttons, not just the field", async ()
 });
 
 test("only threads this search can read are forced to finish mounting", async () => {
-  // Completing globally would make a retained conversation mount every row it withheld.
-  const engine = await readFile(
-    new URL(
-      "../src/features/find-in-page/hooks/use-find-in-page.ts",
-      import.meta.url,
-    ),
-    "utf8",
-  );
   assert.match(
-    engine,
+    USE_FIND_IN_PAGE,
     /completeProgressiveMounts\(\(viewport\) =>\s*\n?\s*indexReaches\(scope, viewport\)/,
   );
-  const progressive = await readFile(
-    new URL(
-      "../src/components/assistant-ui/progressive-messages.tsx",
-      import.meta.url,
-    ),
-    "utf8",
+  const progressive = await readSrcAsync(
+    "components/assistant-ui/progressive-messages.tsx",
   );
-  // The exit has to read the filtered set, or a declined completer holds it open forever.
   assert.match(
     progressive,
     /if \(wanted\(\)\.length === 0 && \(observed \|\| Date\.now\(\) >= deadline\)\)/,
@@ -2752,61 +2506,38 @@ test("only threads this search can read are forced to finish mounting", async ()
 test("the chord is left to the browser when the scope is behind a modal", async () => {
   // `useShortcut` prevents the event BEFORE the handler, so declining inside it kills the chord.
   const controller = await readComponentSource();
-  assert.match(controller, /claims: \(\) => !isSurfaceBackgrounded\(/);
-  const shortcut = await readFile(
-    new URL("../src/features/settings/hooks/use-shortcut.ts", import.meta.url),
-    "utf8",
-  );
-  const consume = shortcut.indexOf("event.preventDefault();");
+  assert.match(controller, /claims: \(\) => !isFindScopeBackgrounded\(\)/);
+  const consume = USE_SHORTCUT.indexOf("event.preventDefault();");
   assert.ok(consume > 0);
-  assert.ok(shortcut.lastIndexOf("latestRef.current.claims?.()", consume) > 0);
+  assert.ok(
+    USE_SHORTCUT.lastIndexOf("latestRef.current.claims?.()", consume) > 0,
+  );
 });
 
 test("the Enter that commits an IME candidate is left alone", async () => {
-  const bar = await readFile(
-    new URL(
-      "../src/features/find-in-page/components/find-bar.tsx",
-      import.meta.url,
-    ),
-    "utf8",
-  );
-  // Ahead of preventDefault, or the composition is discarded before the guard is reached.
-  const enter = bar.slice(bar.indexOf('event.key === "Enter"'));
+  const enter = FIND_BAR.slice(FIND_BAR.indexOf('event.key === "Enter"'));
   const guard = enter.indexOf("isImeComposing(event.nativeEvent)");
   const prevent = enter.indexOf("event.preventDefault()");
   assert.ok(guard > 0 && guard < prevent);
 });
 
 test("closing the bar hands focus back to where it came from", async () => {
-  const bar = await readFile(
-    new URL(
-      "../src/features/find-in-page/components/find-bar.tsx",
-      import.meta.url,
-    ),
-    "utf8",
-  );
-  // Captured above the effect that focuses the field, or it reads the field it is about to fill.
-  const capture = bar.indexOf("const active = document.activeElement");
-  const takeFocus = bar.indexOf("input.select();");
+  const capture = FIND_BAR.indexOf("const active = document.activeElement");
+  const takeFocus = FIND_BAR.indexOf("input.select();");
   assert.ok(capture > 0 && capture < takeFocus);
-  assert.match(bar, /origin\.focus\(\);/);
+  assert.match(FIND_BAR, /origin\.focus\(\{ preventScroll: true \}\);/);
   // First answer only: StrictMode replays the effect, and by the second run the field has focus.
-  assert.match(bar, /originRef\.current === null &&/);
-  // Against the bar's element, not `data-find-skip`, which the composer carries.
-  assert.match(bar, /barRef\.current\?\.contains\(active\) !== true/);
-  assert.equal(bar.includes("closest(`[${FIND_SKIP_ATTRIBUTE}]`)"), false);
+  assert.match(FIND_BAR, /originRef\.current === null &&/);
+  assert.match(FIND_BAR, /barRef\.current\?\.contains\(active\) !== true/);
+  assert.equal(FIND_BAR.includes("closest(`[${FIND_SKIP_ATTRIBUTE}]`)"), false);
   assert.match(
-    bar,
+    FIND_BAR,
     /if \(focused !== null && focused !== document\.body\) return;/,
   );
 });
 
 test("the chat composer is out of the searchable scope", async () => {
-  // Its draft lives in a textarea the index cannot read, leaving find only the pill labels.
-  const thread = await readFile(
-    new URL("../src/components/assistant-ui/thread.tsx", import.meta.url),
-    "utf8",
-  );
+  const thread = await readSrcAsync("components/assistant-ui/thread.tsx");
   const root = thread.slice(thread.indexOf("<ComposerPrimitive.Root"));
   assert.match(
     root.slice(0, root.indexOf(">")),
@@ -2815,85 +2546,62 @@ test("the chat composer is out of the searchable scope", async () => {
 });
 
 test("the reader is kept on the occurrence, not on the number", async () => {
-  const engine = await readFile(
-    new URL(
-      "../src/features/find-in-page/hooks/use-find-in-page.ts",
-      import.meta.url,
-    ),
-    "utf8",
-  );
   assert.match(
-    engine,
+    USE_FIND_IN_PAGE,
     /activeStartRef\.current = active >= 0 \? matches\[active\]\.start : null;/,
   );
-  // Read BEFORE the new list is installed, or it is the new list's answer being read back.
-  const read = engine.indexOf("const wasAt = activeStartRef.current;");
-  const install = engine.indexOf("matchesRef.current = matches;", read - 400);
+  const read = USE_FIND_IN_PAGE.indexOf(
+    "const wasAt = activeStartRef.current;",
+  );
+  const install = USE_FIND_IN_PAGE.indexOf(
+    "matchesRef.current = matches;",
+    read - 400,
+  );
   assert.ok(read > 0 && read < install);
-  assert.match(engine, /ordinalOfStart\(matches, wasAt\)/);
+  assert.match(USE_FIND_IN_PAGE, /ordinalOfStart\(matches, wasAt\)/);
   assert.match(
-    engine,
+    USE_FIND_IN_PAGE,
     /at === -1 \? firstMatchFromViewport\(index, matches\) : at/,
   );
 });
 
 test("the ordinal survives an append and nothing else", async () => {
-  // A streaming reply only adds at the tail; history above, `inert` flipping or a breakpoint
-  // revealing a column each renumber the list.
-  const engine = await readFile(
-    new URL(
-      "../src/features/find-in-page/hooks/use-find-in-page.ts",
-      import.meta.url,
-    ),
-    "utf8",
-  );
-  // One rule, and it lives in the pure module so the tests below can exercise it directly.
   assert.match(
-    engine,
+    USE_FIND_IN_PAGE,
     /return renumbersMatches\(before, indexRef\.current, activeStartRef\.current\);/,
   );
-  assert.equal(engine.includes("search(false, false)"), false);
-  assert.equal((engine.match(/search\(false, reindex\(\)\)/g) ?? []).length, 2);
+  assert.equal(USE_FIND_IN_PAGE.includes("search(false, false)"), false);
+  assert.equal(
+    (USE_FIND_IN_PAGE.match(/search\(false, reindex\(\)\)/g) ?? []).length,
+    2,
+  );
   assert.match(
-    engine,
+    USE_FIND_IN_PAGE,
     /reindex\(\);\n\s*\/\/[^\n]*\n\s*search\(false, true\);/,
   );
 });
 
 test("every navigation waits for the query to settle, buttons included", async () => {
-  // The buttons stay enabled on the previous query's count while an edit is pending, and `apply`
-  // will not paint until it settles, so calling `next`/`previous` from a click dropped it silently.
-  const bar = await readFile(
-    new URL(
-      "../src/features/find-in-page/components/find-bar.tsx",
-      import.meta.url,
-    ),
-    "utf8",
-  );
-  assert.match(bar, /onClick=\{\(\) => stepWhenSettled\(-1\)\}/);
-  assert.match(bar, /onClick=\{\(\) => stepWhenSettled\(1\)\}/);
-  // No control reaches the raw pair, so a new one cannot copy the losing spelling.
-  assert.equal(/onClick=\{(next|previous)\}/.test(bar), false);
-  // Reaching the handler at all: a settled zero must not disable the walk while the next query is
-  // still pending, or editing "no matches" into a match loses the press to a disabled button.
+  assert.match(FIND_BAR, /onClick=\{\(\) => stepWhenSettled\(-1\)\}/);
+  assert.match(FIND_BAR, /onClick=\{\(\) => stepWhenSettled\(1\)\}/);
+  assert.equal(/onClick=\{(next|previous)\}/.test(FIND_BAR), false);
   assert.match(
-    bar,
+    FIND_BAR,
     /const canStep = searching && \(count > 0 \|\| queryPending\);/,
   );
-  assert.equal((bar.match(/disabled=\{!canStep\}/g) ?? []).length, 2);
-  assert.equal(bar.includes("disabled={count === 0}"), false);
-  // The helper queues the step and forces the settle rather than dropping it.
+  assert.equal((FIND_BAR.match(/disabled=\{!canStep\}/g) ?? []).length, 2);
+  assert.equal(FIND_BAR.includes("disabled={count === 0}"), false);
   assert.match(
-    bar,
+    FIND_BAR,
     /if \(queryPending\) \{\s*queuedStepsRef\.current\.push\(\{ query, delta \}\);[\s\S]*?settleQuery\(\);/,
   );
 
-  assert.match(bar, /filter\([\s\S]*?\(step\) => step\.query === query/);
+  assert.match(FIND_BAR, /filter\([\s\S]*?\(step\) => step\.query === query/);
 
-  assert.match(bar, /queuedStepsRef\.current = \[\.\.\.pendingSteps\]/);
-  assert.match(bar, /for \(const step of steps\)/);
+  assert.match(FIND_BAR, /queuedStepsRef\.current = \[\.\.\.pendingSteps\]/);
+  assert.match(FIND_BAR, /for \(const step of steps\)/);
 
-  assert.match(bar, /if \(count > 0\) \{\s*for \(const step of steps\)/);
+  assert.match(FIND_BAR, /if \(count > 0\) \{\s*for \(const step of steps\)/);
 });
 
 test("the seam between the workspace and the surfaces in front of it is recorded", () => {
@@ -2902,7 +2610,6 @@ test("the seam between the workspace and the surfaces in front of it is recorded
   const alone = buildTextIndex(workspace);
   assert.equal(alone.rootLength, alone.text.length);
   const withMonitor = buildTextIndex(workspace, [monitor]);
-  // The joining separator belongs to the surface, so the workspace slice is only the workspace.
   assert.equal(withMonitor.rootLength, alone.text.length);
   assert.equal(withMonitor.text.slice(0, withMonitor.rootLength), alone.text);
   assert.match(withMonitor.text.slice(withMonitor.rootLength), /cpu 12%$/);
@@ -2921,28 +2628,21 @@ test("inserting an earlier surface renumbers a reader in a later one", () => {
 });
 
 test("a monitor polling behind a streaming reply does not move the reader", () => {
-  // The monitor is a permanent tail that rewrites itself on a timer. Judged as one string, every
-  // poll and every streamed character reads as renumbered and re-anchors the reader.
   const monitorAt = (load: string) => el("DIV", [el("P", [text(load)])]);
   const reply = (body: string) => el("DIV", [el("P", [text(body)])]);
 
   const before = buildTextIndex(reply("unsloth one"), [monitorAt("cpu 12%")]);
-  // Where the reader is: on the occurrence in the workspace.
   const readerInWorkspace = findMatches(before, "unsloth")[0].start;
 
-  // The monitor polls; the workspace has not moved.
   const polled = buildTextIndex(reply("unsloth one"), [monitorAt("cpu 34%")]);
   assert.equal(renumbersMatches(before, polled, readerInWorkspace), false);
 
-  // The reply streams on; the monitor has not moved.
   const streamed = buildTextIndex(reply("unsloth one unsloth two"), [
     monitorAt("cpu 12%"),
   ]);
   assert.equal(renumbersMatches(before, streamed, readerInWorkspace), false);
-  // And the occurrence really is still at the offset the search looks it up by.
   assert.equal(findMatches(streamed, "unsloth")[0].start, readerInWorkspace);
 
-  // Both at once, which is the ordinary case while a reply lands.
   const both = buildTextIndex(reply("unsloth one unsloth two"), [
     monitorAt("cpu 34%"),
   ]);
@@ -2950,8 +2650,6 @@ test("a monitor polling behind a streaming reply does not move the reader", () =
 });
 
 test("a reader inside a surface gives up its place when the workspace grows under it", () => {
-  // Growing the workspace moves the tail along, so an occurrence inside a surface is no longer at
-  // the offset it is looked up by. That reader, and only that reader, re-anchors.
   const monitorText = { nodeType: 3 as const, data: "unsloth monitor" };
   const monitor = el("DIV", [el("P", [monitorText])]);
   const before = buildTextIndex(el("DIV", [el("P", [text("reply one")])]), [
@@ -2966,11 +2664,9 @@ test("a reader inside a surface gives up its place when the workspace grows unde
   );
   assert.equal(renumbersMatches(before, grown, readerInMonitor), true);
 
-  // The same growth leaves a reader in the workspace exactly where they were.
   const workspaceReader = 0;
   assert.equal(renumbersMatches(before, grown, workspaceReader), false);
 
-  // A poll that does not move the seam keeps even the surface's own reader in place.
   monitorText.data = "unsloth monitor idle";
   const polled = buildTextIndex(el("DIV", [el("P", [text("reply one")])]), [
     monitor,
@@ -2979,8 +2675,6 @@ test("a reader inside a surface gives up its place when the workspace grows unde
 });
 
 test("a surface reader only minds the text ahead of their occurrence", () => {
-  // A monitor rewrites a reading every second. Only what sits before the occurrence can move it, so
-  // an occurrence in the static label survives the number below it changing.
   const reply = el("DIV", [el("P", [text("reply one")])]);
   const labelledText = {
     nodeType: 3 as const,
@@ -2995,8 +2689,6 @@ test("a surface reader only minds the text ahead of their occurrence", () => {
   assert.equal(renumbersMatches(before, polled, reader), false);
   assert.equal(findMatches(polled, "unsloth")[0].start, reader);
 
-  // A reading AHEAD of the occurrence changing width does move it, and there the offset stops
-  // naming anything: `search` finds no match starting there and re-anchors itself.
   const leadingText = { nodeType: 3 as const, data: "cpu 12% unsloth monitor" };
   const leading = el("DIV", [el("P", [leadingText])]);
   const wasLeading = buildTextIndex(reply, [leading]);
@@ -3008,8 +2700,6 @@ test("a surface reader only minds the text ahead of their occurrence", () => {
     false,
   );
 
-  // Changing it without changing its width leaves the occurrence exactly where it was, which is
-  // the ordinary poll and must not move the reader.
   leadingText.data = "cpu 99% unsloth monitor";
   const sameWidth = buildTextIndex(reply, [leading]);
   assert.equal(renumbersMatches(wasLeading, sameWidth, readerAfter), false);
@@ -3020,7 +2710,6 @@ test("a surface reader only minds the text ahead of their occurrence", () => {
 });
 
 test("history arriving above the reader still renumbers the list", () => {
-  // The rule this all rests on has not been widened: a prepend is not an append on either side.
   const monitorText = { nodeType: 3 as const, data: "cpu 12%" };
   const monitor = el("DIV", [el("P", [monitorText])]);
   const before = buildTextIndex(el("DIV", [el("P", [text("unsloth one")])]), [
@@ -3032,19 +2721,15 @@ test("history arriving above the reader still renumbers the list", () => {
   );
   assert.equal(renumbersMatches(before, prepended, 0), true);
 
-  // A surface whose reading is replaced rather than extended is the ordinary poll, and it must not
-  // renumber anything for a reader in the conversation behind it.
   monitorText.data = "gpu 12%";
   const replaced = buildTextIndex(el("DIV", [el("P", [text("unsloth one")])]), [
     monitor,
   ]);
   assert.equal(renumbersMatches(before, replaced, 0), false);
-  // Nor for a reader inside it: the rewrite kept its width, so nothing moved for them either.
   assert.equal(
     renumbersMatches(before, replaced, before.text.length - 1),
     false,
   );
-  // Growing the workspace under them is what moves a surface reader, and that still renumbers.
   const grown = buildTextIndex(
     el("DIV", [el("P", [text("unsloth one unsloth two")])]),
     [monitor],
@@ -3053,37 +2738,28 @@ test("history arriving above the reader still renumbers the list", () => {
 });
 
 test("a breakpoint that changes what is rendered invalidates the index", async () => {
-  // Crossing one reveals whole columns with nothing in the DOM to observe.
-  const engine = await readFile(
-    new URL(
-      "../src/features/find-in-page/hooks/use-find-in-page.ts",
-      import.meta.url,
-    ),
-    "utf8",
-  );
-  assert.match(engine, /window\.addEventListener\("resize", invalidate\);/);
-  assert.match(engine, /window\.removeEventListener\("resize", invalidate\);/);
   assert.match(
-    engine,
+    USE_FIND_IN_PAGE,
+    /window\.addEventListener\("resize", invalidate\);/,
+  );
+  assert.match(
+    USE_FIND_IN_PAGE,
+    /window\.removeEventListener\("resize", invalidate\);/,
+  );
+  assert.match(
+    USE_FIND_IN_PAGE,
     /const invalidate = \(\) => \{[\s\S]*?REINDEX_INTERVAL_MS\);/,
   );
 });
 
 test("closing preserves the query while leaving the shell forgets the session", async () => {
-  const controller = await readFile(
-    new URL(
-      "../src/features/find-in-page/components/find-in-page.tsx",
-      import.meta.url,
-    ),
-    "utf8",
-  );
-  assert.match(controller, /const \[query, setQuery\] = useState\(""\);/);
+  assert.match(FIND_IN_PAGE, /const \[query, setQuery\] = useState\(""\);/);
   assert.match(
-    controller,
+    FIND_IN_PAGE,
     /const close = useCallback\(\(\) => \{[\s\S]*?setOpen\(false\);[\s\S]*?\}, \[\]\);/,
   );
-  assert.equal(controller.includes('setQuery("")'), false);
-  assert.equal(controller.includes("useFindInPageStore"), false);
+  assert.equal(FIND_IN_PAGE.includes('setQuery("")'), false);
+  assert.equal(FIND_IN_PAGE.includes("useFindInPageStore"), false);
 });
 
 test("the capped window follows the reader, not the top of the document", () => {
@@ -3111,7 +2787,6 @@ test("the capped window follows the reader, not the top of the document", () => 
 });
 
 test("a capped window slides as matches are appended", () => {
-  // The window recentres, so the same number is a different occurrence.
   const limit = 100;
   const before = `${"q".repeat(200)} needle ${"q".repeat(20)}`;
   const after = `${before}${"q".repeat(200)}`;
@@ -3146,7 +2821,6 @@ test("the window is only computed when the cap bites", () => {
 });
 
 test("stopping the count early does not move the window", () => {
-  // A stop that came too soon would drag the window back toward the top.
   const body = "q".repeat(500);
   const index = buildTextIndex(el("DIV", [el("P", [text(body)])]));
   const at = 200;
@@ -3168,7 +2842,6 @@ test("the window stops at the ends of the list", () => {
 });
 
 test("clipped accessibility text is not searchable", () => {
-  // `sr-only` keeps a real box at full opacity, which `checkVisibility` calls visible.
   const label = el("SPAN", [text("Data input")]);
   const shown = el("SPAN", [text("Data output")]);
   withStyles(
@@ -3189,7 +2862,6 @@ test("clipped accessibility text is not searchable", () => {
 });
 
 test("the counter says '+' only when the cap actually cut something off", () => {
-  // A count equal to the cap cannot say whether it is the total or a floor.
   const occurrences = (n: number) =>
     findMatches(
       buildTextIndex(el("DIV", [el("P", [text("a".repeat(n))])])),
@@ -3212,65 +2884,36 @@ test("the counter says '+' only when the cap actually cut something off", () => 
 });
 
 test("the cap flag is what the bar renders, not the count", async () => {
-  const engine = await readFile(
-    new URL(
-      "../src/features/find-in-page/hooks/use-find-in-page.ts",
-      import.meta.url,
-    ),
-    "utf8",
-  );
   assert.match(
-    engine,
+    USE_FIND_IN_PAGE,
     /findMatches\(\s*\n\s*index,\s*\n\s*queryRef\.current,\s*\n\s*MAX_MATCHES \+ 1,/,
   );
-  assert.match(engine, /cappedRef\.current = matches\.length > MAX_MATCHES;/);
-  // Trimmed from the end the reader is further from: a window anchored near the bottom ends at
-  // the document's last match.
   assert.match(
-    engine,
+    USE_FIND_IN_PAGE,
+    /cappedRef\.current = matches\.length > MAX_MATCHES;/,
+  );
+  assert.match(
+    USE_FIND_IN_PAGE,
     /if \(cappedRef\.current\) dropProbeFurthestFrom\(matches, anchoredAt\);/,
   );
-  assert.match(engine, /let anchoredAt: number \| null = null;/);
-  assert.match(engine, /anchoredAt = viewportOffset\(index\);/);
-  const bar = await readFile(
-    new URL(
-      "../src/features/find-in-page/components/find-bar.tsx",
-      import.meta.url,
-    ),
-    "utf8",
-  );
-  assert.match(bar, /\$\{capped \? "\+" : ""\}/);
-  assert.equal(bar.includes("count >= MAX_MATCHES"), false);
+  assert.match(USE_FIND_IN_PAGE, /let anchoredAt: number \| null = null;/);
+  assert.match(USE_FIND_IN_PAGE, /anchoredAt = viewportOffset\(index\);/);
+  assert.match(FIND_BAR, /\$\{capped \? "\+" : ""\}/);
+  assert.equal(FIND_BAR.includes("count >= MAX_MATCHES"), false);
 });
 
 test("Escape is left to the IME while it is composing", async () => {
-  // Escape dismisses a candidate. Consumed here, it closes the bar out from under a word still
-  // being typed, and the candidate window never sees the key it was aimed at.
-  const bar = await readFile(
-    new URL(
-      "../src/features/find-in-page/components/find-bar.tsx",
-      import.meta.url,
-    ),
-    "utf8",
-  );
-  const escapeHandler = bar.slice(bar.indexOf("const onEscape ="));
+  const escapeHandler = FIND_BAR.slice(FIND_BAR.indexOf("const onEscape ="));
   const guard = escapeHandler.indexOf("isImeComposing(event)");
   const consume = escapeHandler.indexOf("event.preventDefault()");
   assert.ok(guard > 0 && guard < consume);
-  // Safe: the global listener stands aside for a composing event before looking for a binding.
-  const shortcut = await readFile(
-    new URL("../src/features/settings/hooks/use-shortcut.ts", import.meta.url),
-    "utf8",
-  );
   assert.match(
-    shortcut,
+    USE_SHORTCUT,
     /if \(isImeComposing\(event\)\) return;\n\s*const hit = bindings\.find/,
   );
 });
 
 test("the selection fallback only clears what it put there", () => {
-  // The bar paints once on opening, before any query, so clearing unconditionally there throws
-  // away what the reader had selected. Boundary points, since engines differ on `getRangeAt`.
   const span = (name: string) =>
     ({
       startContainer: name,
@@ -3302,7 +2945,7 @@ test("the selection fallback only clears what it put there", () => {
     selectRangeFallback(span("the active match"));
     assert.deepEqual(ranges, [span("the active match")]);
     selectRangeFallback(null);
-    // Annotated, or `deepEqual`'s assertion signature narrows `ranges` to `never[]` from here on.
+    // Annotated, or `deepEqual`'s assertion signature narrows `ranges` to `never[]`.
     assert.deepEqual(ranges, [] as Range[]);
 
     selectRangeFallback(span("the active match"));
@@ -3316,13 +2959,8 @@ test("the selection fallback only clears what it put there", () => {
 });
 
 test("the generated-image actions are out of the index too", async () => {
-  // Persistently transparent text has to say so, since the index cannot tell it from a fade-in.
-  const tool = await readFile(
-    new URL(
-      "../src/components/assistant-ui/tool-ui-image-generation.tsx",
-      import.meta.url,
-    ),
-    "utf8",
+  const tool = await readSrcAsync(
+    "components/assistant-ui/tool-ui-image-generation.tsx",
   );
   const at = tool.indexOf("sm:group-hover/generated-image:opacity-100");
   assert.notEqual(at, -1);
@@ -3333,71 +2971,43 @@ test("the generated-image actions are out of the index too", async () => {
 });
 
 test("a hover-only badge is out of the index", async () => {
-  // An affordance, not an entrance animation, so it is marked at the call site rather than by
-  // turning the opacity check on.
-  const sheet = await readFile(
-    new URL(
-      "../src/components/assistant-ui/message-response-details-sheet.tsx",
-      import.meta.url,
-    ),
-    "utf8",
+  const sheet = await readSrcAsync(
+    "components/assistant-ui/message-response-details-sheet.tsx",
   );
   const badge = sheet.slice(sheet.indexOf("aui-response-model-badge") - 400);
   assert.match(
     badge.slice(0, badge.indexOf("aui-response-model-badge")),
     /\{\.\.\.\{ \[FIND_SKIP_ATTRIBUTE\]: "" \}\}/,
   );
-  const index = await readFile(
-    new URL(
-      "../src/features/find-in-page/lib/find-text-index.ts",
-      import.meta.url,
-    ),
-    "utf8",
-  );
-  assert.match(index, /opacityProperty: false/);
+  assert.match(FIND_TEXT_INDEX, /opacityProperty: false/);
 });
 
 test("a container query resizing the scope invalidates the index", async () => {
-  // Images is an `@container`, so pinning the sidebar crosses a breakpoint with no resize and
-  // no mutation inside the scope.
-  const engine = await readFile(
-    new URL(
-      "../src/features/find-in-page/hooks/use-find-in-page.ts",
-      import.meta.url,
-    ),
-    "utf8",
-  );
-  assert.match(engine, /new ResizeObserver\(\(\) => \{/);
-  assert.match(engine, /sized\.observe\(scope\);/);
-  assert.match(engine, /sized\?\.disconnect\(\);/);
-  // The first delivery is the size the scope already had, and would cost a flatten on every open.
+  assert.match(USE_FIND_IN_PAGE, /new ResizeObserver\(\(\) => \{/);
+  assert.match(USE_FIND_IN_PAGE, /sized\.observe\(scope\);/);
+  assert.match(USE_FIND_IN_PAGE, /sized\?\.disconnect\(\);/);
   assert.match(
-    engine,
+    USE_FIND_IN_PAGE,
     /if \(!measured\) \{\s*\n\s*measured = true;\s*\n\s*return;/,
   );
 });
 
 test("nothing of the engine is mounted while the bar is closed", async () => {
-  const controller = await readFile(
-    new URL(
-      "../src/features/find-in-page/components/find-in-page.tsx",
-      import.meta.url,
-    ),
-    "utf8",
-  );
-  assert.match(controller, /if \(!enabled \|\| !open\) return null;/);
+  assert.match(FIND_IN_PAGE, /if \(!enabled \|\| !open\) return null;/);
   assert.match(
-    controller,
+    FIND_IN_PAGE,
     /lazy\(\(\) => import\("\.\/find-bar-loader\.tsx"\)\)/,
   );
-  assert.equal(controller.includes("useFindInPage("), false);
+  assert.equal(FIND_IN_PAGE.includes("useFindInPage("), false);
 
-  const loadedBar = await readFile(
-    new URL(
-      "../src/features/find-in-page/components/find-bar.tsx",
-      import.meta.url,
-    ),
-    "utf8",
-  );
-  assert.equal((loadedBar.match(/useFindInPage\(/g) ?? []).length, 1);
+  assert.equal((FIND_BAR.match(/useFindInPage\(/g) ?? []).length, 1);
+});
+
+test("the find bar hides under the Browser overlay from its first frame", () => {
+  const page = readSrc("features/chat/chat-page.tsx");
+  const start = page.indexOf("function BrowserOverlay(");
+  const overlay = page.slice(start, page.indexOf("\n}\n", start));
+  assert.match(overlay, /useDocumentFlag\("data-browser-overlay-open", true\);/, "the inline modal tells CSS it is up, which nothing else notices until its lazy panel loads");
+  assert.match(INDEX, /html\[data-browser-overlay-open\] \[data-find-bar-layer\] \{\s*display: none;\s*\}/);
+  assert.equal(/html\[data-browser-overlay-open\][^{]*\.interface-zoom-position/.test(INDEX), false, "the zoom popup stays, as upstream keeps it under any dialog");
 });

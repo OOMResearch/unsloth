@@ -6,8 +6,7 @@
 from pathlib import Path
 import sys
 
-# Seed platform._sys_version_cache before attrs->rich->structlog->platform crash on conda Python.
-# See: https://github.com/python/cpython/issues/102396
+# Seed platform._sys_version_cache before a conda Python crash: https://github.com/python/cpython/issues/102396
 _backend_dir = str(Path(__file__).parent)
 if _backend_dir not in sys.path:
     sys.path.insert(0, _backend_dir)
@@ -20,10 +19,8 @@ logger = get_logger(__name__)
 
 
 def get_colab_url(port: int = 8888) -> str:
-    """Get the Colab proxy URL for a port.
-
-    Retries 3x validating a real HTTPS Colab URL; falls back to localhost on failure.
-    """
+    """Get the Colab proxy URL for a port. Retries 3x validating a real HTTPS Colab URL; falls back to
+    localhost on failure."""
     import time as _time
 
     fallback = f"http://localhost:{port}"
@@ -68,10 +65,8 @@ def _is_colab_proxy_url(url: str, port: int) -> bool:
 
 
 def _is_colab_runtime() -> bool:
-    """True on a hosted Colab notebook kernel.
-
-    Reuses the backend's main Colab detector (``/content`` + Colab env / ``google.colab``)
-    instead of a single env var, which is not always present on hosted runtimes.
+    """True on a hosted Colab notebook kernel. Reuses the backend's main Colab detector (``/content`` + Colab env
+    / ``google.colab``) instead of a single env var, which is not always present on hosted runtimes.
     """
     try:
         from main import _IS_COLAB
@@ -124,12 +119,9 @@ def _clear_colab_login_credentials() -> None:
 
 
 def _colab_credentials_still_valid(username: str, password: str) -> bool:
-    """True when *password* still matches the stored admin hash.
-
-    Guards against redisplaying a cached first-run password after the user has
-    changed the admin password through the app, which would print credentials
-    that no longer authenticate to the current Cloudflare tunnel.
-    """
+    """True when *password* still matches the stored admin hash. Guards against redisplaying a cached
+    first-run password after the user has changed the admin password through the app, which would
+    print credentials that no longer authenticate to the current Cloudflare tunnel."""
     try:
         from auth.storage import get_user_and_secret
         from auth.hashing import verify_password
@@ -148,24 +140,15 @@ def _colab_credentials_still_valid(username: str, password: str) -> bool:
 
 
 def _colab_wants_cloudflare(cloudflare: "bool | None") -> bool:
-    """Resolve whether to open a Cloudflare tunnel.
-
-    ``None`` auto-enables on real Colab (the in-cell proxy embed is often blank);
-    pass ``False`` to opt out.
-    """
+    """Resolve whether to open a Cloudflare tunnel. ``None`` auto-enables on real Colab (the in-cell
+    proxy embed is often blank); pass ``False`` to opt out."""
     if cloudflare is not None:
         return cloudflare
     return _is_colab_runtime()
 
 
 def _finalize_colab_admin_password() -> "tuple[str, str] | None":
-    """Clear the bootstrap-password gate on Colab so Cloudflare tunnels can start.
-
-    Returns ``(username, password)`` for display in the notebook. On first run the
-    random admin password is finalized; on later runs (e.g. after interrupt) the
-    stored credentials are re-displayed so the Cloudflare link stays usable.
-    Anyone who can read this cell already controls the runtime.
-    """
+    """Later runs re-display stored credentials; whoever can read this cell already controls the runtime."""
     if not _is_colab_runtime():
         return None
     try:
@@ -190,8 +173,7 @@ def _finalize_colab_admin_password() -> "tuple[str, str] | None":
             creds = _load_colab_login_credentials()
             if creds is not None and _colab_credentials_still_valid(username, creds[1]):
                 return creds
-            # The admin password was changed through the app after the first run,
-            # so the cached copy is stale; drop it instead of printing dead credentials.
+            # Password changed in the app, so the cached copy is stale.
             _clear_colab_login_credentials()
             return None
         password = get_bootstrap_password() or generate_bootstrap_password()
@@ -243,12 +225,7 @@ def _ready_card_html(
     has_cloudflare_link: bool = False,
     cloudflare_requested: bool = False,
 ) -> str:
-    """Branded ready card for the in-notebook Unsloth view.
-
-    Colab ``*.prod.colab.dev`` proxy URLs are session-scoped and 404 when opened as a
-    top-level tab or on another device, so never ``window.open`` them. On real Colab the
-    Cloudflare link is the supported entry point because in-cell proxy embeds often stay blank.
-    """
+    """Never window.open ``*.prod.colab.dev`` URLs: they are session-scoped and 404 as a top-level tab."""
     short_url = _short_colab_url(url, port)
     if _is_colab_runtime() or _is_colab_proxy_url(url, port):
         if has_cloudflare_link:
@@ -320,12 +297,9 @@ def show_link(
     has_cloudflare_link: bool = False,
     cloudflare_requested: bool = False,
 ):
-    """Display a styled ready card for the UI.
-
-    Colab proxy URLs are informational only (no new-tab open; they 404 outside the cell);
-    non-proxy URLs keep a clickable open button. *_url* is an optional pre-fetched proxy
-    URL to avoid a second eval_js round-trip.
-    """
+    """Display a styled ready card for the UI. Colab proxy URLs are informational only (no new-tab
+    open; they 404 outside the cell); non-proxy URLs keep a clickable open button. *_url* is an
+    optional pre-fetched proxy URL to avoid a second eval_js round-trip."""
     from IPython.display import display, HTML
 
     url = _url if _url is not None else get_colab_url(port)
@@ -353,11 +327,9 @@ def _warn_colab_cloudflare_missing(*, use_cloudflare: bool, cloudflare_url: "str
 
 
 def _bootstrap_password_pending() -> bool:
-    """True while the default admin still owes a bootstrap-password change.
-
-    While pending, a public tunnel GET (no Origin) reads as same-origin and gets the
-    injected password, so sharing the link would leak admin access. Fails safe to pending.
-    """
+    """True while the default admin still owes a bootstrap-password change. While pending, a public
+    tunnel GET (no Origin) reads as same-origin and gets the injected password, so sharing the link
+    would leak admin access. Fails safe to pending."""
     try:
         from auth.storage import requires_password_change, DEFAULT_ADMIN_USERNAME
         return bool(requires_password_change(DEFAULT_ADMIN_USERNAME))
@@ -367,11 +339,9 @@ def _bootstrap_password_pending() -> bool:
 
 
 def start_cloudflare_tunnel(port: int) -> "str | None":
-    """Open a shareable Cloudflare quick tunnel to localhost:*port*, or None.
-
-    run_server suppresses the tunnel on Colab, so we start it directly. Refused while the
-    bootstrap password is pending; any failure collapses to None (Colab proxy still works).
-    """
+    """Open a shareable Cloudflare quick tunnel to localhost:*port*, or None. run_server suppresses the
+    tunnel on Colab, so we start it directly. Refused while the bootstrap password is pending; any
+    failure collapses to None (Colab proxy still works)."""
     if _bootstrap_password_pending():
         logger.warning(
             "Cloudflare link not started: the admin account still has its temporary "
@@ -415,10 +385,8 @@ def _stop_cloudflare_tunnel() -> None:
 
 
 def _is_studio_healthy(port: int, timeout: float = 2.0) -> bool:
-    """True only if Unsloth Studio (not some other app) answers /api/health on *port*.
-
-    The service-marker check stops the reuse path reusing or tunneling a foreign process.
-    """
+    """True only if Unsloth Studio (not some other app) answers /api/health on *port*. The
+    service-marker check stops the reuse path reusing or tunneling a foreign process."""
     import json, urllib.request
     try:
         with urllib.request.urlopen(f"http://localhost:{port}/api/health", timeout = timeout) as r:
@@ -432,11 +400,9 @@ def _shareable_link_html(
     password: "str | None" = None,
     username: "str | None" = None,
 ) -> str:
-    """Branded card for the shareable Cloudflare link, styled like the show_link banner.
-
-    *password* renders under the link so the credential sits in the card with the button
-    it unlocks. The username is always the default admin, so it reads inline.
-    """
+    """Branded card for the shareable Cloudflare link, styled like the show_link banner. *password*
+    renders under the link so the credential sits in the card with the button it unlocks. The
+    username is always the default admin, so it reads inline."""
     login_block = ""
     if password:
         login_block = f"""
@@ -482,12 +448,9 @@ _COLAB_IFRAME_HEIGHT = 900
 
 
 def _embed_kernel_port_iframe(port: int) -> bool:
-    """Embed Unsloth via Colab's native kernel-port iframe helper.
-
-    Only trusted on a real Colab runtime: colabtools can import ``google.colab`` and
-    queue browser-side JS without appending an iframe, so callers outside Colab must use
-    the HTML iframe path instead.
-    """
+    """Embed Unsloth via Colab's native kernel-port iframe helper. Only trusted on a real Colab
+    runtime: colabtools can import ``google.colab`` and queue browser-side JS without appending an
+    iframe, so callers outside Colab must use the HTML iframe path instead."""
     if not _is_colab_runtime():
         return False
     try:
@@ -548,10 +511,8 @@ def _show_and_embed(
     colab_login: "tuple[str, str] | None" = None,
     cloudflare_requested: bool = False,
 ):
-    """Render the Unsloth ready card + iframe for *port*.
-
-    Prefer Colab's ``serve_kernel_port_as_iframe`` on real Colab; raw HTML iframe is the
-    fallback. Cloudflare cards stay clickable.
+    """Render the Unsloth ready card + iframe for *port*. Prefer Colab's ``serve_kernel_port_as_iframe`` on real
+    Colab; raw HTML iframe is the fallback. Cloudflare cards stay clickable.
     """
     url = get_colab_url(port)
     logger.info(f"🌐 Unsloth Studio URL: {url}")
@@ -581,8 +542,7 @@ def _show_and_embed(
         except Exception as e:
             logger.info(f"Could not render Colab login card ({e}).")
 
-    # With a tunnel up the embed below is skipped, so the ready card would only restate
-    # the link card and print a proxy URL that 404s outside this tab.
+    # With a tunnel up the embed is skipped, and the proxy URL 404s outside this tab.
     skip_ready_card = _is_colab_runtime() and bool(cloudflare_url)
     if not skip_ready_card:
         try:
@@ -607,19 +567,7 @@ def _show_and_embed(
 
 
 def start(port: int = 8888, *, cloudflare: "bool | None" = None):
-    """Start Unsloth Studio in Colab and display the URL.
-
-    Args:
-        port: Port to bind/serve on.
-        cloudflare: Shareable Cloudflare HTTPS link. ``None`` (default) auto-enables on
-            real Colab because the in-cell proxy embed is often blank; pass ``False`` to
-            skip the tunnel or ``True`` to force it on other runtimes.
-
-    Usage:
-        start()                    # Cloudflare link on Colab (auto); proxy iframe elsewhere
-        start(cloudflare=False)    # Colab proxy iframe only (often blank on current Colab)
-        start(cloudflare=True)     # force Cloudflare link on any runtime
-    """
+    """cloudflare=None auto-enables the tunnel on Colab, where the in-cell proxy is often blank."""
     import time
 
     logger.info("🦥 Starting Unsloth Studio...")

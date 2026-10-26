@@ -23,6 +23,7 @@ from core.inference.mcp_client import (
 from core.inference.tool_loop_controller import is_tool_error, strip_result_for_model
 
 PNG_B64 = "iVBORw0KGgoAAAANSUhEUg=="
+WAV_B64 = "UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA="
 
 
 def _text(value: str) -> SimpleNamespace:
@@ -31,6 +32,10 @@ def _text(value: str) -> SimpleNamespace:
 
 def _image(data: str = PNG_B64, mime: str = "image/png") -> SimpleNamespace:
     return SimpleNamespace(type = "image", data = data, mimeType = mime)
+
+
+def _audio(data: str = WAV_B64, mime: str = "audio/wav") -> SimpleNamespace:
+    return SimpleNamespace(type = "audio", data = data, mimeType = mime)
 
 
 def _blob_resource(
@@ -74,35 +79,33 @@ def test_text_only_result_unchanged():
 def test_image_only_result_keeps_image_and_notes_model():
     flat = _flatten_result(_result(_image()))
     body, payload = flat.split("\n" + MCP_IMAGES_SENTINEL, 1)
-    assert body == "[1 image attached; displayed to the user]"
+    assert body == "[1 image returned]"
     assert json.loads(payload) == [{"data": PNG_B64, "mimeType": "image/png"}]
 
 
 def test_text_plus_image_keeps_both():
     flat = _flatten_result(_result(_text("Took a screenshot"), _image()))
     body, payload = flat.split("\n" + MCP_IMAGES_SENTINEL, 1)
-    assert body == "Took a screenshot\n[1 image attached; displayed to the user]"
+    assert body == "Took a screenshot\n[1 image returned]"
     assert json.loads(payload)[0]["mimeType"] == "image/png"
 
 
 def test_multiple_images_pluralized():
     flat = _flatten_result(_result(_image(), _image(mime = "image/jpeg")))
     body, payload = flat.split("\n" + MCP_IMAGES_SENTINEL, 1)
-    assert "[2 images attached; displayed to the user]" in body
+    assert "[2 images returned]" in body
     assert [img["mimeType"] for img in json.loads(payload)] == ["image/png", "image/jpeg"]
 
 
 def test_strip_result_for_model_drops_image_payload():
     flat = _flatten_result(_result(_text("Took a screenshot"), _image()))
     stripped = strip_result_for_model(flat)
-    assert stripped == "Took a screenshot\n[1 image attached; displayed to the user]"
+    assert stripped == "Took a screenshot\n[1 image returned]"
     assert PNG_B64 not in stripped
 
 
 def test_strip_preserves_literal_mcp_sentinel_in_text():
-    # A tool that legitimately returns text containing the marker (e.g. reading
-    # source/docs that quote it) must not be truncated: the suffix is not a
-    # valid JSON image array.
+    # Tool text quoting the marker must not be truncated: the suffix is not a JSON image array.
     text = "before\n__MCP_IMAGES__: literal from source\nafter"
     assert strip_result_for_model(text) == text
 
@@ -115,17 +118,16 @@ def test_strip_preserves_non_image_json_after_marker():
 def test_strip_removes_only_valid_terminal_envelope():
     text = (
         "Earlier mention: __MCP_IMAGES__: is documented here"
-        "\n[1 image attached; displayed to the user]"
+        "\n[1 image returned]"
         '\n__MCP_IMAGES__:[{"data": "AAAA", "mimeType": "image/png"}]'
     )
     assert strip_result_for_model(text) == (
-        "Earlier mention: __MCP_IMAGES__: is documented here"
-        "\n[1 image attached; displayed to the user]"
+        "Earlier mention: __MCP_IMAGES__: is documented here\n[1 image returned]"
     )
 
 
 def test_strip_still_handles_images_and_rag_sentinels():
-    assert strip_result_for_model("output\n__IMAGES__:['a.png']") == "output"
+    assert strip_result_for_model('output\n__IMAGES__:["a.png"]') == "output"
     assert strip_result_for_model("answer\n__RAG_SOURCES__:[{}]") == "answer"
 
 
@@ -138,7 +140,7 @@ def test_error_result_keeps_error_prefix_and_images():
 
 def test_image_only_error_no_longer_reports_no_content():
     flat = _flatten_result(_result(_image(), is_error = True))
-    assert flat.startswith("Error: [1 image attached")
+    assert flat.startswith("Error: [1 image returned")
     assert "tool returned no content" not in flat
 
 
@@ -153,17 +155,139 @@ def test_oversized_budget_shared_across_images():
     big = "A" * (MAX_IMAGE_PAYLOAD_CHARS - 10)
     flat = _flatten_result(_result(_image(data = big), _image()))
     body, payload = flat.split("\n" + MCP_IMAGES_SENTINEL, 1)
-    assert "1 image attached" in body
+    assert "1 image returned" in body
     assert "1 image omitted (too large)" in body
     images = json.loads(payload)
     assert len(images) == 1 and images[0]["data"] == big
 
 
-def test_non_image_binary_block_still_ignored():
-    flat = _flatten_result(
-        _result(SimpleNamespace(type = "audio", data = PNG_B64, mimeType = "audio/wav"))
+def test_audio_only_result_notes_the_attachment():
+    assert (
+        _flatten_result(_result(_audio()))
+        == "[audio attachment (audio/wav) not shown to the model]"
     )
-    assert flat == ""
+
+
+def test_text_plus_audio_keeps_text_and_appends_note():
+    flat = _flatten_result(_result(_text("Recorded 1s"), _audio()))
+    assert flat == "Recorded 1s\n[audio attachment (audio/wav) not shown to the model]"
+
+
+def test_audio_mirrored_in_structured_content_is_not_dumped():
+    structured = {"content": [{"type": "audio", "data": WAV_B64, "mimeType": "audio/wav"}]}
+    flat = _flatten_result(_result(_audio(), structured = structured))
+    assert flat == "[audio attachment (audio/wav) not shown to the model]"
+    assert WAV_B64 not in flat
+
+
+def test_image_mirrored_in_structured_content_is_not_dumped():
+    structured = {"content": [{"type": "image", "data": PNG_B64, "mimeType": "image/png"}]}
+    flat = _flatten_result(_result(_image(), structured = structured))
+    body, payload = flat.split("\n" + MCP_IMAGES_SENTINEL, 1)
+    assert body == "[1 image returned]"
+    assert json.loads(payload) == [{"data": PNG_B64, "mimeType": "image/png"}]
+    assert PNG_B64 not in strip_result_for_model(flat)
+    huge = "A" * (MAX_IMAGE_PAYLOAD_CHARS + 1)
+    structured = {"content": [{"type": "image", "data": huge, "mimeType": "image/png"}]}
+    assert _flatten_result(_result(_image(data = huge), structured = structured)) == (
+        "[1 image omitted (too large)]"
+    )
+
+
+def test_image_and_audio_share_one_note():
+    flat = _flatten_result(_result(_image(), _audio()))
+    body, payload = flat.split("\n" + MCP_IMAGES_SENTINEL, 1)
+    assert body == ("[1 image returned; audio attachment (audio/wav) not shown to the model]")
+    assert json.loads(payload) == [{"data": PNG_B64, "mimeType": "image/png"}]
+
+
+def test_independent_structured_content_is_kept_beside_attachments():
+    flat = _flatten_result(_result(_image(), structured = {"rows": 3, "max": 41.5}))
+    body, payload = flat.split("\n" + MCP_IMAGES_SENTINEL, 1)
+    assert body == "{'rows': 3, 'max': 41.5}\n[1 image returned]"
+    assert json.loads(payload) == [{"data": PNG_B64, "mimeType": "image/png"}]
+    assert _flatten_result(_result(_audio(), structured = {"duration_s": 1.0})) == (
+        "{'duration_s': 1.0}\n[audio attachment (audio/wav) not shown to the model]"
+    )
+
+
+def test_zero_byte_attachments_are_noted():
+    assert _flatten_result(_result(_audio(data = ""))) == (
+        "[audio attachment (audio/wav) not shown to the model]"
+    )
+    assert (
+        _flatten_result(
+            _result(_blob_resource(data = "", mime = "text/csv", uri = "file:///out/empty.csv"))
+        )
+        == "[file attachment (text/csv) <file:///out/empty.csv> not shown to the model]"
+    )
+
+
+def test_partially_mirrored_structured_content_keeps_its_own_fields():
+    structured = {
+        "content": [{"type": "audio", "data": WAV_B64, "mimeType": "audio/wav"}],
+        "duration_s": 1.0,
+        "transcript": "hello",
+    }
+    flat = _flatten_result(_result(_audio(), structured = structured))
+    assert flat == (
+        "{'duration_s': 1.0, 'transcript': 'hello'}\n"
+        "[audio attachment (audio/wav) not shown to the model]"
+    )
+    blob = _blob_resource(mime = "application/pdf", uri = "file:///out/report.pdf")
+    mirrored = {
+        "content": [
+            {
+                "type": "resource",
+                "resource": {
+                    "uri": "file:///out/report.pdf",
+                    "mimeType": "application/pdf",
+                    "blob": PNG_B64,
+                },
+            }
+        ]
+    }
+    assert _flatten_result(_result(blob, structured = mirrored)) == (
+        "[file attachment (application/pdf) <file:///out/report.pdf> not shown to the model]"
+    )
+    wrapped = {
+        "type": "success",
+        "content": [{"type": "audio", "data": WAV_B64, "mimeType": "audio/wav"}],
+    }
+    assert _flatten_result(_result(_audio(), structured = wrapped)) == (
+        "{'type': 'success'}\n[audio attachment (audio/wav) not shown to the model]"
+    )
+    nested = {"type": "success", "attachment": {"type": "audio", "data": WAV_B64}}
+    assert _flatten_result(_result(_audio(), structured = nested)) == (
+        "{'type': 'success'}\n[audio attachment (audio/wav) not shown to the model]"
+    )
+    colocated = {"type": "audio", "data": WAV_B64, "mimeType": "audio/wav", "transcript": "hello"}
+    assert _flatten_result(_result(_audio(), structured = colocated)) == (
+        "{'transcript': 'hello'}\n[audio attachment (audio/wav) not shown to the model]"
+    )
+    inner = {
+        "content": [
+            {
+                "type": "resource",
+                "resource": {
+                    "uri": "file:///out/report.pdf",
+                    "mimeType": "application/pdf",
+                    "blob": PNG_B64,
+                    "pages": 12,
+                },
+            }
+        ]
+    }
+    assert _flatten_result(_result(blob, structured = inner)) == (
+        "{'content': [{'resource': {'pages': 12}}]}\n"
+        "[file attachment (application/pdf) <file:///out/report.pdf> not shown to the model]"
+    )
+
+
+def test_audio_only_error_keeps_error_prefix():
+    flat = _flatten_result(_result(_audio(), is_error = True))
+    assert flat == "Error: [audio attachment (audio/wav) not shown to the model]"
+    assert is_tool_error(flat)
 
 
 def test_structured_content_fallback_still_used():
@@ -172,8 +296,7 @@ def test_structured_content_fallback_still_used():
 
 
 def test_call_tool_sync_passes_raise_on_error_false_and_keeps_error_images(monkeypatch):
-    # Guards that call_tool_sync passes raise_on_error=False, so an is_error result
-    # with image content reaches _flatten_result instead of FastMCP raising ToolError.
+    # call_tool_sync must pass raise_on_error=False so is_error results reach _flatten_result.
     seen = {}
 
     class _FakeClient:
@@ -245,14 +368,14 @@ def test_stdio_session_call_also_passes_raise_on_error_false(monkeypatch):
 def test_embedded_resource_image_is_rendered():
     flat = _flatten_result(_result(_blob_resource()))
     body, payload = flat.split("\n" + MCP_IMAGES_SENTINEL, 1)
-    assert body == "[1 image attached; displayed to the user]"
+    assert body == "[1 image returned]"
     assert json.loads(payload) == [{"data": PNG_B64, "mimeType": "image/png"}]
 
 
 def test_embedded_resource_image_shares_budget_with_image_content():
     flat = _flatten_result(_result(_text("rendered"), _image(), _blob_resource(mime = "image/webp")))
     body, payload = flat.split("\n" + MCP_IMAGES_SENTINEL, 1)
-    assert body == "rendered\n[2 images attached; displayed to the user]"
+    assert body == "rendered\n[2 images returned]"
     assert [img["mimeType"] for img in json.loads(payload)] == ["image/png", "image/webp"]
 
 
@@ -267,8 +390,28 @@ def test_embedded_text_resource_contributes_its_text():
     )
 
 
-def test_embedded_non_image_blob_still_ignored():
-    assert _flatten_result(_result(_blob_resource(mime = "application/pdf"))) == ""
+def test_embedded_non_image_blob_notes_type_and_uri():
+    flat = _flatten_result(
+        _result(_blob_resource(mime = "application/pdf", uri = "file:///out/report.pdf"))
+    )
+    assert (
+        flat
+        == "[file attachment (application/pdf) <file:///out/report.pdf> not shown to the model]"
+    )
+    assert PNG_B64 not in flat
+
+
+def test_embedded_blobs_are_noted_one_by_one():
+    flat = _flatten_result(
+        _result(
+            _blob_resource(mime = "text/csv", uri = "file:///out/table.csv"),
+            _blob_resource(mime = "application/zip", uri = "file:///out/archive.zip"),
+        )
+    )
+    assert flat == (
+        "[file attachment (text/csv) <file:///out/table.csv> not shown to the model; "
+        "file attachment (application/zip) <file:///out/archive.zip> not shown to the model]"
+    )
 
 
 def test_resource_link_keeps_its_uri():
@@ -289,10 +432,10 @@ def test_server_text_still_wins_over_structured_content():
 
 
 def test_fastmcp_file_format_png_is_rendered():
-    # fastmcp File(data=..., format="png") labels the blob application/png
+    # fastmcp File(format='png') labels the blob application/png.
     flat = _flatten_result(_result(_blob_resource(mime = "application/png")))
     body, payload = flat.split("\n" + MCP_IMAGES_SENTINEL, 1)
-    assert body == "[1 image attached; displayed to the user]"
+    assert body == "[1 image returned]"
     assert json.loads(payload) == [{"data": PNG_B64, "mimeType": "image/png"}]
 
 
@@ -321,12 +464,16 @@ def test_blob_resource_without_mime_uses_uri_extension():
     flat = _flatten_result(_result(_blob_resource(mime = None)))
     payload = flat.split("\n" + MCP_IMAGES_SENTINEL, 1)[1]
     assert json.loads(payload) == [{"data": PNG_B64, "mimeType": "image/png"}]
-    assert _flatten_result(_result(_blob_resource(mime = None, uri = "file:///out/report.pdf"))) == ""
+    assert _flatten_result(_result(_blob_resource(mime = None, uri = "file:///out/report.pdf"))) == (
+        "[file attachment <file:///out/report.pdf> not shown to the model]"
+    )
 
 
-def test_non_image_application_types_stay_ignored():
+def test_non_image_application_types_are_noted_not_rendered():
     for mime in ("application/pdf", "application/octet-stream", "application/json"):
-        assert _flatten_result(_result(_blob_resource(mime = mime))) == "", mime
+        assert _flatten_result(_result(_blob_resource(mime = mime))) == (
+            f"[file attachment ({mime}) <file:///out/gen.png> not shown to the model]"
+        ), mime
 
 
 def test_image_content_mime_is_passed_through_unchanged():
@@ -336,7 +483,6 @@ def test_image_content_mime_is_passed_through_unchanged():
 
 
 def test_mixed_case_image_mime_is_matched():
-    # media type names are case-insensitive
     for mime in ("IMAGE/PNG", "Image/Png", "image/PNG"):
         flat = _flatten_result(_result(_blob_resource(mime = mime)))
         payload = flat.split("\n" + MCP_IMAGES_SENTINEL, 1)[1]
@@ -350,8 +496,7 @@ def test_mime_parameters_are_dropped_from_the_data_url_type():
 
 
 def test_uri_query_and_fragment_are_not_part_of_the_name():
-    # mimetypes only stopped reading the query and fragment in 3.11.9/3.12.3/3.13
-    # (CPython gh-117217); on older supported interpreters this dropped the image.
+    # mimetypes read query/fragment before CPython 3.11.9/3.12.3/3.13 (gh-117217).
     for uri in (
         "file:///out/gen.png?download=1",
         "file:///out/gen.png#preview",
@@ -364,9 +509,10 @@ def test_uri_query_and_fragment_are_not_part_of_the_name():
 
 
 def test_extension_only_in_the_query_is_not_an_image():
-    # the same defect the other way: a query naming a .png made a non-image render
     for uri in ("file:///out/download?name=gen.png", "file:///out/download#gen.png"):
-        assert _flatten_result(_result(_blob_resource(mime = None, uri = uri))) == "", uri
+        assert _flatten_result(_result(_blob_resource(mime = None, uri = uri))) == (
+            f"[file attachment <{uri}> not shown to the model]"
+        ), uri
 
 
 def test_data_uri_still_resolves_its_own_type():
@@ -379,19 +525,21 @@ def test_data_uri_still_resolves_its_own_type():
         _flatten_result(
             _result(_blob_resource(mime = None, uri = "data:application/pdf;base64,JVBERi0="))
         )
-        == ""
+        == "[file attachment not shown to the model]"
     )
 
 
 def test_a_bare_host_is_not_a_file_name():
-    # urlsplit puts gen.png in netloc, not path; 3.10 guessed image/png from it
-    assert _flatten_result(_result(_blob_resource(mime = None, uri = "resource://gen.png"))) == ""
+    # urlsplit puts gen.png in netloc, not path; 3.10 guessed image/png from it.
+    assert _flatten_result(_result(_blob_resource(mime = None, uri = "resource://gen.png"))) == (
+        "[file attachment <resource://gen.png> not shown to the model]"
+    )
     flat = _flatten_result(_result(_blob_resource(mime = None, uri = "resource://images/gen.png")))
     assert MCP_IMAGES_SENTINEL in flat
 
 
 def test_malformed_image_types_never_reach_the_data_url():
-    # anything that survives is interpolated into data:<type>;base64, by the frontend
+    # Survivors are interpolated into data:<type>;base64, by the frontend.
     for mime in (
         "image/",
         "image//png",
@@ -400,7 +548,8 @@ def test_malformed_image_types_never_reach_the_data_url():
         'image/png"',
         "image/png\nX-Injected: 1",
     ):
-        assert _flatten_result(_result(_blob_resource(mime = mime))) == "", mime
+        flat = _flatten_result(_result(_blob_resource(mime = mime)))
+        assert MCP_IMAGES_SENTINEL not in flat and "image attached" not in flat, mime
 
 
 def test_unusual_but_valid_image_types_are_kept():
@@ -411,7 +560,7 @@ def test_unusual_but_valid_image_types_are_kept():
 
 
 def test_snake_case_mime_attribute_is_read_too():
-    # mcp 2.x renames mimeType to mime_type and keeps camelCase only as an alias
+    # mcp 2.x renames mimeType to mime_type and keeps camelCase only as an alias.
     block = SimpleNamespace(
         type = "resource",
         resource = SimpleNamespace(uri = "file:///out/gen.bin", mime_type = "image/png", blob = PNG_B64),
@@ -427,7 +576,7 @@ def test_snake_case_mime_attribute_is_read_too():
 
 
 def test_registry_case_does_not_decide_whether_an_image_survives(monkeypatch):
-    # windows answers .jxl with image/JXL, linux and macos image/jxl; same type per RFC 9110
+    # Windows answers .jxl with image/JXL, Linux and macOS image/jxl; same type per RFC 9110.
     monkeypatch.setattr(
         mcp_client.mimetypes, "guess_type", lambda name, strict = True: ("image/JXL", None)
     )

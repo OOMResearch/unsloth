@@ -1,20 +1,19 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""HTTP API for the RAG engine: KB CRUD, uploads, SSE ingestion, search.
+"""HTTP API for the RAG engine: KB CRUD, uploads, SSE ingestion, search. Single-tenant: the subject gates
+access, not data.
 
-Single-tenant: the subject gates access, not data.
-
-Without a working sqlite-vec the router still mounts, and one contract covers every
-endpoint. The KB list is polled, so it answers 200 with an empty list carrying an
-availability marker, which is what lets a client tell an empty store from a machine
-where RAG cannot run. Every other endpoint answers 503 stating the same reason.
-Nothing logs a traceback for it: the condition is fixed for the session and rag_db
-warns about it exactly once.
+Without a working sqlite-vec the router still mounts, and one contract covers every endpoint. The KB list is
+polled, so it answers 200 with an empty list carrying an availability marker, which is what lets a client tell
+an empty store from a machine where RAG cannot run. Every other endpoint but /extract-text, which only parses,
+answers 503 stating the same reason.
+Nothing logs a traceback for it: the condition is fixed for the session and rag_db warns about it exactly once.
 """
 
 from __future__ import annotations
 
+from core.training.account_jobs import account_path
 import hashlib
 import hmac
 import json
@@ -24,6 +23,7 @@ import re
 import secrets
 import sqlite3
 import time
+import unicodedata
 import uuid
 from contextlib import contextmanager
 from typing import Annotated, Iterator
@@ -33,8 +33,15 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from auth.authentication import get_current_subject, request_admitted_without_credential
-from core.rag import config, folder_sync, ingestion, retrieval, store
+from core.rag import config, folder_sync, ingestion, reembed, retrieval, store
 from storage import rag_db
+from utils.account_context import (
+    OWNER,
+    AccountContext,
+    bind_account,
+    current_account,
+    reset_account,
+)
 from utils.paths import ensure_dir, rag_uploads_root
 
 logger = logging.getLogger(__name__)
@@ -46,27 +53,14 @@ _UNAVAILABLE_DETAIL = "RAG is unavailable: the sqlite-vec extension could not be
 
 
 def _require_rag() -> None:
-    """Gate an endpoint on RAG being runnable here.
-
-    Covers both halves of unavailable: sqlite-vec never imported, and it imported but
-    its native library will not load. 503 with a stated reason rather than the 500 plus
-    traceback a raising connection would produce, and rag_db's warn-once keeps the log
-    quiet however often this fires.
-    """
+    """Returns 503 with a stated reason, not the 500 and traceback a raising connection would produce."""
     if not rag_db.rag_available():
         raise HTTPException(status_code = 503, detail = _UNAVAILABLE_DETAIL)
 
 
 @contextmanager
 def _rag_unavailable_as_503(cleanup_path: str | None = None) -> Iterator[None]:
-    """Report RagExtensionUnavailable as the same 503, wherever it is raised.
-
-    _require_rag() has normally answered for the session already; this closes the window
-    where the very first request is the one that discovers the missing library, and it
-    reaches the connections ingestion opens for itself. ``cleanup_path`` removes an
-    upload that was saved before the failure, so nothing is orphaned in the uploads
-    root. Real database errors are left alone.
-    """
+    """Maps RagExtensionUnavailable to 503 anywhere, removing the upload that cleanup_path names."""
     try:
         yield
     except rag_db.RagExtensionUnavailable as exc:
@@ -81,37 +75,48 @@ def _rag_connection() -> sqlite3.Connection:
 
 
 def _availability(available: bool) -> dict:
-    """Availability marker carried by the KB list, the one response that degrades
-    rather than erroring.
-
-    Additive: a client that only reads the list is unaffected, one that reads this can
-    say "RAG cannot run here" instead of showing an empty page that looks ready to use
-    and offering a Create that can only 503.
-    """
+    """Marks the KB list as degraded rather than erroring, so the UI can say RAG cannot run here."""
     return {
         "ragAvailable": available,
         "ragUnavailableReason": None if available else _UNAVAILABLE_DETAIL,
     }
 
 
-_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
-
-
-def _sanitize_filename(name: str) -> str:
-    base = os.path.basename(name or "").strip() or "document"
-    base = _SAFE.sub("_", base)
+def _document_label(name: str) -> str:
+    # A display label, never a path: the bytes are stored at uploads/<uuid><ext>.
+    base = "".join(
+        (" " if ch.isspace() else "")
+        if unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp")
+        else ch
+        for ch in name or ""
+    )
+    # Not \s+: U+3000 and the other Zs spaces belong to the name.
+    base = re.sub(r" +", " ", base).strip() or "document"
     if len(base) <= 200:
         return base
-    # Trim the stem, not the extension: _save_upload gates on the extension, so
-    # a plain truncation would reject a long-named .txt as "unsupported".
+    # Trim the stem: _save_upload gates on the extension.
     stem, ext = os.path.splitext(base)
     if not ext or len(ext) > 32:
         return base[:200]
     return stem[: 200 - len(ext)] + ext
 
 
-def _persist_upload_stream(source, filename: str, *, empty_detail: str) -> tuple[str, str]:
-    """Copy a validated document stream into the managed uploads root."""
+# Kept narrow: splitting a real name loses part of it.
+# One leading backslash counts as UNC because multipart parsing unescapes "\\" to "\".
+_LOOKS_LIKE_WINDOWS_PATH = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\?|\.{1,2}\\)")
+
+
+def _sanitize_filename(name: str) -> str:
+    """Label a browser upload, whose client-supplied name may carry a path."""
+    # Not ntpath.basename: macOS names like "P:L x.pdf" would read as drive "P:".
+    # Classify first: splitting on "/" would strip the drive from "C:/a\b".
+    raw = name or ""
+    parts = re.split(r"[\\/]", raw) if _LOOKS_LIKE_WINDOWS_PATH.match(raw) else raw.split("/")
+    return _document_label(parts[-1])
+
+
+def _persist_upload_stream(source, filename: str, *, empty_detail: str) -> tuple[str, str, str]:
+    """Returns the content hash so ingestion does not need a second full read of the file."""
     ext = os.path.splitext(filename)[1].lower()
     if ext not in config.UPLOAD_EXTS:
         raise HTTPException(
@@ -122,6 +127,7 @@ def _persist_upload_stream(source, filename: str, *, empty_detail: str) -> tuple
     stored_path = str(uploads / f"{uuid.uuid4().hex}{ext}")
     size = 0
     cap = config.MAX_UPLOAD_BYTES
+    digest = hashlib.sha256()
     try:
         with open(stored_path, "wb") as out:
             while True:
@@ -132,6 +138,7 @@ def _persist_upload_stream(source, filename: str, *, empty_detail: str) -> tuple
                 if cap and size > cap:
                     break
                 out.write(block)
+                digest.update(block)
     except OSError:
         _remove_stored_upload(stored_path)
         raise
@@ -144,11 +151,11 @@ def _persist_upload_stream(source, filename: str, *, empty_detail: str) -> tuple
     if size == 0:
         _remove_stored_upload(stored_path)
         raise HTTPException(status_code = 400, detail = empty_detail)
-    return stored_path, filename
+    return stored_path, filename, digest.hexdigest()
 
 
-def _save_upload(file: UploadFile) -> tuple[str, str]:
-    """Persist a browser upload; returns (stored_path, filename)."""
+def _save_upload(file: UploadFile) -> tuple[str, str, str]:
+    """Persist a browser upload; returns (stored_path, filename, content_hash)."""
     filename = _sanitize_filename(file.filename or "document")
     return _persist_upload_stream(
         file.file,
@@ -157,12 +164,8 @@ def _save_upload(file: UploadFile) -> tuple[str, str]:
     )
 
 
-def _save_native_path_upload(lease: str) -> tuple[str, str]:
-    """Persist a desktop drop; returns (stored_path, filename).
-
-    The webview never gets to name a path directly: Rust signs the path it saw and we
-    re-verify + re-stat that grant here before reading a byte.
-    """
+def _save_native_path_upload(lease: str) -> tuple[str, str, str]:
+    """The webview names no path; the Rust-signed lease is re-verified before a single byte is read."""
     from utils.native_path_leases import NativePathLeaseError, verify_native_path_lease
 
     try:
@@ -176,7 +179,9 @@ def _save_native_path_upload(lease: str) -> tuple[str, str]:
     except NativePathLeaseError as exc:
         raise HTTPException(status_code = 400, detail = str(exc)) from exc
 
-    filename = _sanitize_filename(grant.canonical_path.name)
+    account_path(grant.canonical_path)
+    # Path.name is one component, so a "\" in it is part of the name, as in "AC\DC.pdf".
+    filename = _document_label(grant.canonical_path.name)
     try:
         with open(grant.canonical_path, "rb") as source:
             return _persist_upload_stream(
@@ -190,7 +195,7 @@ def _save_native_path_upload(lease: str) -> tuple[str, str]:
 
 def _resolve_document_upload(
     file: UploadFile | None, native_path_lease: str | None
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     if native_path_lease:
         return _save_native_path_upload(native_path_lease)
     if file is None:
@@ -303,6 +308,12 @@ def _folder_view(row: dict) -> dict:
         if row["status"] in {"error", "retired"}
         else "idle"
     )
+    try:
+        report = json.loads(row.get("scan_report") or "{}")
+    except ValueError:
+        report = {}
+    if not isinstance(report, dict):
+        report = {}
     return {
         "id": row["id"],
         "displayName": row["name"],
@@ -311,6 +322,10 @@ def _folder_view(row: dict) -> dict:
         "status": status,
         "error": row.get("last_error"),
         "lastSyncedAt": row.get("last_scan_at"),
+        "lastChangedAt": row.get("last_change_at"),
+        "skipped": report.get("skipped") or {},
+        "failures": report.get("failures") or [],
+        "failureCount": report.get("failureCount") or 0,
         "documentCount": row.get("file_count", 0),
         "activeJobId": row.get("active_job_id"),
         "scopeName": row.get("scope_name"),
@@ -331,10 +346,8 @@ def _require_scope_owner(
     scope_id: str,
     conn: sqlite3.Connection | None = None,
 ) -> None:
-    """404 unless the scope's owner still exists.
-
-    ``conn`` reuses a connection the caller already holds: sqlite-vec loads per
-    connection, so opening a second one to read a single row pays that twice.
+    """404 unless the scope's owner still exists. ``conn`` reuses a connection the caller already holds:
+    sqlite-vec loads per connection, so opening a second one to read a single row pays that twice.
     """
     if scope_type == "knowledge_base":
         if conn is not None:
@@ -364,6 +377,7 @@ def _require_document_owner(conn: sqlite3.Connection, document: dict) -> None:
 
 
 def _create_linked_folder(scope_type: str, scope_id: str, payload: LinkFolderRequest) -> dict:
+    from utils.native_path_leases import redact_native_paths
     path, signed_identity = _resolve_linked_folder_path(payload.native_path_lease)
     try:
         with folder_sync.scope_lock(_scope_for_owner(scope_type, scope_id)):
@@ -376,10 +390,20 @@ def _create_linked_folder(scope_type: str, scope_id: str, payload: LinkFolderReq
                 name = payload.name,
                 auto_sync = payload.auto_sync,
             )
+        job = folder_sync.get_job(job_id)
+        return {"linkedFolder": _folder_view(folder), "job": _folder_job_view(job)}
+    except HTTPException:
+        raise
     except ValueError as exc:
         raise HTTPException(status_code = 400, detail = str(exc)) from exc
-    job = folder_sync.get_job(job_id)
-    return {"linkedFolder": _folder_view(folder), "job": _folder_job_view(job)}
+    except Exception as exc:
+        # Not left to escape: an unhandled 500 has no CORS headers, so the desktop resent the POST and
+        # its spent grant answered "already used" instead of this error (#13093).
+        logger.exception("linked folder creation failed")
+        raise HTTPException(
+            status_code = 500,
+            detail = f"Could not link the folder: {redact_native_paths(str(exc) or type(exc).__name__)}",
+        ) from exc
 
 
 @router.get("/knowledge-bases")
@@ -387,11 +411,7 @@ def list_knowledge_bases(subject: str = Depends(get_current_subject)) -> dict:
     try:
         conn = rag_db.get_connection()
     except rag_db.RagExtensionUnavailable:
-        # RAG_AVAILABLE only covers the import; the native library can still fail to load per connection (a missing vec0
-        # binary in the venv). The UI polls this list, so 500ing costs a traceback every few seconds for a condition
-        # that never changes in a session, and rag_db has warned once. The marker is the difference between "no
-        # knowledge bases yet" and "RAG cannot run here". Only the unavailable case degrades: a locked or corrupt
-        # database still raises.
+        # Degrade only when the vec0 native lib is unavailable; locked or corrupt DBs must still raise.
         return {"knowledgeBases": [], **_availability(False)}
     try:
         kbs = store.list_kbs(conn)
@@ -476,8 +496,9 @@ def _raise_if_scope_retired(scope: str, detail: str = "Knowledge base is being d
         raise HTTPException(status_code = 409, detail = detail)
 
 
+# Upload routes stay sync so their blocking work runs in the threadpool.
 @router.post("/knowledge-bases/{kb_id}/documents")
-async def upload_kb_document(
+def upload_kb_document(
     kb_id: str,
     file: UploadFile | None = File(None),
     native_path_lease: str | None = Form(None, alias = "nativePathLease"),
@@ -494,14 +515,21 @@ async def upload_kb_document(
         conn.close()
     scope = store.kb_scope(kb_id)
     _raise_if_scope_retired(scope)
-    stored_path, filename = _resolve_document_upload(file, native_path_lease)
+    stored_path, filename, content_hash = _resolve_document_upload(file, native_path_lease)
     try:
         with folder_sync.scope_lock(scope):
             _require_scope_owner("knowledge_base", kb_id)
             _raise_if_scope_retired(scope)
             with _rag_unavailable_as_503(stored_path):
                 document_id, job_id = ingestion.start_ingestion(
-                    scope, kb_id, None, filename, stored_path, ocr = ocr, caption = caption
+                    scope,
+                    kb_id,
+                    None,
+                    filename,
+                    stored_path,
+                    ocr = ocr,
+                    caption = caption,
+                    content_hash = content_hash,
                 )
     except Exception:
         _remove_stored_upload(stored_path)
@@ -531,8 +559,9 @@ def link_kb_folder(
     return _create_linked_folder("knowledge_base", kb_id, payload)
 
 
+# Stays sync for the reason above upload_kb_document.
 @router.post("/threads/{thread_id}/documents")
-async def upload_thread_document(
+def upload_thread_document(
     thread_id: str,
     file: UploadFile | None = File(None),
     native_path_lease: str | None = Form(None, alias = "nativePathLease"),
@@ -541,7 +570,7 @@ async def upload_thread_document(
     subject: str = Depends(get_current_subject),
 ) -> dict:
     _require_rag()
-    stored_path, filename = _resolve_document_upload(file, native_path_lease)
+    stored_path, filename, content_hash = _resolve_document_upload(file, native_path_lease)
     with _rag_unavailable_as_503(stored_path):
         document_id, job_id = ingestion.start_ingestion(
             store.thread_scope(thread_id),
@@ -551,6 +580,7 @@ async def upload_thread_document(
             stored_path,
             ocr = ocr,
             caption = caption,
+            content_hash = content_hash,
         )
     return {"documentId": document_id, "jobId": job_id, "filename": filename}
 
@@ -574,14 +604,13 @@ def _discard_document(document_id: str) -> None:
         store.delete_document(conn, document_id)
     finally:
         conn.close()
-    # Same uploads-root confinement as every other cleanup path, and best-effort for the same
-    # reason: on Windows commonpath raises across drives and os.remove raises while the ingestion
-    # worker still holds the file, neither of which should turn this into a 500.
+    # Best-effort: on Windows commonpath and os.remove can raise; must not 500.
     _remove_stored_upload(document.get("stored_path"))
 
 
+# Stays sync for the reason above upload_kb_document.
 @router.post("/projects/{project_id}/documents")
-async def upload_project_document(
+def upload_project_document(
     project_id: str,
     file: UploadFile | None = File(None),
     native_path_lease: str | None = Form(None, alias = "nativePathLease"),
@@ -596,7 +625,7 @@ async def upload_project_document(
         raise HTTPException(status_code = 404, detail = "Project not found")
     scope = store.project_scope(project_id)
     _raise_if_scope_retired(scope, "Project is being deleted")
-    stored_path, filename = _resolve_document_upload(file, native_path_lease)
+    stored_path, filename, content_hash = _resolve_document_upload(file, native_path_lease)
     try:
         with folder_sync.scope_lock(scope):
             _require_scope_owner("project", project_id)
@@ -611,12 +640,12 @@ async def upload_project_document(
                     project_id = project_id,
                     ocr = ocr,
                     caption = caption,
+                    content_hash = content_hash,
                 )
     except Exception:
         _remove_stored_upload(stored_path)
         raise
-    # the project delete runs in the threadpool and can commit after the check above, once its own
-    # RAG cleanup has already listed the project's documents
+    # The threadpool project delete can commit after the check above.
     if get_chat_project(project_id) is None:
         _discard_document(document_id)
         raise HTTPException(status_code = 404, detail = "Project not found")
@@ -791,6 +820,52 @@ def delete_document(document_id: str, subject: str = Depends(get_current_subject
         conn.close()
 
 
+def _reembed_view(job: dict | None) -> dict | None:
+    if job is None:
+        return None
+    return {
+        "id": job["id"],
+        "status": job["status"],
+        "done": job["done"],
+        "failed": job["failed"],
+        "remaining": job["remaining"],
+        "clippedChunks": job["clipped_chunks"],
+        "progress": job["progress"],
+        "error": job["error"],
+    }
+
+
+@router.get("/reembed")
+def reembed_status(subject: str = Depends(get_current_subject)) -> dict:
+    """Documents indexed under another embedder than the current one, and the re-embed job."""
+    _require_rag()
+    # Job first: one ending between the reads still says running, so the client polls for the counts.
+    job = _reembed_view(reembed.status())
+    with _rag_unavailable_as_503():
+        stale = reembed.stale_counts()
+    return {
+        "staleDocuments": stale["documents"],
+        "staleArchived": stale["archived"],
+        "job": job,
+    }
+
+
+@router.post("/reembed")
+def start_reembed(subject: str = Depends(get_current_subject)) -> dict:
+    _require_rag()
+    with _rag_unavailable_as_503():
+        return {"job": _reembed_view(reembed.start())}
+
+
+@router.post("/reembed/cancel")
+def cancel_reembed(subject: str = Depends(get_current_subject)) -> dict:
+    _require_rag()
+    job = reembed.cancel()
+    if job is None:
+        raise HTTPException(status_code = 404, detail = "No re-embed job")
+    return {"job": _reembed_view(job)}
+
+
 @router.get("/jobs/{job_id}")
 def job_status(job_id: str, subject: str = Depends(get_current_subject)) -> dict:
     _require_rag()
@@ -848,6 +923,7 @@ def _folder_job_view(row: dict) -> dict:
         "processedFiles": processed,
         "indexedFiles": (row.get("added") or 0) + (row.get("changed") or 0),
         "removedFiles": row.get("deleted") or 0,
+        "renamedFiles": row.get("renamed") or 0,
         "failedFiles": row.get("failed") or 0,
         "error": row.get("error"),
         "createdAt": row.get("created_at"),
@@ -895,6 +971,45 @@ def folder_job_events(
         media_type = "text/event-stream",
         headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# MAX_TEXT_ATTACHMENT_BYTES in text-attachment-accept.ts: the composer's ceiling for inline text.
+_EXTRACT_TEXT_MAX_BYTES = 20 * 1024 * 1024
+
+
+# Not gated on sqlite-vec: the composer inlines the text of files its browser readers cannot open.
+@router.post("/extract-text")
+def extract_text(file: UploadFile = File(...), subject: str = Depends(get_current_subject)) -> dict:
+    from core.rag import parsers
+
+    stored_path, filename, _digest = _save_upload(file)
+    try:
+        pages = parsers.parse(stored_path)
+    except ImportError as exc:
+        raise HTTPException(status_code = 503, detail = f"{filename} could not be read: {exc}") from exc
+    # Not only ValueError: python-docx raises its own errors for a damaged .docm/.dotx.
+    except Exception as exc:
+        raise HTTPException(status_code = 422, detail = f"{filename} could not be read: {exc}") from exc
+    finally:
+        _remove_stored_upload(stored_path)
+    # Capped page by page: joining everything first would hold a huge extraction several times over.
+    parts: list[bytes] = []
+    room = _EXTRACT_TEXT_MAX_BYTES
+    truncated = False
+    for page in pages:
+        chunk = page.text.strip().encode("utf-8")
+        if not chunk:
+            continue
+        if parts:
+            chunk = b"\n\n" + chunk
+        if len(chunk) > room:
+            parts.append(chunk[:room])
+            truncated = True
+            break
+        parts.append(chunk)
+        room -= len(chunk)
+    text = b"".join(parts).decode("utf-8", errors = "ignore")
+    return {"filename": filename, "text": text, "truncated": truncated}
 
 
 @router.post("/search")
@@ -947,8 +1062,7 @@ def search(payload: SearchRequest, subject: str = Depends(get_current_subject)) 
         conn.close()
 
 
-# Per-process secret so pdf.js range requests fetch the file without a bearer
-# header; tokens only work on this server instance.
+# Per-process secret so pdf.js range requests work without a bearer header.
 _PREVIEW_SECRET = secrets.token_bytes(32)
 _PREVIEW_TTL = 600
 
@@ -957,79 +1071,50 @@ _CONTENT_TYPES = {
     ".txt": "text/plain; charset=utf-8",
     ".md": "text/markdown; charset=utf-8",
     ".markdown": "text/markdown; charset=utf-8",
-    # Served as plain text, never text/html: an uploaded HTML document rendered same-origin would
-    # execute its scripts with access to the app's storage.
+    # Never text/html: uploaded HTML would run scripts same-origin.
     ".html": "text/plain; charset=utf-8",
     ".htm": "text/plain; charset=utf-8",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 }
 
 
+# The signed token carries the account it was minted for; empty means the owner.
+_DOCUMENT_TOKEN_VERSION = "v2"
+
+
+def _document_mac(document_id: str, exp: str, account_id: str) -> str:
+    payload = f"rag:{_DOCUMENT_TOKEN_VERSION}:{account_id}:{document_id}.{exp}"
+    return hmac.new(_PREVIEW_SECRET, payload.encode(), hashlib.sha256).hexdigest()
+
+
 def _sign_document(document_id: str) -> str:
-    exp = int(time.time()) + _PREVIEW_TTL
-    payload = f"{document_id}.{exp}"
-    sig = hmac.new(_PREVIEW_SECRET, payload.encode(), hashlib.sha256).hexdigest()
-    return f"{payload}.{sig}"
+    account = current_account()
+    account_id = "" if account.is_owner else account.account_id
+    exp = str(int(time.time()) + _PREVIEW_TTL)
+    return f"{exp}.{account_id}.{_document_mac(document_id, exp, account_id)}"
 
 
-def _verify_document_token(token: str) -> str | None:
+def _verify_document_token(document_id: str, token: str) -> AccountContext | None:
+    """The account whose uploads ``token`` opens for ``document_id``, or None once deactivated."""
     try:
-        document_id, exp_s, sig = token.rsplit(".", 2)
+        exp_s, account_id, sig = token.split(".", 2)
     except ValueError:
         return None
-    expected = hmac.new(
-        _PREVIEW_SECRET, f"{document_id}.{exp_s}".encode(), hashlib.sha256
-    ).hexdigest()
-    if not hmac.compare_digest(sig, expected):
+    if "." in sig:
+        return None
+    if not hmac.compare_digest(sig, _document_mac(document_id, exp_s, account_id)):
         return None
     try:
         if int(exp_s) < int(time.time()):
             return None
     except ValueError:
         return None
-    return document_id
+    if not account_id:
+        return OWNER
+    from auth.storage import get_account_by_id
 
-
-@router.get("/documents/{document_id}/preview-target")
-def preview_target(
-    document_id: str,
-    chunk_id: str | None = Query(default = None),
-    subject: str = Depends(get_current_subject),
-) -> dict:
-    """Resolve a citation to filename, page, and highlight regions."""
-    _require_rag()
-    conn = _rag_connection()
-    try:
-        doc = store.get_visible_document(conn, document_id)
-        if doc is None:
-            raise HTTPException(status_code = 404, detail = "Document not found")
-        _require_document_owner(conn, doc)
-        ext = os.path.splitext(doc["filename"])[1].lower()
-        out = {
-            "documentId": document_id,
-            "filename": doc["filename"],
-            "mediaKind": "pdf" if ext == ".pdf" else "text",
-            "targetPage": None,
-            "pdfRegions": [],
-            "text": None,
-        }
-        if chunk_id:
-            row = conn.execute(
-                "SELECT text, page_number, pdf_regions_json FROM chunks "
-                "WHERE id=? AND document_id=?",
-                (chunk_id, document_id),
-            ).fetchone()
-            if row is not None:
-                out["text"] = row["text"]
-                out["targetPage"] = row["page_number"]
-                if row["pdf_regions_json"]:
-                    try:
-                        out["pdfRegions"] = json.loads(row["pdf_regions_json"])
-                    except Exception:
-                        out["pdfRegions"] = []
-        return out
-    finally:
-        conn.close()
+    account = get_account_by_id(account_id)
+    return None if account is None or account.is_owner else account
 
 
 @router.get("/documents/{document_id}/file-url")
@@ -1061,25 +1146,28 @@ def document_file_url(
 def document_file_signed(document_id: str, token: str = Query(...)) -> FileResponse:
     """Serve the source file gated by the HMAC token (no bearer) so pdf.js range
     requests work."""
-    # Token first: this is the one endpoint with no bearer, and _require_rag() now opens
-    # a connection on its first call, which is not work an unverified token should buy.
-    signed_id = _verify_document_token(token)
-    if signed_id != document_id:
+    # Verify the token first: this endpoint has no bearer auth.
+    account = _verify_document_token(document_id, token)
+    if account is None:
         raise HTTPException(status_code = 401, detail = "Invalid or expired token")
-    _require_rag()
-    conn = _rag_connection()
+    # No auth dependency on this route, so without this bind every read hits the owner's store.
+    marker = bind_account(account)
     try:
-        doc = store.get_visible_document(conn, document_id)
-        if doc is not None:
-            _require_document_owner(conn, doc)
+        _require_rag()
+        conn = _rag_connection()
+        try:
+            doc = store.get_visible_document(conn, document_id)
+            if doc is not None:
+                _require_document_owner(conn, doc)
+        finally:
+            conn.close()
+        stored_path = (doc or {}).get("stored_path")
+        if not doc or not stored_path or not os.path.isfile(stored_path):
+            raise HTTPException(status_code = 404, detail = "Document file not found")
+        if not _is_managed_preview_path(stored_path):
+            raise HTTPException(status_code = 403, detail = "Forbidden")
     finally:
-        conn.close()
-    stored_path = (doc or {}).get("stored_path")
-    if not doc or not stored_path or not os.path.isfile(stored_path):
-        raise HTTPException(status_code = 404, detail = "Document file not found")
-    # Confine to the uploads root (defense in depth).
-    if not _is_managed_preview_path(stored_path):
-        raise HTTPException(status_code = 403, detail = "Forbidden")
+        reset_account(marker)
     ext = os.path.splitext(doc["filename"])[1].lower()
     return FileResponse(
         stored_path,

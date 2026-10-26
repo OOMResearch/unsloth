@@ -1,17 +1,21 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Regression test for unslothai/unsloth#9326.
-
-When `embed_tokens` and/or `lm_head` are listed in `target_modules`, Unsloth's
-fast regex path would silently drop them because they do not sit under an
-attention/MLP ancestor.  The fix auto-moves them to `modules_to_save` and
-warns once, which also makes `embedding_learning_rate` work.
-"""
+"""embed_tokens and lm_head in target_modules are auto-moved to modules_to_save, not dropped."""
 
 import os
 import pytest
 import torch
+
+
+def _shared_setup_1():
+    from unsloth import FastLanguageModel
+    model, _ = FastLanguageModel.from_pretrained(
+        model_name = MODEL_NAME,
+        load_in_4bit = True,
+        max_seq_length = 512,
+    )
+    return FastLanguageModel, model
 
 
 pytestmark = pytest.mark.skipif(
@@ -68,13 +72,12 @@ def _run_redirect_check(new_model_path: bool, target_modules):
 
         assert any("layers.0.self_attn.q_proj.lora_A" in k for k in state)
 
-        # embed_tokens/lm_head must be trainable via ModulesToSave, not LoRA
         assert any(
             "embed_tokens.modules_to_save.default.weight" in k and v.requires_grad
             for k, v in state.items()
         )
         if tied:
-            # Tying keeps ONE trainable matrix instead of a second, divergent copy.
+            # Tying keeps one trainable matrix instead of a second, divergent copy.
             assert "lm_head" not in saved_modules, saved_modules
             assert model.get_output_embeddings().weight.requires_grad
         else:
@@ -110,13 +113,7 @@ def test_embed_lm_head_target_redirect(new_model_path: bool, target_modules):
 @pytest.mark.slow
 def test_a_repeat_call_with_the_same_targets_still_passes_through():
     """A tied lm_head lands in modules_to_tie, which the equality check has to count."""
-    from unsloth import FastLanguageModel
-
-    model, _ = FastLanguageModel.from_pretrained(
-        model_name = MODEL_NAME,
-        load_in_4bit = True,
-        max_seq_length = 512,
-    )
+    FastLanguageModel, model = _shared_setup_1()
     try:
         kwargs = dict(r = 8, lora_alpha = 16, target_modules = list(TARGET_MODULES))
         model = FastLanguageModel.get_peft_model(model, **kwargs)
@@ -124,8 +121,6 @@ def test_a_repeat_call_with_the_same_targets_still_passes_through():
             model.peft_config["default"], "modules_to_tie", None
         ), "tied model did not redirect lm_head; this guard would check nothing"
         model = FastLanguageModel.get_peft_model(model, **kwargs)
-        # Same configuration, written the other way round: the embeddings named directly in modules_to_save rather than
-        # reached through the redirect.
         model = FastLanguageModel.get_peft_model(
             model,
             r = 8,
@@ -181,13 +176,7 @@ def test_dropping_the_embeddings_from_a_repeat_call_is_not_silently_ignored(firs
 def test_qualified_targets_are_not_collapsed_to_their_leaf():
     """Only PEFT's model.embed_tokens alias is folded away. layers.0.q_proj is a real
     request and is not the same module as layers.1.q_proj."""
-    from unsloth import FastLanguageModel
-
-    model, _ = FastLanguageModel.from_pretrained(
-        model_name = MODEL_NAME,
-        load_in_4bit = True,
-        max_seq_length = 512,
-    )
+    FastLanguageModel, model = _shared_setup_1()
     try:
         model = FastLanguageModel.get_peft_model(
             model,
@@ -212,13 +201,7 @@ def test_qualified_targets_are_not_collapsed_to_their_leaf():
 def test_flipping_ensure_weight_tying_is_seen_as_a_different_request():
     """Tying is not in check_parameters and leaves both name lists identical, so it has
     to be compared on its own or the caller's request is silently ignored."""
-    from unsloth import FastLanguageModel
-
-    model, _ = FastLanguageModel.from_pretrained(
-        model_name = MODEL_NAME,
-        load_in_4bit = True,
-        max_seq_length = 512,
-    )
+    FastLanguageModel, model = _shared_setup_1()
     try:
         kwargs = dict(r = 8, lora_alpha = 16, target_modules = list(TARGET_MODULES))
         model = FastLanguageModel.get_peft_model(model, **kwargs)
@@ -266,13 +249,7 @@ def test_a_classification_repeat_call_is_not_tripped_by_peft_added_modules():
 @pytest.mark.slow
 def test_embedding_only_target_list_raises_instead_of_training_nothing():
     """Redirecting every target would leave an adapter with no trainable LoRA."""
-    from unsloth import FastLanguageModel
-
-    model, _ = FastLanguageModel.from_pretrained(
-        model_name = MODEL_NAME,
-        load_in_4bit = True,
-        max_seq_length = 512,
-    )
+    FastLanguageModel, model = _shared_setup_1()
     try:
         with pytest.raises(RuntimeError, match = "target_modules` is now empty"):
             FastLanguageModel.get_peft_model(

@@ -2,140 +2,61 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 
-const script = readFileSync(
-  new URL("../public/reload-snapshot.js", import.meta.url),
-  "utf8",
-);
-const indexHtml = readFileSync(
-  new URL("../index.html", import.meta.url),
-  "utf8",
-);
-const indexCss = readFileSync(
-  new URL("../src/index.css", import.meta.url),
-  "utf8",
-);
-const rootRouteSource = readFileSync(
-  new URL("../src/app/routes/__root.tsx", import.meta.url),
-  "utf8",
-);
-const runtimeProviderSource = readFileSync(
-  new URL("../src/features/chat/runtime-provider.tsx", import.meta.url),
-  "utf8",
-);
-const chatPageSource = readFileSync(
-  new URL("../src/features/chat/chat-page.tsx", import.meta.url),
-  "utf8",
-);
-const sharedComposerSource = readFileSync(
-  new URL("../src/features/chat/shared-composer.tsx", import.meta.url),
-  "utf8",
-);
-const imageDropzoneSource = readFileSync(
-  new URL("../src/components/image-dropzone.tsx", import.meta.url),
-  "utf8",
-);
-const attachmentPreviewSource = readFileSync(
-  new URL(
-    "../src/components/assistant-ui/attachment-preview.tsx",
-    import.meta.url,
-  ),
-  "utf8",
-);
+import { readSrc, readText } from "./helpers/kit.ts";
+import { readAudioWorkspaceSource } from "./helpers/audio-workspace.ts";
 
-const attachmentSource = readFileSync(
-  new URL("../src/components/assistant-ui/attachment.tsx", import.meta.url),
-  "utf8",
-);
-const imagesPageSource = readFileSync(
-  new URL("../src/features/images/images-page.tsx", import.meta.url),
-  "utf8",
-);
-const videoPageSource = readFileSync(
-  new URL("../src/features/video/video-page.tsx", import.meta.url),
-  "utf8",
-);
-const audioPageSource = readFileSync(
-  new URL("../src/features/audio/audio-page.tsx", import.meta.url),
-  "utf8",
-);
-const hubPageSource = readFileSync(
-  new URL("../src/features/hub/hub-page.tsx", import.meta.url),
-  "utf8",
-);
-const referencePickerSource = readFileSync(
-  new URL("../src/features/video/reference-picker.tsx", import.meta.url),
-  "utf8",
-);
+const script = readText("../public/reload-snapshot.js");
+const indexHtml = readText("../index.html");
+const indexCss = readSrc("index.css");
+const rootRouteSource = readSrc("app/routes/__root.tsx");
+const runtimeProviderSource = readSrc("features/chat/runtime-provider.tsx");
+const chatPageSource = readSrc("features/chat/chat-page.tsx");
+const sharedComposerSource = readSrc("features/chat/shared-composer.tsx");
+const imageDropzoneSource = readSrc("components/image-dropzone.tsx");
+const attachmentPreviewSource = readSrc("components/assistant-ui/attachment-preview.tsx");
 
-const unstructuredDropZoneSource = readFileSync(
-  new URL(
-    "../src/features/recipe-studio/dialogs/seed/unstructured-drop-zone.tsx",
-    import.meta.url,
-  ),
-  "utf8",
-);
+const attachmentSource = readSrc("components/assistant-ui/attachment.tsx");
+const imagesPageSource = readSrc("features/images/images-page.tsx");
+const videoPageSource = readSrc("features/video/video-page.tsx");
+const audioPageSource = readAudioWorkspaceSource();
+const hubPageSource = readSrc("features/hub/hub-page.tsx");
+const referencePickerSource = readSrc("features/video/reference-picker.tsx");
 
-const projectsPageSource = readFileSync(
-  new URL("../src/features/chat/projects-page.tsx", import.meta.url),
-  "utf8",
-);
+const unstructuredDropZoneSource = readSrc("features/recipe-studio/dialogs/seed/unstructured-drop-zone.tsx");
 
-const seedDialogSource = readFileSync(
-  new URL(
-    "../src/features/recipe-studio/dialogs/seed/seed-dialog.tsx",
-    import.meta.url,
-  ),
-  "utf8",
-);
+const projectsPageSource = readSrc("features/chat/projects-page.tsx");
 
-const projectSourceDropzoneSource = readFileSync(
-  new URL(
-    "../src/features/rag/components/project-source-dropzone.tsx",
-    import.meta.url,
-  ),
-  "utf8",
-);
-const dataRecipesPageSource = readFileSync(
-  new URL(
-    "../src/features/data-recipes/pages/data-recipes-page.tsx",
-    import.meta.url,
-  ),
-  "utf8",
-);
-const editRecipePageSource = readFileSync(
-  new URL(
-    "../src/features/data-recipes/pages/edit-recipe-page.tsx",
-    import.meta.url,
-  ),
-  "utf8",
-);
-const exportPageSource = readFileSync(
-  new URL("../src/features/export/export-page.tsx", import.meta.url),
-  "utf8",
-);
-const studioPageSource = readFileSync(
-  new URL("../src/features/studio/studio-page.tsx", import.meta.url),
-  "utf8",
-);
-const apiMonitorPageSource = readFileSync(
-  new URL("../src/features/api-monitor/api-monitor-page.tsx", import.meta.url),
-  "utf8",
-);
-const authFormSource = readFileSync(
-  new URL("../src/features/auth/components/auth-form.tsx", import.meta.url),
-  "utf8",
-);
+const seedDialogSource = readSrc("features/recipe-studio/dialogs/seed/seed-dialog.tsx");
+
+const projectSourceDropzoneSource = readSrc("features/rag/components/project-source-dropzone.tsx");
+const dataRecipesPageSource = readSrc("features/data-recipes/pages/data-recipes-page.tsx");
+const editRecipePageSource = readSrc("features/data-recipes/pages/edit-recipe-page.tsx");
+const exportPageSource = readSrc("features/export/export-page.tsx");
+const studioPageSource = readSrc("features/studio/studio-page.tsx");
+const apiMonitorPageSource = readSrc("features/api-monitor/api-monitor-page.tsx");
+const authFormSource = readSrc("features/auth/components/auth-form.tsx");
+
+test("scoped readiness still emits the reload snapshot event", () => {
+  const readinessSource = readSrc("components/app-readiness.ts");
+  assert.match(readinessSource, /function signalReloadSnapshotReady\(\): void \{\s*window\.dispatchEvent\(new Event\("unsloth:app-shell-ready"\)\)/);
+  assert.match(readinessSource, /signalReady: \(\) => \{\s*if \(!active\) return;\s*onReady\(\);\s*signalReloadSnapshotReady\(\)/);
+  assert.match(readinessSource, /value: scope\.signalReady/);
+  assert.match(readinessSource, /return useContext\(AppShellReadyContext\)/);
+  for (const source of [rootRouteSource, runtimeProviderSource, chatPageSource,
+    hubPageSource, projectsPageSource, dataRecipesPageSource, editRecipePageSource,
+    exportPageSource, studioPageSource, apiMonitorPageSource, authFormSource]) {
+    assert.match(source, /useAppShellReadySignal/);
+  }
+});
+
 
 type Listener = (event: Record<string, unknown>) => void;
 
-/** A node of the fake #root subtree the capture walks. */
 interface ElementSpec {
   tag: string;
-  /** Live DOM state React writes as a property rather than an attribute. */
   value?: string;
   checked?: boolean;
   selected?: boolean;
@@ -159,7 +80,6 @@ interface ElementSpec {
   videoHeight?: number;
   width?: number;
   height?: number;
-  /** [top, right, bottom, left]. Ignored for a `display: contents` box. */
   rect?: [number, number, number, number];
   text?: string;
   children?: ElementSpec[];
@@ -266,8 +186,7 @@ function createElement(spec: ElementSpec, parent: StubElement | null = null) {
       return null;
     },
     getBoundingClientRect() {
-      // Chromium, Firefox and WebKit all report an empty rectangle for a box
-      // that is not laid out, whatever its children cover.
+      // Browsers report an empty rect for a box that is not laid out.
       const [top, right, bottom, left] =
         spec.display === "contents"
           ? [0, 0, 0, 0]
@@ -348,7 +267,6 @@ function createElement(spec: ElementSpec, parent: StubElement | null = null) {
   return element;
 }
 
-/** Enough of CSSStyleDeclaration for the inline custom properties on <html>. */
 type StubStyle = {
   length: number;
   getPropertyValue(name: string): string;
@@ -403,6 +321,8 @@ function createEnvironment(options: {
   const fontFaces: Array<{ family: string; source: string }> = [];
   const appended: Array<{ innerHTML: string; removed: boolean }> = [];
   let scrollRestoreCalls = 0;
+  let attributeObserver: ((records: { attributeName: string }[]) => void) | null = null;
+  let observingAttributes = false;
   const bodyTree = options.rootTree
     ? createElement({
         tag: "body",
@@ -448,6 +368,9 @@ function createEnvironment(options: {
     },
     removeAttribute: (name: string) => {
       htmlAttributes.delete(name);
+    },
+    get attributes() {
+      return [...htmlAttributes].map(([name, value]) => ({ name, value }));
     },
     appendChild(element: { innerHTML: string; removed: boolean }) {
       appended.push(element);
@@ -519,6 +442,11 @@ function createEnvironment(options: {
         setAttribute(name: string, value: string) {
           element.attributes[name] = value;
         },
+        toggleAttribute(name: string, force: boolean) {
+          if (force) element.attributes[name] = "";
+          else delete element.attributes[name];
+          return force;
+        },
         getAttribute(name: string) {
           return element.attributes[name] ?? null;
         },
@@ -563,9 +491,20 @@ function createEnvironment(options: {
       // Timer bookkeeping is outside this lifecycle test.
     },
     document,
+    MutationObserver: class {
+      constructor(callback: (records: { attributeName: string }[]) => void) {
+        attributeObserver = callback;
+      }
+      observe(target: unknown, options: { attributes: boolean }) {
+        assert.equal(target, documentElement);
+        assert.equal(options.attributes, true);
+        observingAttributes = true;
+      }
+      disconnect() {
+        observingAttributes = false;
+      }
+    },
     getComputedStyle: (element: StubElement) =>
-      // <html> resolves to its own declaration block, which is where the
-      // design tokens the copy has to carry are read from.
       (element as unknown) === documentElement
         ? documentElement.style
         : {
@@ -612,10 +551,17 @@ function createEnvironment(options: {
     appended,
     htmlVariables: documentElement.style,
     htmlAttributes,
+    get observingAttributes() {
+      return observingAttributes;
+    },
+    changeRootAttribute(name: string, value: string | null) {
+      if (value === null) htmlAttributes.delete(name);
+      else htmlAttributes.set(name, value);
+      if (observingAttributes) attributeObserver?.([{ attributeName: name }]);
+    },
     get scrollRestoreCalls() {
       return scrollRestoreCalls;
     },
-    /** The host element of the retained shell, if one was restored. */
     get shell() {
       const host = appended[0] as unknown as
         | {
@@ -820,17 +766,13 @@ test("mirrors Temporary Chat privacy and lets history completion retire chat she
   );
   assert.match(
     runtimeProviderSource,
-    /async load\(\) \{[\s\S]*?const completeLoad =[\s\S]*?unsloth:app-shell-ready[\s\S]*?await loadGenerationOverlaySnapshot\([\s\S]*?listStoredChatMessages[\s\S]*?return completeLoad/,
+    /async load\(\) \{[\s\S]*?const completeLoad =[\s\S]*?signalReady\(\)[\s\S]*?await loadGenerationOverlaySnapshot\([\s\S]*?listStoredChatMessages[\s\S]*?return completeLoad/,
   );
   assert.match(
     runtimeProviderSource,
     /!reloadReadyThreadId \|\| loadedThreadId === reloadReadyThreadId/,
   );
-  // The rejection arm is a .then(onFulfilled, onRejected) pair since #8908, which needs
-  // both outcomes: that PR retires the switch's claim on either. What this guards is
-  // unchanged -- a failed switchToThread still releases the retained shell -- and the
-  // call must stay AHEAD of that PR's staleness guard, since a superseded attempt is
-  // still an attempt that ended and the shell would otherwise wait for ever.
+  // A failed switchToThread must release the shell, ahead of the staleness guard.
   assert.match(
     runtimeProviderSource,
     /switchToThread\(threadId\)[\s\S]*?\.then\([\s\S]*?onSwitchFailed\?\.\(\)/,
@@ -845,15 +787,13 @@ test("mirrors Temporary Chat privacy and lets history completion retire chat she
   );
   assert.match(
     runtimeProviderSource,
-    /const signalFailedInitialSwitchReady = useCallback[\s\S]*?onInitialHistoryReady\(\)[\s\S]*?unsloth:app-shell-ready[\s\S]*?onSwitchFailed=\{signalFailedInitialSwitchReady\}/,
+    /const signalFailedInitialSwitchReady = useCallback[\s\S]*?onInitialHistoryReady\(\)[\s\S]*?signalReady\(\)[\s\S]*?onSwitchFailed=\{signalFailedInitialSwitchReady\}/,
   );
   assert.match(
     runtimeProviderSource,
     /createRuntimeHook\([\s\S]*?modelType,[\s\S]*?pairId,[\s\S]*?initialThreadId,[\s\S]*?onInitialHistoryReady/,
   );
-  // A compare pane reports readiness through onInitialHistoryReady, and its
-  // runtime bootstraps on an empty thread first, so this branch must check the
-  // thread or both panes go ready while their conversations still load.
+  // Compare panes bootstrap on an empty thread first, so readiness must check the thread.
   assert.match(
     runtimeProviderSource,
     /const completeLoad =[\s\S]*?if \(onInitialHistoryReady\) \{\s*if \(loadedTheRequestedThread\) onInitialHistoryReady\(\);/,
@@ -864,7 +804,7 @@ test("mirrors Temporary Chat privacy and lets history completion retire chat she
   );
   assert.match(
     chatPageSource,
-    /state\.panes\.add\(pane\)[\s\S]*?state\.panes\.size < 2[\s\S]*?unsloth:app-shell-ready/,
+    /state\.panes\.add\(pane\)[\s\S]*?state\.panes\.size < 2[\s\S]*?signalReady\(\)/,
   );
   assert.match(
     chatPageSource,
@@ -880,7 +820,7 @@ test("mirrors Temporary Chat privacy and lets history completion retire chat she
   );
   assert.match(
     chatPageSource,
-    /const previewsReady = items\.every[\s\S]*?!dataLoaded \|\|[\s\S]*?!runtimeReady \|\|[\s\S]*?!previewsReady \|\|[\s\S]*?unsloth:app-shell-ready/,
+    /const previewsReady = items\.every[\s\S]*?!dataLoaded \|\|[\s\S]*?!runtimeReady \|\|[\s\S]*?!previewsReady \|\|[\s\S]*?signalReady\(\)/,
   );
   assert.match(
     chatPageSource,
@@ -935,11 +875,11 @@ test("data-backed routes own reload readiness until hydration settles", () => {
   );
   assert.match(
     hubPageSource,
-    /!initialResidentStatusSettled[\s\S]*?\(isDiscoverTab \? isLoading : !inventorySettled\)[\s\S]*?unsloth:app-shell-ready/,
+    /!initialResidentStatusSettled[\s\S]*?\(isDiscoverTab \? isLoading : !inventorySettled\)[\s\S]*?signalReady\(\)/,
   );
   assert.match(
     projectsPageSource,
-    /if \(!hasLoaded \|\| reloadReadySent\.current\) \{\s*return;\s*\}[\s\S]*?unsloth:app-shell-ready/,
+    /if \(!hasLoaded \|\| reloadReadySent\.current\) \{\s*return;\s*\}[\s\S]*?signalReady\(\)/,
   );
   assert.match(
     rootRouteSource,
@@ -947,32 +887,32 @@ test("data-backed routes own reload readiness until hydration settles", () => {
   );
   assert.match(
     dataRecipesPageSource,
-    /if \(!ready \|\| reloadReadySent\.current\) \{\s*return;\s*\}[\s\S]*?unsloth:app-shell-ready/,
+    /if \(!ready \|\| reloadReadySent\.current\) \{\s*return;\s*\}[\s\S]*?signalReady\(\)/,
   );
   assert.match(
     editRecipePageSource,
-    /if \(loadState\.status === "loading" \|\| reloadReadySent\.current\) \{\s*return;\s*\}[\s\S]*?unsloth:app-shell-ready/,
+    /if \(loadState\.status === "loading" \|\| reloadReadySent\.current\) \{\s*return;\s*\}[\s\S]*?signalReady\(\)/,
   );
   assert.match(rootRouteSource, /pathname === "\/export"/);
   assert.match(
     exportPageSource,
-    /loadingCheckpoints \|\|[\s\S]*?isLoadingLocalModels \|\|[\s\S]*?unsloth:app-shell-ready/,
+    /loadingCheckpoints \|\|[\s\S]*?isLoadingLocalModels \|\|[\s\S]*?signalReady\(\)/,
   );
   assert.match(rootRouteSource, /pathname === "\/studio"/);
   assert.match(
     studioPageSource,
-    /capabilitiesUnknown \|\|[\s\S]*?!hasHydratedRuntime \|\|[\s\S]*?isHydratingRuntime \|\|[\s\S]*?unsloth:app-shell-ready/,
+    /capabilitiesUnknown \|\|[\s\S]*?!hasHydratedRuntime \|\|[\s\S]*?isHydratingRuntime \|\|[\s\S]*?signalReady\(\)/,
   );
   assert.match(rootRouteSource, /pathname === "\/api-monitor"/);
   assert.match(
     apiMonitorPageSource,
-    /if \(loading \|\| reloadReadySent\.current\) \{\s*return;\s*\}[\s\S]*?unsloth:app-shell-ready/,
+    /if \(loading \|\| reloadReadySent\.current\) \{\s*return;\s*\}[\s\S]*?signalReady\(\)/,
   );
   assert.match(rootRouteSource, /pathname === "\/login"/);
   assert.match(rootRouteSource, /pathname === "\/change-password"/);
   assert.match(
     authFormSource,
-    /if \(statusLoading \|\| reloadReadySent\.current\) return;[\s\S]*?unsloth:app-shell-ready/,
+    /if \(statusLoading \|\| reloadReadySent\.current\) return;[\s\S]*?signalReady\(\)/,
   );
 });
 
@@ -1044,8 +984,7 @@ test("restores scroll offsets again after linked styles load", () => {
 });
 
 test("keeps what a display:contents wrapper renders, drops what is offscreen", () => {
-  // A `display: contents` box is not laid out, so its rectangle is empty even
-  // while its children fill the viewport: /studio wraps its whole page in one.
+  // /studio wraps its page in a display: contents box, whose rect is empty.
   const environment = createEnvironment({
     navigationType: "navigate",
     rootTree: {
@@ -1075,8 +1014,7 @@ test("keeps what a display:contents wrapper renders, drops what is offscreen", (
 });
 
 test("carries the appearance customization so the shell paints in its own colors", () => {
-  // theme-boot.js resolves mode and palette only; the rest lands in a React
-  // effect, which is well after the restored shell has painted.
+  // theme-boot.js resolves mode and palette only; the rest lands in a later React effect.
   const outgoing = createEnvironment({
     navigationType: "navigate",
     rootHtml: "<main>Existing chat</main>",
@@ -1116,21 +1054,6 @@ test("carries the appearance customization so the shell paints in its own colors
   assert.equal(
     incoming.htmlVariables.getPropertyValue("--studio-sidebar-live-width"),
     "",
-  );
-});
-
-test("adapts root-scoped palette state to the snapshot shell", () => {
-  assert.match(
-    indexCss,
-    /\.reload-snapshot-shell:not\(\[data-palette\]\)[\s\S]*?\.palette-card\[data-palette-value="standard"\]/,
-  );
-  assert.match(
-    indexCss,
-    /\.reload-snapshot-shell\[data-palette="classic"\][\s\S]*?\.palette-card\[data-palette-value="classic"\]/,
-  );
-  assert.match(
-    indexCss,
-    /\.reload-snapshot-shell\[data-palette="minimal"\][\s\S]*?\.palette-card\[data-palette-value="minimal"\]/,
   );
 });
 
@@ -1194,9 +1117,7 @@ test("loads selected imported fonts before revealing the shell", async () => {
 });
 
 test("drops the retained shell's animations instead of pausing them", () => {
-  // Not reachable from the script tests: a paused animation holds its FIRST
-  // keyframe, so `animate-in fade-in` entrances would render at opacity 0 for
-  // as long as the shell is up. Only the stylesheet can express this.
+  // A paused animation holds its first keyframe, so fade-in entrances would stay invisible.
   const start = indexCss.indexOf(".reload-snapshot-shell *,");
   assert.ok(start > 0);
   const rule = indexCss.slice(start, indexCss.indexOf("}", start));
@@ -1205,8 +1126,7 @@ test("drops the retained shell's animations instead of pausing them", () => {
 });
 
 test("leaves the retained shell click-through", () => {
-  // A full-viewport overlay that takes pointer events swallows every click for
-  // as long as it is up, which is up to the five-second fail-open.
+  // A pointer-capturing overlay would swallow clicks until the five-second fail-open.
   const start = indexCss.indexOf(".reload-snapshot {");
   assert.ok(start > 0);
   const rule = indexCss.slice(start, indexCss.indexOf("}", start));
@@ -1214,8 +1134,7 @@ test("leaves the retained shell click-through", () => {
 });
 
 test("builds the retained shell inside a closed shadow tree", () => {
-  // The copy duplicates the live markup, so leaving it in the page tree makes
-  // every `textarea[aria-label=...]` style query ambiguous while it is up.
+  // Left in the page tree, the copy makes aria-label queries ambiguous.
   const outgoing = createEnvironment({
     navigationType: "navigate",
     rootHtml: "<main>Existing chat</main>",
@@ -1245,14 +1164,11 @@ test("builds the retained shell inside a closed shadow tree", () => {
     "/assets/index-abc123.css",
     "/assets/chat-def456.css",
   ]);
-  // The shell's own rules live in that stylesheet and hang off this marker.
   assert.match(incoming.shell?.rootClass ?? "", /^reload-snapshot-shell /);
 });
 
 test("roots the copy in an html element so html-anchored rules still match", () => {
-  // 80-odd rules in the app stylesheet are anchored on `html`, light/dark
-  // theming above all, and a selector cannot reach across the shadow boundary
-  // to the real document element.
+  // Many app rules anchor on `html`, which selectors cannot reach across the shadow boundary.
   const outgoing = createEnvironment({
     navigationType: "navigate",
     rootHtml: "<main>Existing chat</main>",
@@ -1275,9 +1191,50 @@ test("roots the copy in an html element so html-anchored rules still match", () 
   });
 });
 
+test("gives the copy's root the live root's viewport gates, so width-gated rules match the same", () => {
+  const outgoing = createEnvironment({
+    navigationType: "navigate",
+    rootHtml: "<main>Existing chat</main>",
+    styleSheets: ["/assets/index-abc123.css"],
+    htmlAttributes: { "data-palette": "classic" },
+  });
+  outgoing.dispatch("pageswap", {
+    activation: { navigationType: "reload" },
+  });
+
+  const incoming = createEnvironment({
+    navigationType: "reload",
+    storage: outgoing.storage,
+    htmlAttributes: {
+      lang: "en",
+      "data-mq-min-width-40rem": "",
+      "data-mq-min-width-48rem": "",
+    },
+  });
+  assert.deepEqual(incoming.shell?.rootAttributes, {
+    "data-palette": "classic",
+    "data-mq-min-width-40rem": "",
+    "data-mq-min-width-48rem": "",
+  });
+  incoming.changeRootAttribute("data-mq-min-width-48rem", null);
+  incoming.changeRootAttribute("data-mq-min-width-64rem", "");
+  incoming.changeRootAttribute("data-palette", "changed");
+  assert.deepEqual(incoming.shell?.rootAttributes, {
+    "data-palette": "classic",
+    "data-mq-min-width-40rem": "",
+    "data-mq-min-width-64rem": "",
+  });
+  assert.equal(incoming.observingAttributes, true);
+  incoming.dispatch("unsloth:app-shell-ready");
+  incoming.runAnimationFrame();
+  incoming.runAnimationFrame();
+  assert.equal(incoming.observingAttributes, false);
+  incoming.changeRootAttribute("data-mq-min-width-40rem", null);
+  assert.equal(incoming.shell?.rootAttributes["data-mq-min-width-40rem"], "");
+});
+
 test("freezes the design tokens onto the copy's own root", () => {
-  // `:root` matches a document's root element only, so tokens declared there
-  // never reach a shadow tree; the copy carries the resolved set instead.
+  // `:root` tokens never reach a shadow tree, so the copy carries the resolved set.
   const outgoing = createEnvironment({
     navigationType: "navigate",
     rootHtml: "<main>Existing chat</main>",
@@ -1301,9 +1258,7 @@ test("freezes the design tokens onto the copy's own root", () => {
 });
 
 test("carries live form state, except what sensitive fields hide", () => {
-  // React writes value/checked as DOM properties; cloneNode copies attributes,
-  // so a typed composer would come back empty. Secret fields can be revealed as
-  // plain text, but their values must stay behind regardless of presentation.
+  // cloneNode copies attributes, not React's value/checked properties; secrets must stay behind.
   const environment = createEnvironment({
     navigationType: "navigate",
     styleSheets: ["/assets/index-abc123.css"],
@@ -1374,8 +1329,7 @@ test("carries live form state, except what sensitive fields hide", () => {
           attributes: { "data-reload-snapshot-sensitive": "" },
         },
         {
-          // A filename row repeats the value in its tooltip and in the
-          // accessible name beside it, so clearing text alone still ships it.
+          // The value also appears in the tooltip and accessible name, so clearing text is not enough.
           tag: "span",
           rect: [0, 1440, 560, 0],
           text: "rendered-local-filename.csv",
@@ -1450,8 +1404,7 @@ test("carries live form state, except what sensitive fields hide", () => {
     imageDropzoneSource,
     /if \(value\)[\s\S]*?data-reload-snapshot-sensitive/,
   );
-  // A picked file's NAME renders outside the file input in several places that
-  // neither type=file nor a marked ancestor reaches: the dialogs portal out.
+  // Picked file names render outside the input in portaled dialogs.
   assert.match(
     referencePickerSource,
     /if \(value\)[\s\S]*?data-reload-snapshot-sensitive[\s\S]*?value\.name/,
@@ -1468,8 +1421,6 @@ test("carries live form state, except what sensitive fields hide", () => {
     seedDialogSource,
     /data-reload-snapshot-sensitive[\s\S]*?localFile\?\.name/,
   );
-  // The monitor renders prompt/reply text in three places, not just the
-  // expanded payload: every row's excerpt, and a lifecycle row's error text.
   assert.match(
     apiMonitorPageSource,
     /function PayloadBlock[\s\S]*?data-reload-snapshot-sensitive/,
@@ -1484,10 +1435,8 @@ test("carries live form state, except what sensitive fields hide", () => {
   );
   assert.match(
     sharedComposerSource,
-    /data-reload-snapshot-sensitive[\s\S]*?pendingAudio\.name/,
+    /pendingAudio\.map\([\s\S]*?data-reload-snapshot-sensitive[\s\S]*?\{clip\.name\}/,
   );
-  // Both carriers: the tooltip on the name, and the accessible name on the
-  // remove button, a sibling no ancestor marker would reach.
   assert.match(
     projectSourceDropzoneSource,
     /data-reload-snapshot-sensitive[\s\S]*?title=\{entry\.name\}/,
@@ -1500,25 +1449,34 @@ test("carries live form state, except what sensitive fields hide", () => {
     attachmentSource,
     /export const ComposerAttachments[\s\S]*?data-reload-snapshot-sensitive/,
   );
-  // The dialog lives in attachment-preview.tsx; attachment.tsx passes the flag.
   assert.match(attachmentSource, /<AttachmentPreviewDialog redactFromReload=/);
   assert.match(
     attachmentPreviewSource,
     /AttachmentPreviewDialog[\s\S]*?redactFromReload/,
   );
   for (const dialog of [
-    "AttachmentImageDialog",
+    "ImageGalleryDialog",
     "AttachmentTextDialog",
     "AttachmentAudioDialog",
   ]) {
+    const body = attachmentPreviewSource.slice(
+      attachmentPreviewSource.indexOf(`const ${dialog}: FC`),
+    );
     assert.match(
-      attachmentPreviewSource,
-      new RegExp(
-        `${dialog}[\\s\\S]*?data-reload-snapshot-sensitive=\\{redactFromReload \\? "" : undefined\\}`,
-      ),
+      body,
+      /^[\s\S]*?<AttachmentViewer[\s\S]*?redactFromReload=\{redactFromReload\}/,
       `${dialog} must redact its portaled content`,
     );
   }
+  const viewer = readSrc("components/assistant-ui/attachment-document-dialog.tsx");
+  assert.match(
+    viewer,
+    /export const AttachmentViewer[\s\S]*?<MediaViewer[\s\S]*?redactFromReload=\{redactFromReload\}/,
+  );
+  assert.match(
+    readSrc("components/media-viewer.tsx"),
+    /data-reload-snapshot-sensitive=\{redactFromReload \? "" : undefined\}/,
+  );
 });
 
 test("keeps native select options that paint the closed control label", () => {
@@ -1789,9 +1747,7 @@ test("keeps trusted chart CSS while stripping every other style", () => {
 });
 
 test("keeps the shell when materialized media alone passes the cap", () => {
-  // capturePixels rasterizes at devicePixelRatio, so the same page costs 4x on
-  // a 2x display. Discarding the whole snapshot there puts back the blank
-  // flash this exists to remove; drop the pixels and keep the layout instead.
+  // Pixels cost 4x on 2x displays; drop the pixels but keep the layout instead of the snapshot.
   const tiles = Array.from({ length: 6 }, (_, index) => ({
     tag: "img",
     rect: [10 + index, 400, 200 + index, 200] as [number, number, number, number],
@@ -1854,8 +1810,6 @@ test("materializes visible canvas pixels into the retained shell", () => {
 });
 
 test("skips the shell when the snapshot carries no stylesheets", () => {
-  // Without them the copy paints unstyled inside the shadow tree, which reads
-  // worse than the blank interval this replaces.
   const outgoing = createEnvironment({
     navigationType: "navigate",
     rootHtml: "<main>Existing chat</main>",

@@ -2,6 +2,7 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import type { HfModelResult } from "@/features/hub/hooks/use-hub-model-search";
+import { getHfEndpoint, useHfEndpoint } from "@/lib/hf-endpoint";
 import { cachedModelInfo } from "../lib/hf-cache";
 import { useEffect, useState } from "react";
 import { toHfModelResult } from "../lib/view-models";
@@ -26,17 +27,18 @@ export function useSelectedModelMetadata(
     error: boolean;
   }>(() => ({ repoId: "", result: null, error: false }));
 
+  const hfEndpoint = useHfEndpoint();
+
   useEffect(() => {
     if (!(repoId && enabled && online)) {
       return;
     }
 
-    // No AbortController: cachedModelInfo shares one in-flight request per repo
-    // across callers (hf-cache.ts), so aborting would cancel it for everyone.
-    // The `cancelled` flag plus the state.repoId guard prevent stale writes.
+    // No AbortController: cachedModelInfo shares one in-flight request per repo across callers.
     let cancelled = false;
 
     cachedModelInfo({
+      hubUrl: getHfEndpoint(),
       name: repoId,
       ...(accessToken ? { accessToken } : {}),
     })
@@ -64,7 +66,7 @@ export function useSelectedModelMetadata(
     return () => {
       cancelled = true;
     };
-  }, [repoId, accessToken, enabled, online]);
+  }, [repoId, accessToken, enabled, online, hfEndpoint]);
 
   if (state.repoId !== repoId) {
     return { result: null, error: false };

@@ -5,12 +5,10 @@
 Unsloth becomes reachable: a public Cloudflare URL (``--secure`` / ``--cloudflare``)
 or a raw non-loopback bind such as ``-H 0.0.0.0``.
 
-Masked input echoes one ``*`` per keystroke (unlike ``getpass``). Works on
-Windows (``msvcrt``) and Linux/macOS (``termios``). All output goes to stderr so
-redirected stdout never swallows the prompt.
-
-Mirrored for the CLI at ``unsloth_cli/commands/_password_prompt.py`` (the CLI
-cannot import the Unsloth backend package); keep the two in sync.
+Masked input echoes one ``*`` per keystroke (unlike ``getpass``). Works on Windows (``msvcrt``) and Linux/macOS
+(``termios``). All output goes to stderr so redirected stdout never swallows the prompt. Mirrored for the CLI at
+``unsloth_cli/commands/_password_prompt.py`` (the CLI cannot import the Unsloth backend package); keep the two
+in sync.
 """
 
 from __future__ import annotations
@@ -41,11 +39,9 @@ def _getch_windows() -> str:  # pragma: no cover - exercised via fake on Linux C
 
 
 class _RestoreTtyOnSignals:
-    """Restore terminal attrs if SIGTERM/SIGHUP kills the prompt mid-read.
-
-    A finally block can't run when a signal terminates the process, leaving the
-    shared terminal in cbreak/no-echo. Best-effort: no-op off the main thread or
-    where the signals are absent.
+    """Restore terminal attrs if SIGTERM/SIGHUP kills the prompt mid-read. A finally block can't run when a
+    signal terminates the process, leaving the shared terminal in cbreak/no-echo. Best-effort: no-op off the
+    main thread or where the signals are absent.
     """
 
     def __init__(self, fd: int, old_attrs) -> None:
@@ -155,12 +151,7 @@ class PromptUnattended(Exception):
 
 
 def _wait_for_first_key(timeout: float) -> bool:
-    """Whether a keystroke arrived within ``timeout`` seconds.
-
-    Requires cbreak mode already set: canonical mode holds input until a newline,
-    so the fd would not become readable on the first character. True on any doubt
-    (the blocking behaviour).
-    """
+    """Needs cbreak mode already set; canonical mode holds input until a newline. True on any doubt."""
     if os.name == "nt":
         import time
 
@@ -190,13 +181,7 @@ def _read_password(
     out: "TextIO | None" = None,
     first_key_timeout: "float | None" = None,
 ) -> str:
-    """Read one masked line: echo ``*`` per char, support backspace editing.
-
-    Raises KeyboardInterrupt on Ctrl-C and EOFError on Ctrl-D/Ctrl-Z with an
-    empty buffer; the terminal is restored on every exit path. With
-    ``first_key_timeout``, raises PromptUnattended when the FIRST keystroke never
-    arrives; once someone starts typing there is no deadline.
-    """
+    """With ``first_key_timeout``, a silent terminal raises PromptUnattended; typing has no deadline."""
     if out is None:
         out = sys.stderr
     out.write(prompt)
@@ -249,18 +234,7 @@ def should_prompt_password_change(
     stderr_isatty: bool,
     bind_is_exposed: bool = False,
 ) -> bool:
-    """Whether to block startup on an interactive terminal password change.
-
-    True when the launch puts the web UI where others can reach it, the admin
-    still has the seeded password, and both stdin and stderr are real terminals
-    (headless launches keep the bootstrap-timeout protection instead of hanging).
-
-    Two ways to be reachable: ``tunnel_will_start`` (public Cloudflare URL) and
-    ``bind_is_exposed`` (a raw non-loopback bind like ``-H 0.0.0.0``, reachable by
-    the whole network yet starting no tunnel). The second used to get no prompt at
-    all, so the seeded password stayed live and was served to anyone who loaded
-    the page.
-    """
+    """A raw non-loopback bind (-H 0.0.0.0) is reachable without a tunnel, so it prompts too."""
     if not (tunnel_will_start or bind_is_exposed):
         return False
     return requires_change and stdin_isatty and stderr_isatty
@@ -276,25 +250,8 @@ def prompt_for_password_change(
     exposure: str = "on the public internet",
     first_key_timeout: "float | None" = None,
     refusal_aborts: bool = True,
-) -> bool:
-    """Force a new admin password before exposure; True on success.
-
-    Loops until a valid, confirmed password is committed via ``apply_change``.
-    Ctrl-C / EOF returns False; ``refusal_aborts`` tells the banner what the
-    caller does with that, so it never promises an abort that will not happen:
-    True for a tunnel (caller aborts), False for a raw bind (launch proceeds,
-    because it worked before this prompt existed).
-
-    ``exposure`` names where this launch is reachable: a tunnel really is the
-    public internet, a raw bind is every interface (LAN behind NAT, or the
-    internet on a cloud box). Claiming the wrong one trains people to ignore it.
-
-    ``first_key_timeout`` bounds the wait for the FIRST keystroke, returning
-    False if it never comes. Only a caller that must not block a launch passes
-    it: a detached pty (``tmux new -d``, ``docker run -dt``) looks exactly like
-    an attended terminal, so undeadlined it waits forever and never binds its
-    socket. Unset (the tunnel) blocks indefinitely.
-    """
+) -> "bool | None":
+    """Only ``first_key_timeout`` callers pass it: a detached pty looks attended and would wait forever."""
     if out is None:
         out = sys.stderr
     refusal = (
@@ -344,8 +301,9 @@ def prompt_for_password_change(
             "No response at the terminal; leaving the auto-generated admin password in place.\n"
         )
         out.flush()
-        return False
+        return None
     except (KeyboardInterrupt, EOFError):
+        # Must agree with the banner: a caller that continues cannot claim otherwise.
         out.write(
             "Password change aborted; not exposing Unsloth.\n"
             if refusal_aborts
@@ -356,13 +314,7 @@ def prompt_for_password_change(
 
 
 def resolve_supplied_password(cli_value: "str | None", out: "TextIO | None" = None) -> "str | None":
-    """Resolve a non-interactive initial admin password, or None if unset.
-
-    Precedence: an explicit ``--password`` (literal ``-`` reads a line from
-    stdin), then the ``UNSLOTH_STUDIO_PASSWORD`` env var; empty/omitted means off.
-    A literal argv value is visible in the process list, so a note points at the
-    env var or stdin instead. Mirror of the CLI helper -- keep the two in sync.
-    """
+    """Mirrors the CLI helper, so keep both in sync; a literal --password is visible in the process list."""
     if out is None:
         out = sys.stderr
     if cli_value == "-":

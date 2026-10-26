@@ -1,12 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""stdio MCP runs a local command as the backend user, outside the sandbox, and
-sk-unsloth API keys authenticate the same routes the UI uses. So these pin that
-only a UI session may define a command, and that http(s) MCP stays usable from an
-API key. list_tools_async is stubbed to fail if called, so a gate placed after the
-probe would not pass.
-"""
+"""Only a UI session may define a stdio MCP command, since it runs outside the sandbox."""
 
 import asyncio
 import os
@@ -21,7 +16,7 @@ from utils import host_policy
 
 def _reset_db(tmp_path, monkeypatch):
     monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(tmp_path))
-    monkeypatch.setattr(mcp_servers_db, "_schema_ready", False)
+    monkeypatch.setattr(mcp_servers_db, "_schema_ready", set())
     mcp_client.invalidate_tool_cache()
 
 
@@ -59,14 +54,12 @@ def no_probe(monkeypatch):
 STDIO_CMD = "/bin/sh -c id"
 
 
-# ── stdio form codec: command material is UI-session-only ──────────
-
-
 @pytest.mark.parametrize("operation", ["encode", "decode"])
 def test_stdio_command_codec_refuses_api_key_before_work(
     monkeypatch, stdio_on, no_probe, operation
 ):
     import routes.mcp_servers as routes_mcp
+
     from models.mcp_servers import McpStdioCommand, McpStdioDecodeRequest
 
     def _never(*args, **kwargs):
@@ -89,11 +82,9 @@ def test_stdio_command_codec_refuses_api_key_before_work(
     assert exc.value.status_code == 403
 
 
-# ── /test: an unstored, caller-supplied command ─────────────────────
-
-
 def test_test_endpoint_refuses_stdio_from_api_key(tmp_path, monkeypatch, stdio_on, no_probe):
     import routes.mcp_servers as routes_mcp
+
     from models.mcp_servers import McpServerTestRequest
 
     _reset_db(tmp_path, monkeypatch)
@@ -110,6 +101,7 @@ def test_test_endpoint_refuses_stdio_from_api_key(tmp_path, monkeypatch, stdio_o
 
 def test_test_endpoint_allows_http_from_api_key(tmp_path, monkeypatch, stdio_on):
     import routes.mcp_servers as routes_mcp
+
     from models.mcp_servers import McpServerTestRequest
 
     _reset_db(tmp_path, monkeypatch)
@@ -131,11 +123,9 @@ def test_test_endpoint_allows_http_from_api_key(tmp_path, monkeypatch, stdio_on)
     assert seen["url"] == "https://example.com/mcp"
 
 
-# ── create / update ─────────────────────────────────────────────────
-
-
 def test_create_refuses_stdio_from_api_key_and_writes_nothing(tmp_path, monkeypatch, stdio_on):
     import routes.mcp_servers as routes_mcp
+
     from models.mcp_servers import McpServerCreate
 
     _reset_db(tmp_path, monkeypatch)
@@ -153,6 +143,7 @@ def test_create_refuses_stdio_from_api_key_and_writes_nothing(tmp_path, monkeypa
 
 def test_create_allows_http_from_api_key(tmp_path, monkeypatch, stdio_on):
     import routes.mcp_servers as routes_mcp
+
     from models.mcp_servers import McpServerCreate
 
     _reset_db(tmp_path, monkeypatch)
@@ -167,8 +158,8 @@ def test_create_allows_http_from_api_key(tmp_path, monkeypatch, stdio_on):
 
 
 def test_update_refuses_http_to_stdio_conversion_from_api_key(tmp_path, monkeypatch, stdio_on):
-    import routes.mcp_servers as routes_mcp
     from models.mcp_servers import McpServerUpdate
+    import routes.mcp_servers as routes_mcp
 
     _reset_db(tmp_path, monkeypatch)
     mcp_servers_db.create_server(id = "s1", display_name = "A", url = "https://a/mcp")
@@ -198,8 +189,8 @@ def test_update_refuses_any_edit_of_a_stdio_row_from_api_key(
 ):
     """Not just the address: the env vars, the name and the enabled flag all
     change what runs or how, so an API key may not touch a stdio row at all."""
-    import routes.mcp_servers as routes_mcp
     from models.mcp_servers import McpServerUpdate
+    import routes.mcp_servers as routes_mcp
 
     _reset_db(tmp_path, monkeypatch)
     mcp_servers_db.create_server(id = "s1", display_name = "Local", url = STDIO_CMD)
@@ -220,8 +211,8 @@ def test_update_regates_after_the_oauth_clear_await(tmp_path, monkeypatch, stdio
     """clear_oauth_tokens_async awaits, handing the loop to other requests. If
     the owner converts the row to stdio in that window, the write that follows
     must not land the API key's headers as the command's env."""
-    import routes.mcp_servers as routes_mcp
     from models.mcp_servers import McpServerUpdate
+    import routes.mcp_servers as routes_mcp
 
     _reset_db(tmp_path, monkeypatch)
     mcp_servers_db.create_server(
@@ -249,8 +240,8 @@ def test_update_regates_after_the_oauth_clear_await(tmp_path, monkeypatch, stdio
 def test_update_allows_http_row_but_redacts_saved_headers_from_keyless(
     tmp_path, monkeypatch, stdio_on
 ):
-    import routes.mcp_servers as routes_mcp
     from models.mcp_servers import McpServerUpdate
+    import routes.mcp_servers as routes_mcp
 
     _reset_db(tmp_path, monkeypatch)
     mcp_servers_db.create_server(
@@ -270,9 +261,6 @@ def test_update_allows_http_row_but_redacts_saved_headers_from_keyless(
     )
     assert resp.display_name == "B"
     assert resp.headers == {}
-
-
-# ── refresh ─────────────────────────────────────────────────────────
 
 
 def test_refresh_refuses_stored_stdio_from_api_key(tmp_path, monkeypatch, stdio_on, no_probe):
@@ -305,9 +293,6 @@ def test_refresh_allows_http_from_api_key(tmp_path, monkeypatch, stdio_on):
     assert res.ok is True
 
 
-# ── import: per-entry, so a mixed config still lands its http rows ──
-
-
 _MIXED_CONFIG = {
     "mcpServers": {
         "remote": {"url": "https://example.com/mcp"},
@@ -318,6 +303,7 @@ _MIXED_CONFIG = {
 
 def test_import_from_api_key_keeps_http_and_reports_stdio(tmp_path, monkeypatch, stdio_on):
     import routes.mcp_servers as routes_mcp
+
     from models.mcp_servers import McpServerImportRequest
 
     _reset_db(tmp_path, monkeypatch)
@@ -332,8 +318,6 @@ def test_import_from_api_key_keeps_http_and_reports_stdio(tmp_path, monkeypatch,
     assert any("local" in err for err in res.errors)
     assert [row["url"] for row in mcp_servers_db.list_servers()] == ["https://example.com/mcp"]
 
-    # Re-importing the same config is idempotent: the http entry is now a skip,
-    # the stdio entry is still an error, and no row is duplicated.
     again = asyncio.run(
         routes_mcp.import_mcp_servers(
             McpServerImportRequest(config = _MIXED_CONFIG),
@@ -347,16 +331,13 @@ def test_import_from_api_key_keeps_http_and_reports_stdio(tmp_path, monkeypatch,
     assert len(mcp_servers_db.list_servers()) == 1
 
 
-# ── a UI session keeps every existing stdio behaviour ───────────────
-
-
 def test_ui_session_still_creates_and_imports_stdio(tmp_path, monkeypatch, stdio_on):
+    from models.mcp_servers import McpServerUpdate
     import routes.mcp_servers as routes_mcp
+
     from models.mcp_servers import McpServerCreate, McpServerImportRequest, McpServerUpdate
 
     _reset_db(tmp_path, monkeypatch)
-    # A command distinct from the one in _MIXED_CONFIG, so the import below is a
-    # real create rather than the url-dedupe skip.
     own_cmd = "/bin/echo hello"
     created = asyncio.run(
         routes_mcp.create_mcp_server(
@@ -390,9 +371,9 @@ def test_default_is_ui_session_so_direct_calls_are_unaffected():
     """The dependency is Annotated with a plain False default; a bare
     `= Depends(...)` default would be a truthy object and 403 every direct
     call (the existing suites call these handlers directly)."""
-    import inspect
-
     import routes.mcp_servers as routes_mcp
+
+    import inspect
 
     for name in (
         "create_mcp_server",
@@ -405,9 +386,6 @@ def test_default_is_ui_session_so_direct_calls_are_unaffected():
     ):
         param = inspect.signature(getattr(routes_mcp, name)).parameters["via_api_key"]
         assert param.default is False, name
-
-
-# ── data recipe: the same primitive, same gate ──────────────────────
 
 
 _STDIO_PROVIDER = {
@@ -458,9 +436,6 @@ def test_data_recipe_validate_refuses_stdio_recipe_from_api_key():
     assert exc.value.status_code == 403
 
 
-# ── reading back a command the gate would not let a key define ──────
-
-
 def test_list_hides_stdio_rows_from_api_keys(tmp_path, monkeypatch, stdio_on):
     """A key that may not define a command may not read one back: `url` is the
     argv (carries credentials) and `headers` is the subprocess env."""
@@ -485,7 +460,6 @@ def test_list_hides_stdio_rows_from_api_keys(tmp_path, monkeypatch, stdio_on):
     serialized = repr([row.model_dump() for row in keyed])
     assert "sk-argv-secret" not in serialized
     assert "sk-env-secret" not in serialized
-    # http(s) MCP stays fully usable from a key, headers included.
     assert keyed[0].headers == {"Authorization": "Bearer t"}
 
     keyless = routes_mcp.list_mcp_servers(
@@ -511,14 +485,25 @@ def test_list_shows_stdio_rows_to_a_ui_session(tmp_path, monkeypatch, stdio_on):
     assert rows[0].headers == {"API_KEY": "sk-env-secret"}
 
 
-def test_studio_mcp_surface_refuses_stdio_recipes():
-    """mcp_server.py calls the validate route function directly, so the ViaApiKey
-    dependency never runs and its `= False` default would read as a UI session.
-    That remote static bearer surface must pass True itself or the gate is dead."""
-    import inspect
+@pytest.mark.parametrize("mode", ["validate", "preview", "full"])
+def test_studio_mcp_surface_refuses_stdio_recipes(monkeypatch, mode):
+    """Studio MCP reaches the recipe routes as the agent's API key, so the routes' own
+    UI-session gate holds: a recipe that defines a local (stdio) MCP command is refused
+    with the route's 403 text, whichever mode runs it."""
+    from auth.authentication import get_current_credential
+    from routes.data_recipe import router as data_recipe_router
 
-    import mcp_server
+    from .mcp_harness import route_studio, run_tool
 
-    assert "validate(RecipePayload(recipe = recipe), via_api_key = True)" in inspect.getsource(
-        mcp_server
+    studio = route_studio(
+        data_recipe_router,
+        "/api/data-recipe",
+        overrides = {get_current_credential: lambda: ("unsloth", None)},
+    )
+    result, _studio = run_tool(
+        monkeypatch, studio, "run_recipe", {"recipe": _STDIO_RECIPE, "mode": mode}
+    )
+    assert result["isError"] is True
+    assert result["content"][0]["text"].startswith(
+        "Local (stdio) MCP servers can only be configured from the Unsloth UI, not with an API key."
     )

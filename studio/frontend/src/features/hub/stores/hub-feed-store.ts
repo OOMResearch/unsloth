@@ -5,6 +5,7 @@ import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 import type { HfModelResult } from "../hooks/use-hub-model-search";
 import { type ChannelId, findChannel } from "../lib/channels";
+import { fingerprintToken } from "../lib/token-fingerprint";
 import { createThrottledStorage, noopStorage } from "./persist-storage";
 
 export interface ChannelFeedEntry {
@@ -22,6 +23,14 @@ export interface HubFeedState {
     tokenFingerprint: string,
   ) => void;
   clearForToken: (tokenFingerprint: string) => void;
+}
+
+/** Feed entries are keyed on endpoint AND token, so a mirror never shows a huggingface.co feed. */
+export function feedIdentity(
+  endpoint: string,
+  token: string | null | undefined,
+): string {
+  return `${endpoint}::${fingerprintToken(token)}`;
 }
 
 export const FEED_CACHE_CAP = 24;

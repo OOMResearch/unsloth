@@ -1,17 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""Tests for Anthropic fast-mode wiring and streaming refusal handling.
-
-fast_mode=True on Opus 4.6/4.7 attaches the ``fast-mode-2026-02-01`` beta
-header and sets ``speed: "fast"``; unsupported models drop both. Streaming
-``stop_reason: "refusal"`` surfaces a user notice before the
-``content_filter`` finish chunk.
-https://platform.claude.com/docs/en/test-and-evaluate/strengthen-guardrails/handle-streaming-refusals
-"""
+"""Fast mode is sent only to Opus 4.6 and 4.7, and a streamed refusal surfaces a notice first."""
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import httpx
 
@@ -155,22 +149,115 @@ def test_fast_mode_none_does_not_attach_header_or_field(monkeypatch):
 def test_refusal_emits_user_facing_notice_and_content_filter_finish(monkeypatch):
     _, lines = _capture(monkeypatch, sse = _refusal_sse())
     body = "\n".join(lines)
-    # User-visible refusal notice.
     assert "stopped by Anthropic's safety classifier" in body, body
-    # OpenAI-spec finish_reason mapping.
     assert '"finish_reason": "content_filter"' in body, body
-    # Original deltas preserved before the refusal supplement.
     assert "Hello." in body, body
 
 
 def test_refusal_emits_tool_event_for_chat_adapter_drop(monkeypatch):
-    """Refused turns emit an out-of-band `_toolEvent` that the chat-adapter
-    latches into assistant `metadata.custom.anthropicRefusal`, driving the
-    next-request prune. Tool event (not text) prevents spoofing.
-    """
+    """Refusal is signalled by an out-of-band tool event, not visible text, so content cannot spoof it."""
     _, lines = _capture(monkeypatch, sse = _refusal_sse())
     body = "\n".join(lines)
     assert '"_toolEvent": {"type": "anthropic_refusal"}' in body, body
-    # Visible refusal text must not embed a sentinel that could spoof a
-    # context reset if echoed by another assistant message.
+    # A sentinel in visible text could spoof a context reset if echoed.
     assert "studio:anthropic-refusal" not in body, body
+
+
+def _stop_reason_sse(reason: str) -> bytes:
+    return (
+        b'event: message_start\ndata: {"type":"message_start","message":'
+        b'{"id":"m1","content":[],"model":"claude-sonnet-4-5","role":"assistant",'
+        b'"stop_reason":null,"usage":{"input_tokens":1,"output_tokens":1}}}\n\n'
+        b'event: content_block_start\ndata: {"type":"content_block_start",'
+        b'"index":0,"content_block":{"type":"text","text":""}}\n\n'
+        b'event: content_block_delta\ndata: {"type":"content_block_delta",'
+        b'"index":0,"delta":{"type":"text_delta","text":"Half an ans"}}\n\n'
+        b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+        b'event: message_delta\ndata: {"type":"message_delta",'
+        b'"delta":{"stop_reason":"' + reason.encode() + b'"}}\n\n'
+        b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+    )
+
+
+def _stop_reason_lines(monkeypatch, reason: str) -> list[str]:
+    _, lines = _capture(
+        monkeypatch,
+        sse = _stop_reason_sse(reason),
+        model = "claude-sonnet-4-5",
+    )
+    return lines
+
+
+def _finish_reasons(lines: list[str]) -> list[str]:
+    seen: list[str] = []
+    for line in lines:
+        if not line.startswith("data: ") or line == "data: [DONE]":
+            continue
+        for choice in json.loads(line[len("data: ") :]).get("choices") or []:
+            if choice.get("finish_reason"):
+                seen.append(choice["finish_reason"])
+    return seen
+
+
+def _record_stream_logs(monkeypatch) -> list[tuple[str, str]]:
+    # structlog bound logger never reaches caplog's stdlib handlers.
+    records: list[tuple[str, str]] = []
+
+    def _record(level):
+        return lambda fmt, *args, **kwargs: records.append((level, str(fmt) % args))
+
+    monkeypatch.setattr(
+        ep_mod,
+        "logger",
+        SimpleNamespace(
+            debug = _record("debug"),
+            info = _record("info"),
+            warning = _record("warning"),
+            error = _record("error"),
+            exception = _record("exception"),
+        ),
+    )
+    return records
+
+
+def test_context_window_exceeded_finishes_as_length(monkeypatch):
+    lines = _stop_reason_lines(monkeypatch, "model_context_window_exceeded")
+    assert _finish_reasons(lines) == ["length"], lines
+    assert "Half an ans" in "\n".join(lines), lines
+
+
+def test_context_window_exceeded_emits_tool_event(monkeypatch):
+    # `length` would arm auto-continuation into the overflowed window.
+    body = "\n".join(_stop_reason_lines(monkeypatch, "model_context_window_exceeded"))
+    assert '"_toolEvent": {"type": "context_window_exceeded"}' in body, body
+
+
+def test_max_tokens_still_finishes_as_length_without_the_event(monkeypatch):
+    body = "\n".join(_stop_reason_lines(monkeypatch, "max_tokens"))
+    assert '"finish_reason": "length"' in body, body
+    assert "context_window_exceeded" not in body, body
+
+
+def test_end_turn_is_still_a_completed_answer(monkeypatch):
+    body = "\n".join(_stop_reason_lines(monkeypatch, "end_turn"))
+    assert '"finish_reason": "stop"' in body, body
+    assert "context_window_exceeded" not in body, body
+
+
+def test_an_unmapped_stop_reason_is_logged(monkeypatch):
+    records = _record_stream_logs(monkeypatch)
+    body = "\n".join(_stop_reason_lines(monkeypatch, "model_ran_out_of_ideas"))
+    assert '"finish_reason": "stop"' in body, body
+    assert [
+        message
+        for level, message in records
+        if level == "warning" and "model_ran_out_of_ideas" in message
+    ], records
+
+
+def test_a_mapped_stop_reason_is_not_logged(monkeypatch):
+    records = _record_stream_logs(monkeypatch)
+    _stop_reason_lines(monkeypatch, "end_turn")
+    assert not [
+        message for level, message in records if level == "warning" and "stop_reason" in message
+    ], records

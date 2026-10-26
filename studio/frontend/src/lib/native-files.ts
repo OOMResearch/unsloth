@@ -4,7 +4,9 @@
 import { isTauri } from "@/lib/api-base";
 import { decodeDataUri, isDataUri } from "@/lib/data-uri";
 
-const NATIVE_FILE_NAME_HEADER = "x-unsloth-default-name";
+export const NATIVE_FILE_NAME_HEADER = "x-unsloth-default-name";
+const NATIVE_FILE_SAVE_TOKEN_HEADER = "x-unsloth-save-token";
+const NATIVE_FILE_CHUNK_BYTES = 8 * 1024 * 1024;
 export class DownloadCancelledError extends Error {
   constructor() {
     super("Save cancelled.");
@@ -16,7 +18,7 @@ export function isDownloadCancelled(error: unknown): boolean {
   return error instanceof DownloadCancelledError;
 }
 
-function encodeNativeFilename(filename: string): string {
+export function encodeNativeFilename(filename: string): string {
   const bytes = new TextEncoder().encode(filename);
   let binary = "";
   for (const byte of bytes) {
@@ -30,7 +32,6 @@ export interface NativeImportedTextFile {
   content: string;
 }
 
-/** Handle for a native chat import read in bounded ranges. */
 export interface NativeChatImport {
   name: string;
   size: number;
@@ -52,7 +53,7 @@ export async function readNativeChatImportChunk(
     : new Uint8Array(bytes);
 }
 
-function browserDownload(blob: Blob, filename: string): void {
+export function browserDownload(blob: Blob, filename: string): void {
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;
@@ -60,7 +61,7 @@ function browserDownload(blob: Blob, filename: string): void {
   document.body.appendChild(anchor);
   anchor.click();
   anchor.remove();
-  URL.revokeObjectURL(url);
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
 function browserUrlDownload(url: string, filename: string): void {
@@ -81,7 +82,6 @@ async function fetchDownload(url: string): Promise<Response> {
   return response;
 }
 
-/** Save through a native chooser in Tauri and retain normal downloads on web. */
 export async function downloadFile(
   content: string | Blob | Uint8Array,
   filename: string,
@@ -117,6 +117,46 @@ export async function downloadFile(
   return;
 }
 
+/** Save a Blob through bounded IPC chunks in Tauri and retain normal downloads on web. */
+export async function downloadBlobStreaming(
+  content: Blob,
+  filename: string,
+): Promise<void> {
+  if (!isTauri) {
+    browserDownload(content, filename);
+    return;
+  }
+  const { invoke } = await import("@tauri-apps/api/core");
+  const token = await invoke<string | null>("begin_native_file_save", {
+    fileName: filename,
+  });
+  if (token === null) {
+    throw new DownloadCancelledError();
+  }
+  try {
+    for (
+      let offset = 0;
+      offset < content.size;
+      offset += NATIVE_FILE_CHUNK_BYTES
+    ) {
+      const bytes = new Uint8Array(
+        await content
+          .slice(offset, offset + NATIVE_FILE_CHUNK_BYTES)
+          .arrayBuffer(),
+      );
+      await invoke<void>("append_native_file_save_chunk", bytes, {
+        headers: { [NATIVE_FILE_SAVE_TOKEN_HEADER]: token },
+      });
+    }
+    await invoke<string>("finish_native_file_save", { token });
+  } catch (error) {
+    await invoke<void>("cancel_native_file_save", { token }).catch(
+      () => undefined,
+    );
+    throw error;
+  }
+}
+
 export async function urlToBlob(url: string): Promise<Blob> {
   if (isDataUri(url)) {
     const { bytes, mimeType } = decodeDataUri(url);
@@ -125,11 +165,7 @@ export async function urlToBlob(url: string): Promise<Blob> {
   return (await fetchDownload(url)).blob();
 }
 
-/**
- * Save a local backend URL without holding it in memory. `downloadUrl` buffers the body
- * to cross the IPC boundary, which is the wrong shape for a gallery clip: here the
- * chooser opens first and Rust streams to the chosen path. The browser keeps its anchor.
- */
+/** Opens the chooser first and Rust streams to the path, avoiding buffering across IPC. */
 export async function downloadUrlStreaming(
   url: string,
   filename: string,
@@ -148,7 +184,6 @@ export async function downloadUrlStreaming(
   }
 }
 
-/** Resolve media before crossing the native save boundary. */
 export async function downloadUrl(
   url: string,
   filename: string,
@@ -171,7 +206,6 @@ export async function downloadUrl(
   );
 }
 
-/** Open the bounded native chat-import picker. Cancellation returns null. */
 export async function pickNativeChatImport(): Promise<NativeChatImport | null> {
   if (!isTauri) {
     return null;

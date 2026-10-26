@@ -15,12 +15,24 @@ from core.inference.api_monitor import ApiMonitor, _trim
 import routes.inference as inference_route
 
 
+def _start(monitor, **overrides):
+    """Begin a monitored request, defaulting the fields a test does not vary."""
+    return monitor.start(
+        **{
+            "endpoint": "/v1/chat/completions",
+            "method": "POST",
+            "model": "m",
+            "prompt": "hi",
+            **overrides,
+        }
+    )
+
+
 def test_terminal_api_usage_receipt_is_immutable_and_emitted_once():
     receipts = []
     monitor = ApiMonitor(terminal_callback = receipts.append)
-    entry_id = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
+    entry_id = _start(
+        monitor,
         model = "org/model",
         prompt = "do not persist this",
         subject = "alice",
@@ -53,10 +65,9 @@ def test_terminal_api_usage_receipt_is_immutable_and_emitted_once():
 def test_partial_terminal_api_usage_is_emitted_once(terminal, status):
     receipts = []
     monitor = ApiMonitor(terminal_callback = receipts.append)
-    entry_id = monitor.start(
+    entry_id = _start(
+        monitor,
         endpoint = "/v1/responses",
-        method = "POST",
-        model = "m",
         prompt = "private",
         subject = "alice",
         via_api_key = True,
@@ -81,10 +92,9 @@ def test_terminal_callback_runs_outside_monitor_lock():
         assert monitor.snapshot()
 
     monitor.set_terminal_callback(callback)
-    entry_id = monitor.start(
+    entry_id = _start(
+        monitor,
         endpoint = "/v1/messages",
-        method = "POST",
-        model = "m",
         prompt = "private",
         subject = "alice",
         via_api_key = True,
@@ -99,10 +109,9 @@ def test_terminal_callback_failure_is_logged_and_swallowed(caplog):
         raise RuntimeError("storage unavailable")
 
     monitor = ApiMonitor(terminal_callback = broken)
-    entry_id = monitor.start(
+    entry_id = _start(
+        monitor,
         endpoint = "/v1/completions",
-        method = "POST",
-        model = "m",
         prompt = "private",
         subject = "alice",
         via_api_key = True,
@@ -121,12 +130,10 @@ def test_overlapping_callback_leases_do_not_disable_the_live_owner():
     older = monitor.acquire_terminal_callback(older_receipts.append)
     newer = monitor.acquire_terminal_callback(newer_receipts.append)
 
-    # Lifespan A exits while the later lifespan B remains live.
     monitor.release_terminal_callback(older)
-    entry_id = monitor.start(
+    entry_id = _start(
+        monitor,
         endpoint = "/v1/responses",
-        method = "POST",
-        model = "m",
         prompt = "private",
         subject = "alice",
         via_api_key = True,
@@ -158,24 +165,11 @@ def test_non_external_and_non_request_rows_never_emit_usage_receipts():
     receipts = []
     monitor = ApiMonitor(terminal_callback = receipts.append)
 
-    studio = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "m",
-        prompt = "studio",
-        subject = "alice",
-        via_api_key = False,
-    )
+    studio = _start(monitor, prompt = "studio", subject = "alice", via_api_key = False)
     monitor.set_usage(studio, total_tokens = 10)
     monitor.finish(studio)
 
-    anonymous = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "m",
-        prompt = "anonymous",
-        via_api_key = True,
-    )
+    anonymous = _start(monitor, prompt = "anonymous", via_api_key = True)
     monitor.set_usage(anonymous, total_tokens = 10)
     monitor.finish(anonymous)
 
@@ -185,10 +179,9 @@ def test_non_external_and_non_request_rows_never_emit_usage_receipts():
     monitor.finish(lifecycle)
     monitor.record_lifecycle(event = "unload", model = "m", subject = "alice", via_api_key = True)
 
-    discarded = monitor.start(
+    discarded = _start(
+        monitor,
         endpoint = "/v1/responses",
-        method = "POST",
-        model = "m",
         prompt = "private",
         subject = "alice",
         via_api_key = True,
@@ -202,17 +195,11 @@ def test_non_external_and_non_request_rows_never_emit_usage_receipts():
 
 
 def _get_monitor(monkeypatch, *, enabled: bool):
-    """Call GET /monitor against a monitor in a known state.
-
-    Swaps the whole singleton rather than poking ``_enabled`` on it: the route
-    reads ``snapshot()``, which does not consult the flag, so a shared monitor
-    carrying rows from an earlier test would leak into the assertions.
-    """
+    """Swaps in a fresh monitor, since snapshot() ignores _enabled and a shared one leaks earlier rows."""
     monkeypatch.setattr(inference_route, "api_monitor", ApiMonitor(enabled = enabled))
     app = FastAPI()
     app.include_router(inference_route.studio_router)
-    # Dict literal, not `overrides[key] = ...`: verify_import_hoist.py does not
-    # see Load names inside an assignment target and reports the import unused.
+    # Dict literal: verify_import_hoist.py misses names in assignment targets.
     app.dependency_overrides = {get_current_subject: lambda: "test-user"}
     return TestClient(app).get("/monitor")
 
@@ -220,13 +207,7 @@ def _get_monitor(monkeypatch, *, enabled: bool):
 def test_api_monitor_tracks_reply_usage_and_context():
     monitor = ApiMonitor(max_entries = 3)
 
-    entry_id = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "local-model",
-        prompt = "user: hello",
-        context_length = 100,
-    )
+    entry_id = _start(monitor, model = "local-model", prompt = "user: hello", context_length = 100)
     monitor.append_reply(entry_id, "hi")
     monitor.append_reply(entry_id, " there")
     monitor.set_usage(
@@ -246,12 +227,7 @@ def test_api_monitor_tracks_reply_usage_and_context():
 
 def test_api_monitor_summary_omits_full_prompt_and_reply():
     monitor = ApiMonitor(max_entries = 3)
-    entry_id = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "local-model",
-        prompt = "p" * 500,
-    )
+    entry_id = _start(monitor, model = "local-model", prompt = "p" * 500)
     monitor.set_reply(entry_id, "r" * 500)
 
     [summary] = monitor.snapshot(include_details = False)
@@ -270,20 +246,8 @@ def test_api_monitor_summary_omits_full_prompt_and_reply():
 
 def test_api_monitor_filters_entries_by_subject():
     monitor = ApiMonitor(max_entries = 3)
-    alice = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "m",
-        prompt = "alice prompt",
-        subject = "alice",
-    )
-    bob = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "m",
-        prompt = "bob prompt",
-        subject = "bob",
-    )
+    alice = _start(monitor, prompt = "alice prompt", subject = "alice")
+    bob = _start(monitor, prompt = "bob prompt", subject = "bob")
     monitor.finish(bob)
 
     alice_entries = monitor.snapshot(subject = "alice")
@@ -297,24 +261,9 @@ def test_api_monitor_filters_entries_by_subject():
 def test_api_monitor_keeps_bounded_recent_history():
     monitor = ApiMonitor(max_entries = 2)
 
-    first = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "m",
-        prompt = "first",
-    )
-    second = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "m",
-        prompt = "second",
-    )
-    third = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "m",
-        prompt = "third",
-    )
+    first = _start(monitor, prompt = "first")
+    second = _start(monitor, prompt = "second")
+    third = _start(monitor, prompt = "third")
     monitor.finish(first)
     monitor.finish(second)
     monitor.finish(third)
@@ -330,19 +279,9 @@ def test_api_monitor_keeps_bounded_recent_history():
 def test_api_monitor_keeps_running_entries_beyond_history_limit():
     monitor = ApiMonitor(max_entries = 1)
 
-    running = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "m",
-        prompt = "running",
-    )
+    running = _start(monitor, prompt = "running")
     for prompt in ("done-1", "done-2", "done-3"):
-        entry_id = monitor.start(
-            endpoint = "/v1/chat/completions",
-            method = "POST",
-            model = "m",
-            prompt = prompt,
-        )
+        entry_id = _start(monitor, prompt = prompt)
         monitor.finish(entry_id)
 
     entries = monitor.snapshot()
@@ -359,12 +298,7 @@ def test_api_monitor_keeps_running_entries_beyond_history_limit():
 
 def test_api_monitor_finish_is_idempotent():
     monitor = ApiMonitor(max_entries = 2)
-    entry_id = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "m",
-        prompt = "hi",
-    )
+    entry_id = _start(monitor)
     monitor.finish(entry_id)
     first = monitor.snapshot()[0]
     monitor.finish(entry_id)
@@ -375,31 +309,20 @@ def test_api_monitor_finish_is_idempotent():
 
 def test_api_monitor_preserves_authoritative_total_tokens():
     monitor = ApiMonitor(max_entries = 2)
-    entry_id = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "m",
-        prompt = "hi",
-    )
+    entry_id = _start(monitor)
     monitor.set_usage(
         entry_id,
         prompt_tokens = 10,
         completion_tokens = 20,
         total_tokens = 33,
     )
-    # A later partial chunk omitting `total_tokens` must not clobber 33.
     monitor.set_usage(entry_id, prompt_tokens = 11)
     assert monitor.snapshot()[0]["total_tokens"] == 33
 
 
 def test_api_monitor_recomputes_derived_total_tokens():
     monitor = ApiMonitor(max_entries = 2)
-    entry_id = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "m",
-        prompt = "hi",
-    )
+    entry_id = _start(monitor)
     monitor.set_usage(entry_id, prompt_tokens = 10)
     assert monitor.snapshot()[0]["total_tokens"] == 10
 
@@ -416,12 +339,7 @@ def test_api_monitor_duration_non_negative_under_clock_step(monkeypatch):
     fake_now = [1000.0]
     monkeypatch.setattr(m.time, "time", lambda: fake_now[0])
     monitor = ApiMonitor(max_entries = 1)
-    entry_id = monitor.start(
-        endpoint = "/x",
-        method = "POST",
-        model = "m",
-        prompt = "hi",
-    )
+    entry_id = _start(monitor, endpoint = "/x")
     fake_now[0] = 500.0
     monitor.finish(entry_id)
     assert monitor.snapshot()[0]["duration_ms"] >= 0
@@ -439,17 +357,11 @@ def test_api_monitor_append_reply_caps_without_regrowing():
     import core.inference.api_monitor as m
 
     monitor = ApiMonitor(max_entries = 1)
-    entry_id = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "m",
-        prompt = "go",
-    )
+    entry_id = _start(monitor, prompt = "go")
     monitor.append_reply(entry_id, "x" * (m._MAX_REPLY_CHARS + 500))
     capped = monitor.snapshot()[0]["reply"]
     assert len(capped) == m._MAX_REPLY_CHARS and capped.endswith("...")
 
-    # Chunks past the cap must not change or grow the stored preview.
     monitor.append_reply(entry_id, "y" * 1000)
     assert monitor.snapshot()[0]["reply"] == capped
 
@@ -458,16 +370,9 @@ def test_api_monitor_append_reply_exact_cap_then_more_marks_truncated():
     import core.inference.api_monitor as m
 
     monitor = ApiMonitor(max_entries = 1)
-    entry_id = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "m",
-        prompt = "go",
-    )
-    # A reply landing exactly on the cap has no "..." marker yet.
+    entry_id = _start(monitor, prompt = "go")
     monitor.append_reply(entry_id, "x" * m._MAX_REPLY_CHARS)
     assert not monitor.snapshot()[0]["reply"].endswith("...")
-    # One more chunk must record the truncation, not silently freeze.
     monitor.append_reply(entry_id, "y")
     reply = monitor.snapshot()[0]["reply"]
     assert len(reply) == m._MAX_REPLY_CHARS and reply.endswith("...")
@@ -478,50 +383,23 @@ def test_clear_keeps_the_callers_own_request_that_is_still_running():
     loses the request outright: the active count falls to zero and the finish that follows
     has no entry left to land on, so a completed call never appears at all."""
     monitor = ApiMonitor(max_entries = 4)
-    done = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "m",
-        prompt = "finished",
-        subject = "alice",
-    )
+    done = _start(monitor, prompt = "finished", subject = "alice")
     monitor.finish(done)
-    live = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "m",
-        prompt = "in flight",
-        subject = "alice",
-    )
+    live = _start(monitor, prompt = "in flight", subject = "alice")
 
     monitor.clear(subject = "alice")
 
     assert [entry["id"] for entry in monitor.snapshot(subject = "alice")] == [live]
     assert monitor.active_count(subject = "alice") == 1
-    # And the row is still there to be completed.
     monitor.finish(live)
     assert monitor.get(live, subject = "alice")["status"] == "completed"
 
 
 def test_api_monitor_clear_is_scoped_to_one_subject():
-    # Every other read is subject-scoped; an unscoped clear would erase another's history.
     monitor = ApiMonitor(max_entries = 4)
-    alice = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "m",
-        prompt = "alice prompt",
-        subject = "alice",
-    )
-    bob = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "m",
-        prompt = "bob prompt",
-        subject = "bob",
-    )
-    # Finished first: a running row is a request in flight, not history, and clear keeps
-    # it. This test is about the subject scoping, so it clears history and nothing else.
+    alice = _start(monitor, prompt = "alice prompt", subject = "alice")
+    bob = _start(monitor, prompt = "bob prompt", subject = "bob")
+    # Clear keeps running rows, so finish first.
     monitor.finish(alice)
 
     monitor.clear(subject = "alice")
@@ -530,29 +408,14 @@ def test_api_monitor_clear_is_scoped_to_one_subject():
     assert monitor.active_count(subject = "bob") == 1
     assert monitor.get(alice, subject = "alice") is None
 
-    # Passing no subject is the explicit "everything" path.
     monitor.clear()
     assert monitor.snapshot(subject = "bob") == []
 
 
 def test_api_monitor_records_whether_the_caller_used_an_api_key():
-    # Unsloth's chat hits these endpoints on a JWT, and the panel auto-opens off this flag.
     monitor = ApiMonitor(max_entries = 4)
-    ui = monitor.start(
-        endpoint = "/api/inference/chat",
-        method = "POST",
-        model = "m",
-        prompt = "hi",
-        subject = "u",
-    )
-    api = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "m",
-        prompt = "hi",
-        subject = "u",
-        via_api_key = True,
-    )
+    ui = _start(monitor, endpoint = "/api/inference/chat", subject = "u")
+    api = _start(monitor, subject = "u", via_api_key = True)
     by_id = {entry["id"]: entry for entry in monitor.snapshot(subject = "u")}
     assert by_id[ui]["via_api_key"] is False
     assert by_id[api]["via_api_key"] is True
@@ -561,13 +424,7 @@ def test_api_monitor_records_whether_the_caller_used_an_api_key():
 def test_api_monitor_disabled_is_noop():
     monitor = ApiMonitor(max_entries = 3, enabled = False)
 
-    request_id = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "local-model",
-        prompt = "user: hello",
-        context_length = 100,
-    )
+    request_id = _start(monitor, model = "local-model", prompt = "user: hello", context_length = 100)
     load_id = monitor.record_lifecycle(
         event = "load",
         model = "local-model",
@@ -579,7 +436,6 @@ def test_api_monitor_disabled_is_noop():
     )
     assert request_id == load_id == unload_id == ""
 
-    # Every mutator must be a safe no-op on the falsy id.
     monitor.append_reply(request_id, "hi")
     monitor.set_reply(request_id, "hi")
     monitor.set_usage(request_id, prompt_tokens = 4, completion_tokens = 6)
@@ -615,16 +471,12 @@ def test_api_monitor_disable_env_var_unset(monkeypatch):
     assert m._api_monitor_disabled() is False
 
 
-# ── model lifecycle rows (load / unload) ────────────────────────────
-
-
 def test_lifecycle_load_row_opens_running_then_closes():
     monitor = ApiMonitor(max_entries = 5)
     event_id = monitor.record_lifecycle(event = "load", model = "org/A-GGUF", running = True)
     row = monitor.snapshot()[0]
     assert row["kind"] == "lifecycle" and row["event"] == "load"
     assert row["status"] == "running" and row["duration_ms"] is None
-    # A load in progress is not an in-flight API request.
     assert monitor.active_count() == 0
 
     monitor.relabel(event_id, "org/A-GGUF:Q4_K_M")
@@ -645,15 +497,8 @@ def test_lifecycle_unload_row_is_terminal_on_arrival():
 
 
 def test_lifecycle_rows_are_visible_to_every_subject():
-    # A load is server-wide, so it must not vanish for other API keys like a request does.
     monitor = ApiMonitor(max_entries = 5)
-    monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "m",
-        prompt = "hi",
-        subject = "alice",
-    )
+    _start(monitor, subject = "alice")
     event_id = monitor.record_lifecycle(event = "unload", model = "org/A-GGUF")
 
     bob = monitor.snapshot(subject = "bob")
@@ -664,28 +509,20 @@ def test_lifecycle_rows_are_visible_to_every_subject():
 
 def test_request_rows_stay_private_to_their_subject():
     monitor = ApiMonitor(max_entries = 5)
-    rid = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "m",
-        prompt = "hi",
-        subject = "alice",
-    )
+    rid = _start(monitor, subject = "alice")
     assert monitor.snapshot(subject = "bob") == []
     assert monitor.get(rid, subject = "bob") is None
 
 
 def test_discard_drops_a_row_that_never_happened():
-    # A load that found the model already resident must leave no trace.
     monitor = ApiMonitor(max_entries = 5)
     event_id = monitor.record_lifecycle(event = "load", model = "org/A-GGUF", running = True)
     monitor.discard(event_id)
     assert monitor.snapshot() == []
-    monitor.discard(event_id)  # idempotent
+    monitor.discard(event_id)
 
 
 def test_fail_open_never_touches_a_finished_row():
-    # Called from a finally, so it must not stamp an error onto a load that succeeded.
     monitor = ApiMonitor(max_entries = 5)
     event_id = monitor.record_lifecycle(event = "load", model = "org/A-GGUF", running = True)
     monitor.finish(event_id)
@@ -713,20 +550,9 @@ def test_request_rows_report_kind_request():
 
 
 def test_clear_hides_shared_lifecycle_rows_for_that_caller_only():
-    """A lifecycle row is shared, so it is visible to every caller but owned by
-    none. A subject-scoped clear dropped only that subject's own rows, so the
-    shared ones survived and the reload straight after "Clear log" brought them
-    back: the button visibly did nothing to them. Dropping them outright is not
-    an option either, since that erases another caller's history.
-    """
+    """Clear hides shared lifecycle rows for that caller only; deleting them would erase others' history."""
     monitor = ApiMonitor(max_entries = 10)
-    mine = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "org/A",
-        prompt = "user: hi",
-        subject = "alice",
-    )
+    mine = _start(monitor, model = "org/A", prompt = "user: hi", subject = "alice")
     monitor.finish(mine)
     shared = monitor.record_lifecycle(event = "unload", model = "org/A")
 
@@ -736,7 +562,6 @@ def test_clear_hides_shared_lifecycle_rows_for_that_caller_only():
     monitor.clear(subject = "alice")
 
     assert monitor.snapshot(subject = "alice") == []
-    # Hidden for alice, not deleted, so bob's view is untouched.
     assert {e["id"] for e in monitor.snapshot(subject = "bob")} == {shared}
     assert monitor.get(shared, subject = "alice") is None
     assert monitor.get(shared, subject = "bob") is not None
@@ -757,17 +582,17 @@ def test_hidden_shared_ids_do_not_outlive_their_entries():
     monitor = ApiMonitor(max_entries = 2)
     monitor.record_lifecycle(event = "unload", model = "org/A")
     monitor.clear(subject = "alice")
-    assert monitor._hidden_shared.get("alice")
+    from utils.account_context import current_account_id
+
+    key = (current_account_id(), "alice")
+    assert monitor._hidden_shared.get(key)
     for i in range(5):
         monitor.record_lifecycle(event = "unload", model = f"org/M{i}")
-    assert not monitor._hidden_shared.get("alice")
+    assert not monitor._hidden_shared.get(key)
 
 
 def test_an_api_triggered_lifecycle_row_carries_the_attribution():
-    """The overlay opens on API-key traffic only. An auto-switch or auto-download
-    that is refused never reaches api_monitor.start, so the lifecycle row is the
-    whole trace of that request; without the attribution the monitor stayed shut
-    on exactly the failures it exists to surface."""
+    """A refused auto-switch never reaches start, so its lifecycle row must carry via_api_key."""
     monitor = ApiMonitor(max_entries = 5)
 
     api_load = monitor.record_lifecycle(
@@ -777,11 +602,9 @@ def test_an_api_triggered_lifecycle_row_carries_the_attribution():
 
     rows = {e["id"]: e for e in monitor.snapshot()}
     assert rows[api_load]["via_api_key"] is True
-    # A background unload is not API traffic and must not pop the overlay.
     idle = [e for e in rows.values() if e["event"] == "unload"]
     assert idle and all(e["via_api_key"] is False for e in idle)
 
-    # The failure path keeps it: failing the row must not drop the attribution.
     monitor.fail(api_load, error = "auto-switch refused")
     after = {e["id"]: e for e in monitor.snapshot()}
     assert after[api_load]["via_api_key"] is True
@@ -789,10 +612,7 @@ def test_an_api_triggered_lifecycle_row_carries_the_attribution():
 
 
 def test_an_api_lifecycle_row_pops_the_overlay_only_for_its_own_caller():
-    """A lifecycle row is shared so it appears in every monitor list, and it also
-    carries via_api_key, which is what the floating panel auto-opens on. Reported
-    to everyone, the panel springs open in a browser that had nothing to do with
-    the traffic. The row stays visible to all; only the attribution is scoped."""
+    """The row is shared, but via_api_key only opens the overlay for the caller that made the request."""
     monitor = ApiMonitor(max_entries = 5)
 
     row = monitor.record_lifecycle(
@@ -805,15 +625,12 @@ def test_an_api_lifecycle_row_pops_the_overlay_only_for_its_own_caller():
 
     mine = {e["id"]: e for e in monitor.snapshot(subject = "alice")}
     theirs = {e["id"]: e for e in monitor.snapshot(subject = "bob")}
-    # Shared visibility is deliberate and must survive: bob still sees the load.
     assert row in mine and row in theirs
     assert mine[row]["via_api_key"] is True
     assert theirs[row]["via_api_key"] is False
 
-    # The details read is scoped the same way, so the panel cannot re-derive it.
     assert monitor.get(row, subject = "alice")["via_api_key"] is True
     assert monitor.get(row, subject = "bob")["via_api_key"] is False
-    # An unscoped read (internal callers) still sees the row's own flag.
     assert monitor.get(row)["via_api_key"] is True
 
 
@@ -833,9 +650,6 @@ def test_clearing_hides_a_shared_row_this_caller_owns_rather_than_deleting_it():
     assert monitor.get(row, subject = "bob") is not None
 
 
-# ── stream framing must not depend on the monitor ───────────────────
-
-
 def test_sse_done_detection_accepts_both_spacings():
     done = inference_route._is_openai_sse_done
     assert done("data: [DONE]") is True
@@ -846,18 +660,10 @@ def test_sse_done_detection_accepts_both_spacings():
 
 
 def test_sse_done_detection_is_independent_of_the_monitor():
-    """The external-provider proxy sets ``sent_done`` from the line itself.
-
-    It used to read the monitor helper's return, which is None for every line
-    once recording is off -- so the proxy appended a second [DONE] after the
-    provider's own, changing client-visible framing based on a logging flag.
-    """
+    """The proxy sets sent_done from the line itself, so a logging flag cannot add a second [DONE]."""
     line = "data: [DONE]"
     assert inference_route._monitor_openai_sse_line(None, line) is None
     assert inference_route._is_openai_sse_done(line) is True
-
-
-# ── /monitor route: the disabled state has to reach the UI ──────────
 
 
 def test_monitor_route_reports_enabled(monkeypatch):
@@ -870,8 +676,6 @@ def test_monitor_route_reports_enabled(monkeypatch):
 def test_monitor_route_reports_disabled(monkeypatch):
     response = _get_monitor(monkeypatch, enabled = False)
 
-    # An empty list on its own is indistinguishable from "no traffic yet", so the
-    # console needs the flag to explain itself instead of claiming idleness.
     assert response.status_code == 200
     payload = response.json()
     assert payload["logging_enabled"] is False
@@ -882,13 +686,7 @@ def test_monitor_route_disabled_still_hides_recorded_rows(monkeypatch):
     """A disabled monitor records nothing, so the route reports an empty list
     even after traffic that would otherwise have shown up."""
     monkeypatch.setattr(inference_route, "api_monitor", ApiMonitor(enabled = False))
-    inference_route.api_monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "m",
-        prompt = "hi",
-        subject = "test-user",
-    )
+    _start(inference_route.api_monitor, subject = "test-user")
     app = FastAPI()
     app.include_router(inference_route.studio_router)
     app.dependency_overrides = {get_current_subject: lambda: "test-user"}
@@ -900,13 +698,7 @@ def test_monitor_route_disabled_still_hides_recorded_rows(monkeypatch):
 
 def test_set_perf_records_stats_and_snapshot_reports_them():
     monitor = ApiMonitor(max_entries = 3)
-    entry_id = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "local-model",
-        prompt = "user: hello",
-    )
-    # set_reply never stamps TTFT; this is the case the prompt_ms fallback exists for.
+    entry_id = _start(monitor, model = "local-model", prompt = "user: hello")
     monitor.set_reply(entry_id, "hi")
     monitor.set_perf(
         entry_id,
@@ -925,14 +717,8 @@ def test_set_perf_records_stats_and_snapshot_reports_them():
 
 
 def test_measured_ttft_wins_over_engine_prefill():
-    # Queue wait precedes llama-server, so prefill-only prompt_ms under-reports TTFT.
     monitor = ApiMonitor(max_entries = 3)
-    entry_id = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "local-model",
-        prompt = "user: hello",
-    )
+    entry_id = _start(monitor, model = "local-model", prompt = "user: hello")
     entry = next(e for e in monitor._entries if e.id == entry_id)
     entry.started_monotonic -= 2.0
     monitor.append_reply(entry_id, "hi")
@@ -945,12 +731,7 @@ def test_measured_ttft_wins_over_engine_prefill():
 
 def test_set_perf_rejects_non_finite_values():
     monitor = ApiMonitor(max_entries = 3)
-    entry_id = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "local-model",
-        prompt = "user: hello",
-    )
+    entry_id = _start(monitor, model = "local-model", prompt = "user: hello")
     monitor.set_perf(
         entry_id,
         tok_per_sec = float("nan"),
@@ -968,12 +749,7 @@ def test_set_perf_rejects_non_finite_values():
 
 def test_full_response_reply_does_not_stamp_ttft():
     monitor = ApiMonitor(max_entries = 3)
-    entry_id = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "local-model",
-        prompt = "user: hello",
-    )
+    entry_id = _start(monitor, model = "local-model", prompt = "user: hello")
     monitor.set_reply(entry_id, "full response")
     monitor.append_reply(entry_id, " tail", stamp_first_token = False)
     monitor.finish(entry_id)
@@ -985,12 +761,7 @@ def test_full_response_reply_does_not_stamp_ttft():
 
 def test_set_usage_rejects_malformed_token_counts():
     monitor = ApiMonitor(max_entries = 3)
-    entry_id = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "local-model",
-        prompt = "user: hello",
-    )
+    entry_id = _start(monitor, model = "local-model", prompt = "user: hello")
     monitor.append_reply(entry_id, "hi")
     monitor.set_usage(
         entry_id,
@@ -1009,24 +780,14 @@ def test_set_usage_rejects_malformed_token_counts():
 
 def test_mark_first_token_stamps_ttft_for_reasoning_only_streams():
     monitor = ApiMonitor(max_entries = 3)
-    entry_id = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "local-model",
-        prompt = "user: hello",
-    )
+    entry_id = _start(monitor, model = "local-model", prompt = "user: hello")
     monitor.mark_first_token(entry_id)
     monitor.finish(entry_id)
 
     [entry] = monitor.snapshot()
     assert entry["ttft_ms"] is not None
 
-    entry_id2 = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "local-model",
-        prompt = "user: hello",
-    )
+    entry_id2 = _start(monitor, model = "local-model", prompt = "user: hello")
     monitor.mark_first_token(entry_id2)
     first = monitor._find_locked(entry_id2).first_token_monotonic
     monitor.append_reply(entry_id2, "visible")
@@ -1034,8 +795,7 @@ def test_mark_first_token_stamps_ttft_for_reasoning_only_streams():
 
 
 def test_queue_state_counts_direct_overflow_as_queued(monkeypatch):
-    # Direct calls hold no lease, so overflow past capacity must show as queued,
-    # not get clamped out of the readout.
+    # Direct calls hold no lease, so overflow must show as queued.
     from types import SimpleNamespace
 
     import routes.inference as inf
@@ -1058,14 +818,13 @@ def test_queue_state_counts_direct_overflow_as_queued(monkeypatch):
 
 
 def test_non_streaming_responses_reports_its_finish_reason(monkeypatch):
-    # Stop reason must be read off the choice, or the row shows a blank.
     import routes.inference as inf
 
     monitor = ApiMonitor(max_entries = 3)
     monkeypatch.setattr(inf, "api_monitor", monitor)
-    entry_id = monitor.start(
+    entry_id = _start(
+        monitor,
         endpoint = "/v1/responses",
-        method = "POST",
         model = "local-model",
         prompt = "user: hello",
     )
@@ -1074,7 +833,6 @@ def test_non_streaming_responses_reports_its_finish_reason(monkeypatch):
         "timings": {"predicted_per_second": 12.5, "prompt_ms": 80.0},
     }
     choices = body.get("choices", [])
-    # Mirrors the call the route makes at the end of _responses_non_streaming.
     inf._monitor_usage(
         entry_id,
         {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
@@ -1091,7 +849,6 @@ def test_non_streaming_responses_reports_its_finish_reason(monkeypatch):
 
 
 def test_parked_tool_resume_counts_as_queued():
-    # Without resume tickets counted, the readout shows a full server with nothing queued.
     from core.inference.llama_admission import LlamaAdmissionQueue
 
     queue = LlamaAdmissionQueue("http://llama.test")
@@ -1100,10 +857,7 @@ def test_parked_tool_resume_counts_as_queued():
 
 
 def test_free_never_reports_a_slot_admission_would_refuse():
-    """`free` is what a new arrival could take, so it must track _can_admit_locked:
-    a resume ticket holds a slot back, so counting it in `queued` without dropping it
-    from `free` prints free slots next to a queued request.
-    """
+    """free must match _can_admit_locked, since a resume ticket holds a slot back from new arrivals."""
     from core.inference.llama_admission import LlamaAdmissionQueue
     for capacity, held, tickets in itertools.product(range(1, 5), range(0, 5), range(0, 3)):
         if held > capacity:
@@ -1150,17 +904,9 @@ def test_queue_panel_never_shows_a_free_slot_next_to_a_resume(monkeypatch):
 
 
 def test_set_perf_survives_an_out_of_range_engine_number():
-    """float() on a huge upstream int raises OverflowError, which is not ValueError,
-    and these helpers run inside streaming generators where a raise truncates the
-    user's response.
-    """
+    """float() of a huge int raises OverflowError, which a ValueError handler misses, inside a stream."""
     monitor = ApiMonitor(max_entries = 3)
-    entry_id = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "local-model",
-        prompt = "user: hello",
-    )
+    entry_id = _start(monitor, model = "local-model", prompt = "user: hello")
     huge = int("9" * 400)
     monitor.set_perf(entry_id, tok_per_sec = huge, prompt_ms = huge, stop_reason = "stop")
     monitor.finish(entry_id)
@@ -1190,27 +936,18 @@ def test_monitor_chunk_never_raises_on_a_malformed_upstream_chunk(monkeypatch, c
 
     monitor = ApiMonitor(max_entries = 3)
     monkeypatch.setattr(inf, "api_monitor", monitor)
-    entry_id = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "local-model",
-        prompt = "user: hello",
-    )
+    entry_id = _start(monitor, model = "local-model", prompt = "user: hello")
     inf._monitor_openai_chunk(entry_id, chunk, 4096, streaming = True)
-    # snapshot() divides by the recorded counts, so it has to survive them too.
     assert monitor.snapshot()
 
 
 def test_direct_llama_counter_is_started_last_before_its_guarding_try():
-    """Anything between started() and the try leaks a permanent +1 if it raises, and
-    this counter has no reset hook, so one leak pins the slot panel at busy until the
-    process restarts.
-    """
+    """started() must come last before the try, since anything raised between them leaks a busy slot."""
     import ast
     import inspect
     import textwrap
 
-    for func_name in ("openai_completions", "openai_embeddings", "_direct_llama_request"):
+    for func_name in ("openai_completions", "_monitored_llama_call", "_direct_llama_request"):
         tree = ast.parse(textwrap.dedent(inspect.getsource(getattr(inference_route, func_name))))
         started = [
             node
@@ -1256,7 +993,6 @@ def _llama_slot_readout(
         context_length = 4096,
         model_identifier = "some/tts-GGUF",
         _is_audio = is_audio,
-        # A real GGUF TTS codec: /audio/generate rejects anything llama.cpp cannot decode.
         _audio_type = "snac",
         _auth_headers = None,
     )
@@ -1267,10 +1003,7 @@ def _llama_slot_readout(
 
 
 def test_queue_state_counts_rag_vision_captioning(monkeypatch):
-    """RAG captioning/OCR reaches llama-server with no lease (see the
-    LlamaAdmissionQueue docstring), so without the direct count the panel reported an
-    idle server for the whole ingestion.
-    """
+    """RAG captioning reaches llama-server with no lease, so the panel must count it directly."""
     import routes.inference as inf
     from core.rag import captioner
 
@@ -1392,17 +1125,11 @@ def test_gguf_tts_balances_the_direct_counter(monkeypatch, outcome):
 
 
 def test_top_level_provider_tool_event_stamps_first_token(monkeypatch):
-    # _toolEvent rides the chunk itself, beside choices, with an empty delta.
     import routes.inference as inf
 
     monitor = ApiMonitor(max_entries = 3)
     monkeypatch.setattr(inf, "api_monitor", monitor)
-    entry_id = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "provider/model",
-        prompt = "hi",
-    )
+    entry_id = _start(monitor, model = "provider/model")
     inf._monitor_openai_chunk(
         entry_id,
         {
@@ -1419,20 +1146,13 @@ def test_top_level_provider_tool_event_stamps_first_token(monkeypatch):
 
 
 def test_disagreeing_choice_finish_reasons_report_no_stop_reason(monkeypatch):
-    # The row aggregates every choice, so one choice's reason is only the request's
-    # when they all agree.
     import routes.inference as inf
 
     monitor = ApiMonitor(max_entries = 3)
     monkeypatch.setattr(inf, "api_monitor", monitor)
 
     def row_for(reasons):
-        entry_id = monitor.start(
-            endpoint = "/v1/chat/completions",
-            method = "POST",
-            model = "m",
-            prompt = "hi",
-        )
+        entry_id = _start(monitor)
         inf._monitor_openai_chunk(
             entry_id,
             {
@@ -1451,20 +1171,14 @@ def test_disagreeing_choice_finish_reasons_report_no_stop_reason(monkeypatch):
 
 
 def test_streamed_choice_finish_reasons_are_compared_across_chunks(monkeypatch):
-    # llama-server streams an n > 1 request as one single-choice chunk per sample, so
-    # agreement can only be judged across the whole stream, not inside one chunk.
+    # n > 1 streams one choice per chunk; judge agreement across the stream.
     import routes.inference as inf
 
     monitor = ApiMonitor(max_entries = 3)
     monkeypatch.setattr(inf, "api_monitor", monitor)
 
     def row_for(reasons):
-        entry_id = monitor.start(
-            endpoint = "/v1/completions",
-            method = "POST",
-            model = "m",
-            prompt = "hi",
-        )
+        entry_id = _start(monitor, endpoint = "/v1/completions")
         for i, reason in enumerate(reasons):
             inf._monitor_openai_sse_line(
                 entry_id,
@@ -1476,20 +1190,13 @@ def test_streamed_choice_finish_reasons_are_compared_across_chunks(monkeypatch):
 
     assert row_for(["stop"]) == "stop"
     assert row_for(["stop", "stop"]) == "stop"
-    # Used to report "length": each chunk agreed with itself and the last one won.
     assert row_for(["stop", "length"]) is None
 
 
 def test_streamed_stop_reason_is_withheld_until_the_request_finishes(monkeypatch):
-    # An n > 1 stream finishes its choices in separate chunks, so publishing the first one
-    # would state a request-level verdict while the rest are still running, then retract it.
+    # Publishing the first choice's reason would later be retracted.
     monitor = ApiMonitor(max_entries = 3)
-    entry_id = monitor.start(
-        endpoint = "/v1/completions",
-        method = "POST",
-        model = "m",
-        prompt = "hi",
-    )
+    entry_id = _start(monitor, endpoint = "/v1/completions")
 
     def row():
         return next(r for r in monitor.snapshot() if r["id"] == entry_id)
@@ -1509,16 +1216,9 @@ def test_streamed_stop_reason_is_withheld_until_the_request_finishes(monkeypatch
     [("completed", "stop"), ("cancelled", None), ("failed", None), ("error", None)],
 )
 def test_stop_reason_is_kept_only_by_completed_requests(writer, status, expected):
-    # A cancelled n > 1 stream stopped its remaining choices rather than hearing from
-    # them, and several local streams record "stop" through set_perf on the way out of a
-    # cancelled loop, before the cancellation is stamped. Neither describes how it ended.
+    # Cancelled streams may record 'stop' before cancellation is stamped.
     monitor = ApiMonitor(max_entries = 3)
-    entry_id = monitor.start(
-        endpoint = "/v1/completions",
-        method = "POST",
-        model = "m",
-        prompt = "hi",
-    )
+    entry_id = _start(monitor, endpoint = "/v1/completions")
     if writer == "set_perf":
         monitor.set_perf(entry_id, stop_reason = "stop")
     else:
@@ -1533,15 +1233,8 @@ def test_stop_reason_is_kept_only_by_completed_requests(writer, status, expected
 
 
 def test_non_streaming_stop_reason_survives_the_finish(monkeypatch):
-    # Nothing accumulates on that path, so resolving at finish must not clear what
-    # set_perf already recorded.
     monitor = ApiMonitor(max_entries = 3)
-    entry_id = monitor.start(
-        endpoint = "/v1/completions",
-        method = "POST",
-        model = "m",
-        prompt = "hi",
-    )
+    entry_id = _start(monitor, endpoint = "/v1/completions")
     monitor.set_perf(entry_id, stop_reason = "stop")
     monitor.finish(entry_id)
     assert next(r for r in monitor.snapshot() if r["id"] == entry_id)["stop_reason"] == "stop"
@@ -1557,9 +1250,7 @@ def test_non_streaming_stop_reason_survives_the_finish(monkeypatch):
     ],
 )
 def test_monitor_status_counts_slots_no_row_can_see(monkeypatch, queue, expected):
-    # A direct llama call (RAG caption/OCR) opens no row, logging may be off, and another
-    # subject's work is not counted here, so rows alone would report Ready beside a busy
-    # slot readout the same response carries.
+    # Direct llama calls open no row, so rows alone would report Ready.
     import routes.inference as inf
 
     monkeypatch.setattr(inf, "api_monitor", ApiMonitor(max_entries = 3))
@@ -1591,32 +1282,23 @@ def test_monitor_status_is_idle_without_a_model(monkeypatch):
 
 
 def test_tool_card_starts_ttft_but_not_the_token_rate_clock(monkeypatch):
-    # A tool card is client output, so it starts TTFT. It is not decoded output, so the
-    # tool run (or a human confirming one) after it must not count as decoding time --
-    # dividing by that wait reports a rate near zero.
+    # Tool run / confirmation time must not count as decoding time.
     import core.inference.api_monitor as m
 
     clock = [100.0]
     monkeypatch.setattr(m.time, "monotonic", lambda: clock[0])
     monitor = ApiMonitor(max_entries = 3)
-    entry_id = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "m",
-        prompt = "hi",
-    )
+    entry_id = _start(monitor)
 
     monitor.mark_first_token(entry_id, decoded = False)
-    clock[0] = 160.0  # a minute of tool run / human confirmation
+    clock[0] = 160.0
     monitor.append_reply(entry_id, "first real token")
-    clock[0] = 162.0  # two seconds of decoding
+    clock[0] = 162.0
     monitor.set_usage(entry_id, completion_tokens = 21)
     monitor.finish(entry_id)
 
     row = next(r for r in monitor.snapshot() if r["id"] == entry_id)
-    # TTFT still measures from the card the user actually saw.
     assert row["ttft_ms"] == 0
-    # 20 gaps over 2s, not over 62s.
     assert row["tok_per_sec"] == 10.0
 
 
@@ -1626,14 +1308,8 @@ def test_a_decoded_first_token_starts_both_clocks(monkeypatch):
     clock = [100.0]
     monkeypatch.setattr(m.time, "monotonic", lambda: clock[0])
     monitor = ApiMonitor(max_entries = 3)
-    entry_id = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "m",
-        prompt = "hi",
-    )
+    entry_id = _start(monitor)
 
-    # Reasoning tokens are decoded output, so they start the rate clock as before.
     monitor.mark_first_token(entry_id)
     clock[0] = 102.0
     monitor.set_usage(entry_id, completion_tokens = 21)
@@ -1643,16 +1319,9 @@ def test_a_decoded_first_token_starts_both_clocks(monkeypatch):
 
 
 def test_a_stop_reason_written_after_finish_escapes_the_clearing():
-    # Why every route records the reason before finish(): the settle runs once, at the
-    # terminal transition, so a later write would put a natural stop reason back onto a
-    # cancelled row.
+    # The settle runs once at finish, so later writes would undo it.
     monitor = ApiMonitor(max_entries = 3)
-    entry_id = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "m",
-        prompt = "hi",
-    )
+    entry_id = _start(monitor)
     monitor.set_perf(entry_id, stop_reason = "stop")
     monitor.finish(entry_id, "cancelled")
     assert next(r for r in monitor.snapshot() if r["id"] == entry_id)["stop_reason"] is None
@@ -1665,11 +1334,9 @@ def test_a_stop_reason_written_after_finish_escapes_the_clearing():
     "line, dropped",
     [
         ('data: {"choices":[],"usage":{"completion_tokens":9}}', True),
-        # A content chunk carrying inline usage still has to reach the client.
         ('data: {"choices":[{"delta":{"content":"x"}}],"usage":{"completion_tokens":9}}', False),
         ('data: {"choices":[{"delta":{"content":"x"}}]}', False),
-        # Content that quotes the key gets past the cheap prefilter, so only the parse
-        # can tell it apart from a real usage chunk.
+        # Quoted key passes the prefilter; only the parse can tell.
         ('data: {"choices":[{"delta":{"content":"\\"usage\\":1"}}]}', False),
         ("data: [DONE]", False),
         ("data: not json", False),
@@ -1677,9 +1344,7 @@ def test_a_stop_reason_written_after_finish_escapes_the_clearing():
     ],
 )
 def test_usage_only_sse_is_recognized_for_relay_filtering(line, dropped):
-    # Providers are asked for stream usage regardless of what the caller wanted, so the
-    # proxy has to drop the standalone chunk on the way out: a client that did not opt in
-    # would index choices[0] on it. Same rule _cmpl_stream_event_out applies locally.
+    # A client that did not opt in would index choices[0] on a usage chunk.
     import routes.inference as inf
     assert inf._is_openai_usage_only_sse(line) is dropped
 
@@ -1695,8 +1360,7 @@ def test_wants_stream_usage_reads_the_callers_opt_in(include_usage, expected):
 
 
 def test_direct_llama_work_is_busy_without_the_admission_snapshot(monkeypatch):
-    # With UNSLOTH_LLAMA_ADMISSION_CONTROL=off the queue readout is None, so a caption or
-    # OCR call (which opens no row) would leave the row saying Ready while the server works.
+    # With admission off the readout is None, so track direct calls.
     import routes.inference as inf
 
     monkeypatch.setattr(inf, "api_monitor", ApiMonitor(max_entries = 3))
@@ -1715,7 +1379,6 @@ def test_direct_llama_work_is_busy_without_the_admission_snapshot(monkeypatch):
     assert body["queue"] is None
     assert body["status"] == "generating"
 
-    # Back to ready once it finishes.
     monkeypatch.setattr(inf, "_direct_llama_inflight", 0)
     assert TestClient(app).get("/monitor").json()["status"] == "ready"
 
@@ -1733,12 +1396,7 @@ def test_the_decode_span_comes_only_from_engine_timings(monkeypatch):
     """duration_ms carries the queue wait, which read a 50 tok/s model as 5. decode_ms must not."""
     monitor = ApiMonitor(max_entries = 3)
     monkeypatch.setattr(inference_route, "api_monitor", monitor)
-    entry_id = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "local-model",
-        prompt = "user: hello",
-    )
+    entry_id = _start(monitor, model = "local-model", prompt = "user: hello")
     inference_route._monitor_usage(
         entry_id,
         {"prompt_tokens": 11, "completion_tokens": 50},
@@ -1758,13 +1416,144 @@ def test_the_decode_span_comes_only_from_engine_timings(monkeypatch):
     assert row["prompt_tok_per_sec"] == 11.0
 
 
+def test_prompt_progress_updates_for_followup_prefill_and_decode_phase(monkeypatch):
+    monitor = ApiMonitor(max_entries = 3)
+    monkeypatch.setattr(inference_route, "api_monitor", monitor)
+    entry_id = _start(monitor)
+
+    monitor.set_prompt_progress(
+        entry_id,
+        total = 1000,
+        processed = 400,
+        cached = 100,
+        time_ms = 250.25,
+    )
+    row = monitor.get(entry_id)
+    assert row["running_phase"] == "prompt_processing"
+    assert row["prompt_progress"] == {
+        "total": 1000,
+        "processed": 400,
+        "cached": 100,
+        "time_ms": 250.25,
+        "percent": 40.0,
+    }
+
+    monitor.set_running_phase(entry_id, "token_generation")
+    monitor.set_prompt_progress(entry_id, total = 1000, processed = 500)
+    row = monitor.get(entry_id)
+    assert row["running_phase"] == "prompt_processing"
+    assert row["prompt_progress"]["processed"] == 500
+
+    inference_route._monitor_usage(
+        entry_id,
+        None,
+        timings = {
+            "prompt_progress": {"total": 1000, "processed": 600},
+            "running_phase": "token_generation",
+        },
+    )
+    row = monitor.get(entry_id)
+    assert row["running_phase"] == "token_generation"
+    assert row["prompt_progress"]["processed"] == 600
+
+
+def test_monitor_usage_relays_live_progress_and_decode_phase(monkeypatch):
+    monitor = ApiMonitor(max_entries = 3)
+    monkeypatch.setattr(inference_route, "api_monitor", monitor)
+    entry_id = _start(monitor)
+
+    inference_route._monitor_usage(
+        entry_id,
+        None,
+        timings = {
+            "prompt_progress": {
+                "total": 800,
+                "processed": 200,
+                "cache": 0,
+                "time_ms": 10,
+            }
+        },
+    )
+    inference_route._monitor_usage(
+        entry_id,
+        None,
+        timings = {"running_phase": "token_generation"},
+    )
+
+    row = monitor.get(entry_id)
+    assert row["running_phase"] == "token_generation"
+    assert row["prompt_progress"]["percent"] == 25.0
+
+
+@pytest.mark.parametrize(
+    "delta",
+    [
+        {
+            "tool_calls": [
+                {
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "search", "arguments": '{"query":'},
+                }
+            ]
+        },
+        {"function_call": {"name": "search", "arguments": '{"query":'}},
+    ],
+)
+def test_tool_only_stream_leaves_prefill_phase(monkeypatch, delta):
+    monitor = ApiMonitor(max_entries = 3)
+    monkeypatch.setattr(inference_route, "api_monitor", monitor)
+    entry_id = _start(monitor)
+    inference_route._monitor_openai_chunk(
+        entry_id,
+        {"prompt_progress": {"total": 1000, "processed": 1000}, "choices": []},
+        streaming = True,
+    )
+    inference_route._monitor_openai_chunk(
+        entry_id,
+        {"choices": [{"index": 0, "delta": delta}]},
+        streaming = True,
+    )
+    assert monitor.get(entry_id)["running_phase"] == "token_generation"
+
+
+def test_streaming_response_exposes_monitor_id():
+    response = inference_route._sse_streaming_response(
+        iter(()),
+        monitor_id = "apireq_test",
+    )
+    assert response.headers["X-Unsloth-Monitor-ID"] == "apireq_test"
+    assert "X-Unsloth-Monitor-ID" not in inference_route._sse_streaming_response(iter(())).headers
+
+
+def test_monitor_id_reads_the_matching_concurrent_request(monkeypatch):
+    monitor = ApiMonitor(max_entries = 3)
+    monkeypatch.setattr(inference_route, "api_monitor", monitor)
+    first_id = _start(monitor, subject = "alice", model = "same-model", prompt = "same")
+    second_id = _start(monitor, subject = "alice", model = "same-model", prompt = "same")
+    monitor.set_prompt_progress(first_id, total = 1000, processed = 200)
+    monitor.set_prompt_progress(second_id, total = 1000, processed = 800)
+
+    app = FastAPI()
+    app.include_router(inference_route.studio_router)
+    app.dependency_overrides = {get_current_subject: lambda: "alice"}
+    client = TestClient(app)
+
+    first = client.get(f"/monitor/{first_id}").json()
+    second = client.get(f"/monitor/{second_id}").json()
+    assert first["id"] != second["id"]
+    assert first["prompt_progress"]["processed"] == 200
+    assert second["prompt_progress"]["processed"] == 800
+
+
 def test_a_timings_only_final_chunk_still_sets_the_decode_span(monkeypatch):
     """llama-server can end a stream with timings and no usage."""
     monitor = ApiMonitor(max_entries = 3)
     monkeypatch.setattr(inference_route, "api_monitor", monitor)
-    entry_id = monitor.start(
+    entry_id = _start(
+        monitor,
         endpoint = "/v1/completions",
-        method = "POST",
         model = "local-model",
         prompt = "user: hello",
     )
@@ -1777,12 +1566,7 @@ def test_a_timings_only_final_chunk_still_sets_the_decode_span(monkeypatch):
 def test_a_streamed_reply_alone_reports_no_decode_span():
     """Timing the stream misses the first chunk and reasoning tokens, so report nothing."""
     monitor = ApiMonitor(max_entries = 3)
-    entry_id = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "local-model",
-        prompt = "user: hello",
-    )
+    entry_id = _start(monitor, model = "local-model", prompt = "user: hello")
     monitor.append_reply(entry_id, "hi")
     monitor.append_reply(entry_id, " there")
     monitor.finish(entry_id)
@@ -1793,7 +1577,7 @@ def test_a_streamed_reply_alone_reports_no_decode_span():
 
 
 @pytest.mark.parametrize(
-    # "1000" is absent on purpose: _finite_float_or_none coerces a numeric string.
+    # "1000" is absent: _finite_float_or_none coerces numeric strings.
     "predicted_ms",
     [float("inf"), float("nan"), -1, "abc", None, 1e308, 10**400, {}, []],
 )
@@ -1801,12 +1585,7 @@ def test_a_bad_predicted_ms_is_dropped_rather_than_raising(monkeypatch, predicte
     """json.loads accepts a bare Infinity; a raise in a streaming generator truncates the reply."""
     monitor = ApiMonitor(max_entries = 3)
     monkeypatch.setattr(inference_route, "api_monitor", monitor)
-    entry_id = monitor.start(
-        endpoint = "/v1/chat/completions",
-        method = "POST",
-        model = "local-model",
-        prompt = "user: hello",
-    )
+    entry_id = _start(monitor, model = "local-model", prompt = "user: hello")
     inference_route._monitor_usage(
         entry_id,
         {"completion_tokens": 50},
@@ -1816,3 +1595,41 @@ def test_a_bad_predicted_ms_is_dropped_rather_than_raising(monkeypatch, predicte
     monitor.finish(entry_id)
 
     assert monitor.snapshot()[0]["decode_ms"] is None
+
+
+def test_perf_callback_reports_decode_phase_once_per_prefill_round(monkeypatch):
+    import routes.inference as inf_mod
+    from core.inference.llama_cpp import _report_live_llama_timings
+
+    seen = []
+    monkeypatch.setattr(
+        inf_mod,
+        "_monitor_usage",
+        lambda *_a, timings, **_k: seen.append(timings.get("running_phase")),
+    )
+    callback = inf_mod._monitor_perf_callback("apireq_x", 4096)
+    progress = {
+        "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}}],
+        "prompt_progress": {"total": 10, "processed": 10, "cache": 0, "time_ms": 1},
+    }
+    token = {"choices": [{"index": 0, "delta": {"content": "a"}}], "timings": {"predicted_n": 1}}
+    for chunk in (progress, token, token, token, progress, token, token):
+        _report_live_llama_timings(callback, chunk)
+
+    assert seen == [None, "token_generation", None, None, None, "token_generation", None]
+
+
+def test_progress_updates_advance_updated_at_on_a_frozen_clock(monkeypatch):
+    import core.inference.api_monitor as monitor_mod
+
+    monitor = ApiMonitor(max_entries = 3)
+    entry_id = monitor.start(endpoint = "/v1/chat/completions", method = "POST", model = "m", prompt = "p")
+    monkeypatch.setattr(monitor_mod.time, "time", lambda: 1_000.0)
+    seen = []
+    for processed in (10, 20):
+        monitor.set_prompt_progress(entry_id, total = 100, processed = processed)
+        seen.append(monitor.snapshot()[0]["updated_at"])
+    monitor.set_running_phase(entry_id, "token_generation")
+    seen.append(monitor.snapshot()[0]["updated_at"])
+
+    assert seen[0] < seen[1] < seen[2]

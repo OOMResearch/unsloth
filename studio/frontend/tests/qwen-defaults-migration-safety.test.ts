@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-// The migration must never leave this tab showing sampling the server does not
-// have. Each test here failed before the fix it guards.
-
 import assert from "node:assert/strict";
 import { register } from "node:module";
 import test from "node:test";
@@ -48,17 +45,31 @@ function resetHttp(settings: Record<string, unknown>): void {
   settingsHttp.putGate = null;
 }
 
-function seedActiveQwen(): void {
+function seedActiveQwen(overrides: Record<string, unknown> = {}): void {
+  const hydratedSnapshot = { ...LEGACY_SNAPSHOT, minPMode: "custom" as const };
   useChatRuntimeStore.setState((state) => ({
-    params: { ...state.params, ...LEGACY_SNAPSHOT, checkpoint: QWEN38 },
-    paramsByModel: { [QWEN38]: LEGACY_SNAPSHOT },
+    params: { ...state.params, ...hydratedSnapshot, checkpoint: QWEN38 },
+    paramsByModel: { [QWEN38]: hydratedSnapshot },
     activePreset: "Default",
     activePresetSource: "builtin-default",
     rememberParamsPerModel: true,
     reasoningAlwaysOn: false,
     reasoningEnabled: true,
     settingsHydrated: true,
+    ...overrides,
   }));
+}
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+async function adoptQwenDefaults(): Promise<void> {
+  const active = useChatRuntimeStore.getState();
+  active.setParams(
+    { ...active.params, minP: 0, presencePenalty: 1.5 },
+    { fromModelDefaults: true },
+  );
+  await sleep(50);
 }
 
 function serverRow(key = QWEN38): Record<string, unknown> {
@@ -70,16 +81,18 @@ function serverRow(key = QWEN38): Record<string, unknown> {
   )[key];
 }
 
-const LEGACY_SETTINGS = {
+const BUILTIN_DEFAULT = {
   activePreset: "Default",
   activePresetSource: "builtin-default",
+} as const;
+
+const LEGACY_SETTINGS = {
+  ...BUILTIN_DEFAULT,
   inferenceParamsByModel: { [QWEN38]: LEGACY_SNAPSHOT },
 };
 
 test("a rejected retry leaves local sampling on the value the server kept", async () => {
   resetHttp({ ...LEGACY_SETTINGS });
-  // Another tab commits presencePenalty=0.4 between the confirming GET and the
-  // conditional write, so the compare-and-set is rejected.
   settingsHttp.beforeConditionalApply = () => {
     settingsHttp.settings = {
       ...LEGACY_SETTINGS,
@@ -90,16 +103,10 @@ test("a rejected retry leaves local sampling on the value the server kept", asyn
   };
   seedActiveQwen();
 
-  const active = useChatRuntimeStore.getState();
-  active.setParams(
-    { ...active.params, minP: 0, presencePenalty: 1.5 },
-    { fromModelDefaults: true },
-  );
-  await new Promise((resolve) => setTimeout(resolve, 50));
+  await adoptQwenDefaults();
 
   assert.equal(settingsHttp.puts.length, 0);
   assert.equal(serverRow().presencePenalty, 0.4);
-  // The local store must not advertise the rejected values.
   const after = useChatRuntimeStore.getState();
   assert.notEqual(after.params.presencePenalty, 1.5);
   assert.notEqual(
@@ -112,12 +119,7 @@ test("an accepted retry still applies the migration locally", async () => {
   resetHttp({ ...LEGACY_SETTINGS });
   seedActiveQwen();
 
-  const active = useChatRuntimeStore.getState();
-  active.setParams(
-    { ...active.params, minP: 0, presencePenalty: 1.5 },
-    { fromModelDefaults: true },
-  );
-  await new Promise((resolve) => setTimeout(resolve, 50));
+  await adoptQwenDefaults();
 
   assert.equal(settingsHttp.puts.length, 1);
   assert.equal(serverRow().presencePenalty, 1.5);
@@ -129,17 +131,11 @@ test("an accepted retry still applies the migration locally", async () => {
 
 test("a backend without the conditional route persists nothing and shows nothing", async () => {
   resetHttp({ ...LEGACY_SETTINGS });
-  // The desktop app adopts backends above a version floor, so an older one that
-  // never learned this route is a supported install rather than an error.
+  // Desktop adopts older backends without this route, so a 404 is a supported install.
   settingsHttp.conditionalStatus = 404;
   seedActiveQwen();
 
-  const active = useChatRuntimeStore.getState();
-  active.setParams(
-    { ...active.params, minP: 0, presencePenalty: 1.5 },
-    { fromModelDefaults: true },
-  );
-  await new Promise((resolve) => setTimeout(resolve, 50));
+  await adoptQwenDefaults();
 
   assert.equal(settingsHttp.puts.length, 0);
   assert.equal(serverRow().presencePenalty, 0);
@@ -153,12 +149,7 @@ test("the browser build's 405 is treated the same as an absent route", async () 
   settingsHttp.conditionalStatus = 405;
   seedActiveQwen();
 
-  const active = useChatRuntimeStore.getState();
-  active.setParams(
-    { ...active.params, minP: 0, presencePenalty: 1.5 },
-    { fromModelDefaults: true },
-  );
-  await new Promise((resolve) => setTimeout(resolve, 50));
+  await adoptQwenDefaults();
 
   assert.equal(settingsHttp.puts.length, 0);
   assert.equal(serverRow().presencePenalty, 0);
@@ -167,20 +158,12 @@ test("the browser build's 405 is treated the same as an absent route", async () 
 
 test("a preset modified during hydration is not migrated on a stale read", async () => {
   resetHttp({ ...LEGACY_SETTINGS });
-  useChatRuntimeStore.setState((state) => ({
-    params: { ...state.params, ...LEGACY_SNAPSHOT, checkpoint: QWEN38 },
-    paramsByModel: { [QWEN38]: LEGACY_SNAPSHOT },
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
-    rememberParamsPerModel: true,
-    reasoningAlwaysOn: false,
-    reasoningEnabled: true,
+  seedActiveQwen({
     settingsHydrated: false,
-  }));
+  });
   settingsHttp.hold();
   const hydration = useChatRuntimeStore.getState().hydratePersistedSettings();
-  // A slider moves while the settings GET is in flight. Its provenance write
-  // sits behind the debounce, so the server still reads "builtin-default".
+  // Provenance write sits behind the debounce, so the server still reads builtin-default.
   useChatRuntimeStore.getState().setActivePresetSource("modified");
   settingsHttp.release?.();
   await hydration;
@@ -197,41 +180,25 @@ test("a preset modified during hydration is not migrated on a stale read", async
 test("a normalized exact key cannot overwrite a row added after the read", async () => {
   const lower = QWEN38.toLowerCase();
   resetHttp({
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
+    ...BUILTIN_DEFAULT,
     inferenceParamsByModel: { [lower]: LEGACY_SNAPSHOT },
   });
   const newerRow = { temperature: 0.31, presencePenalty: 0.4, maxTokens: 2048 };
   settingsHttp.beforeConditionalApply = () => {
     settingsHttp.settings = {
-      activePreset: "Default",
-      activePresetSource: "builtin-default",
+      ...BUILTIN_DEFAULT,
       inferenceParamsByModel: {
         [lower]: LEGACY_SNAPSHOT,
         [QWEN38]: newerRow,
       },
     };
   };
-  useChatRuntimeStore.setState((state) => ({
-    params: { ...state.params, ...LEGACY_SNAPSHOT, checkpoint: QWEN38 },
+  seedActiveQwen({
     paramsByModel: { [lower]: LEGACY_SNAPSHOT },
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
-    rememberParamsPerModel: true,
-    reasoningAlwaysOn: false,
-    reasoningEnabled: true,
-    settingsHydrated: true,
-  }));
+  });
 
-  const active = useChatRuntimeStore.getState();
-  active.setParams(
-    { ...active.params, minP: 0, presencePenalty: 1.5 },
-    { fromModelDefaults: true },
-  );
-  await new Promise((resolve) => setTimeout(resolve, 50));
+  await adoptQwenDefaults();
 
-  // The exact-key row the other tab wrote must survive intact, and no
-  // per-model patch may be sent for it at all.
   assert.deepEqual(serverRow(QWEN38), newerRow);
   assert.deepEqual(serverRow(lower), LEGACY_SNAPSHOT);
   assert.deepEqual(
@@ -243,56 +210,34 @@ test("a normalized exact key cannot overwrite a row added after the read", async
 test("a model id containing slashes stays one absence-fence path segment", async () => {
   const lower = QWEN38.toLowerCase();
   resetHttp({
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
+    ...BUILTIN_DEFAULT,
     inferenceParamsByModel: { [lower]: LEGACY_SNAPSHOT },
   });
-  useChatRuntimeStore.setState((state) => ({
-    params: { ...state.params, ...LEGACY_SNAPSHOT, checkpoint: QWEN38 },
+  seedActiveQwen({
     paramsByModel: { [lower]: LEGACY_SNAPSHOT },
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
-    rememberParamsPerModel: true,
-    reasoningAlwaysOn: false,
-    reasoningEnabled: true,
-    settingsHydrated: true,
-  }));
+  });
 
-  const active = useChatRuntimeStore.getState();
-  active.setParams(
-    { ...active.params, minP: 0, presencePenalty: 1.5 },
-    { fromModelDefaults: true },
-  );
-  await new Promise((resolve) => setTimeout(resolve, 50));
+  await adoptQwenDefaults();
 
-  // Nothing raced it, so the normalization applies under the exact spelling.
   assert.equal(serverRow(QWEN38).presencePenalty, 1.5);
 });
 
 test("the loaded model's reasoning mode survives hydration", async () => {
   // A small Qwen defaults to non-thinking while storage still says thinking.
   resetHttp({
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
+    ...BUILTIN_DEFAULT,
     reasoningEnabled: true,
     inferenceParamsByModel: { [QWEN38]: LEGACY_SNAPSHOT },
   });
-  useChatRuntimeStore.setState((state) => ({
-    params: { ...state.params, ...LEGACY_SNAPSHOT, checkpoint: QWEN38 },
-    paramsByModel: { [QWEN38]: LEGACY_SNAPSHOT },
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
-    rememberParamsPerModel: true,
-    reasoningAlwaysOn: false,
+  seedActiveQwen({
     reasoningEnabled: false,
     settingsHydrated: false,
-  }));
+  });
   noteLoadedModelReasoningMode(QWEN38, false, true);
 
   await useChatRuntimeStore.getState().hydratePersistedSettings();
 
   const after = useChatRuntimeStore.getState();
-  // The pill and the sampling table have to agree; both follow the load.
   assert.equal(after.reasoningEnabled, false);
   assert.equal(after.params.temperature, 0.7);
   assert.equal(after.params.topP, 0.8);
@@ -301,58 +246,35 @@ test("the loaded model's reasoning mode survives hydration", async () => {
 });
 
 test("a status refresh cannot outrank the installation's persisted reasoning", async () => {
-  // Adoption of a resident model echoes whatever this browser had locally,
-  // which before hydration is a local default, not the installation setting.
-  // Only a load this browser performed may win.
+  // Before hydration the echo is a local default, so only a load from this browser may win.
   resetHttp({
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
+    ...BUILTIN_DEFAULT,
     reasoningEnabled: false,
     inferenceParamsByModel: { [QWEN38]: LEGACY_SNAPSHOT },
   });
-  useChatRuntimeStore.setState((state) => ({
-    params: { ...state.params, ...LEGACY_SNAPSHOT, checkpoint: QWEN38 },
-    paramsByModel: { [QWEN38]: LEGACY_SNAPSHOT },
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
-    rememberParamsPerModel: true,
-    reasoningAlwaysOn: false,
-    reasoningEnabled: true,
+  seedActiveQwen({
     settingsHydrated: false,
-  }));
-  // This browser never loaded QWEN38: clear any load marker left by an earlier
-  // case, then let a status merely report the model (fromLoad defaults false).
+  });
   noteLoadedModelReasoningMode("unsloth/Llama-3.2-3B-Instruct-GGUF", false);
   noteLoadedModelReasoningMode(QWEN38, true);
 
   await useChatRuntimeStore.getState().hydratePersistedSettings();
 
-  // The server said thinking is off for this installation. It stays off.
   assert.equal(useChatRuntimeStore.getState().reasoningEnabled, false);
 });
 
 test("the post-load refresh does not drop the load's claim on the mode", async () => {
-  // performLoad marks fromLoad, then awaits refresh(), whose status merge calls
-  // noteLoadedModelReasoningMode again with the default false. Downgrading there
-  // would let hydration replay the previous model's persisted toggle.
+  // refresh() re-notes the mode with false; downgrading would replay the previous toggle.
   resetHttp({
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
+    ...BUILTIN_DEFAULT,
     reasoningEnabled: true,
     inferenceParamsByModel: { [QWEN38]: LEGACY_SNAPSHOT },
   });
-  useChatRuntimeStore.setState((state) => ({
-    params: { ...state.params, ...LEGACY_SNAPSHOT, checkpoint: QWEN38 },
-    paramsByModel: { [QWEN38]: LEGACY_SNAPSHOT },
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
-    rememberParamsPerModel: true,
-    reasoningAlwaysOn: false,
+  seedActiveQwen({
     reasoningEnabled: false,
     settingsHydrated: false,
-  }));
+  });
   noteLoadedModelReasoningMode(QWEN38, false, true);
-  // The refresh that performLoad awaits, reporting the same model.
   noteLoadedModelReasoningMode(QWEN38, false);
 
   await useChatRuntimeStore.getState().hydratePersistedSettings();
@@ -364,25 +286,15 @@ test("the post-load refresh does not drop the load's claim on the mode", async (
 });
 
 test("a model without reasoning support is migrated as non-thinking", async () => {
-  // The load-time overlay is gated on supportsReasoning, so a toggle left over
-  // from the previous model must not pick the thinking table for the row.
+  // The overlay is gated on supportsReasoning, so a leftover toggle must not pick the thinking table.
   resetHttp({
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
+    ...BUILTIN_DEFAULT,
     inferenceParamsByModel: { [QWEN38]: LEGACY_SNAPSHOT },
   });
-  useChatRuntimeStore.setState((state) => ({
-    params: { ...state.params, ...LEGACY_SNAPSHOT, checkpoint: QWEN38 },
-    paramsByModel: { [QWEN38]: LEGACY_SNAPSHOT },
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
-    rememberParamsPerModel: true,
-    reasoningAlwaysOn: false,
-    reasoningEnabled: true,
+  seedActiveQwen({
     supportsReasoning: false,
     settingsHydrated: false,
-  }));
-  // A status reported this checkpoint, and it cannot reason.
+  });
   noteLoadedModelReasoningMode("unsloth/Llama-3.2-3B-Instruct-GGUF", false);
   useChatRuntimeStore.setState({ reasoningEnabled: true });
   noteLoadedModelReasoningMode(QWEN38, true);
@@ -394,14 +306,9 @@ test("a model without reasoning support is migrated as non-thinking", async () =
 });
 
 test("an empty stored model map is declined, since it cannot be fenced", async () => {
-  // sanitizeChatSettings drops inferenceParamsByModel: {}, so it lands in
-  // neither expected nor expectedAbsent, and the server matches expected by
-  // recursive subset, where an empty map matches a populated one. Another tab
-  // adding the first row would slip through, so this declines rather than
-  // write unfenced. An absent key is different and stays fenced.
+  // An empty map matches any populated one by recursive subset, so this declines to write unfenced.
   resetHttp({
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
+    ...BUILTIN_DEFAULT,
     inferenceParams: {
       temperature: 0.6,
       topP: 0.95,
@@ -410,16 +317,11 @@ test("an empty stored model map is declined, since it cannot be fenced", async (
     },
     inferenceParamsByModel: {},
   });
-  useChatRuntimeStore.setState((state) => ({
-    params: { ...state.params, ...LEGACY_SNAPSHOT, checkpoint: QWEN38 },
+  seedActiveQwen({
     paramsByModel: {},
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
     rememberParamsPerModel: false,
-    reasoningAlwaysOn: false,
-    reasoningEnabled: true,
     settingsHydrated: false,
-  }));
+  });
 
   await useChatRuntimeStore.getState().hydratePersistedSettings();
 
@@ -434,35 +336,29 @@ test("case-distinct POSIX paths keep separate reasoning-mode records", async () 
   const upper = "/home/u/Models/qwen3.8-27b";
   const lower = "/home/u/models/qwen3.8-27b";
   resetHttp({
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
+    ...BUILTIN_DEFAULT,
     reasoningEnabled: true,
     inferenceParamsByModel: { [lower]: LEGACY_SNAPSHOT },
   });
   useChatRuntimeStore.setState((state) => ({
     params: { ...state.params, ...LEGACY_SNAPSHOT, checkpoint: lower },
     paramsByModel: { [lower]: LEGACY_SNAPSHOT },
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
+    ...BUILTIN_DEFAULT,
     rememberParamsPerModel: true,
     reasoningAlwaysOn: false,
     reasoningEnabled: false,
     supportsReasoning: true,
     settingsHydrated: false,
   }));
-  // The load was for the other path entirely.
   noteLoadedModelReasoningMode(upper, false, true);
 
   await useChatRuntimeStore.getState().hydratePersistedSettings();
 
-  // No record for this checkpoint, so the persisted toggle stands.
   assert.equal(useChatRuntimeStore.getState().reasoningEnabled, true);
 });
 
 test("a checkpoint switch during the conditional write is not migrated", async () => {
-  // The CAS commits for QWEN38, but the user moves to another Qwen before the
-  // response resolves. Applying then would mark the second model's row migrated
-  // while the server updated only the first.
+  // Applying after a switch would mark the second row migrated; the server updated only the first.
   const other = "unsloth/Qwen3.6-9B-GGUF";
   resetHttp({ ...LEGACY_SETTINGS });
   settingsHttp.beforeConditionalApply = () => {
@@ -481,9 +377,8 @@ test("a checkpoint switch during the conditional write is not migrated", async (
     { ...active.params, minP: 0, presencePenalty: 1.5 },
     { fromModelDefaults: true },
   );
-  await new Promise((resolve) => setTimeout(resolve, 60));
+  await sleep(60);
 
-  // The row the user switched to keeps its legacy values locally.
   const after = useChatRuntimeStore.getState();
   const otherRow = after.paramsByModel[other] as Record<string, number>;
   assert.equal(otherRow.presencePenalty, 0);
@@ -491,14 +386,11 @@ test("a checkpoint switch during the conditional write is not migrated", async (
 });
 
 test("case-distinct POSIX ownership claims still conflict", async () => {
-  // Two resident-model callbacks enqueue ownership before the microtask runs.
-  // They are different files, so the competing claims must cancel each other
-  // rather than the later one silently replacing the earlier.
+  // Different files, so competing ownership claims must cancel rather than the later one win.
   const upper = "/home/u/Models/qwen3.8-27b";
   const lower = "/home/u/models/qwen3.8-27b";
   resetHttp({
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
+    ...BUILTIN_DEFAULT,
     inferenceParams: {
       temperature: 0.6,
       topP: 0.95,
@@ -509,8 +401,7 @@ test("case-distinct POSIX ownership claims still conflict", async () => {
   useChatRuntimeStore.setState((state) => ({
     params: { ...state.params, ...LEGACY_SNAPSHOT, checkpoint: lower },
     paramsByModel: {},
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
+    ...BUILTIN_DEFAULT,
     rememberParamsPerModel: false,
     reasoningAlwaysOn: false,
     reasoningEnabled: true,
@@ -528,7 +419,7 @@ test("case-distinct POSIX ownership claims still conflict", async () => {
     { ...second.params, checkpoint: lower },
     { fromModelDefaults: true, migrateOwnedGlobalQwenDefaults: true },
   );
-  await new Promise((resolve) => setTimeout(resolve, 60));
+  await sleep(60);
 
   const global = settingsHttp.settings.inferenceParams as Record<
     string,
@@ -539,21 +430,18 @@ test("case-distinct POSIX ownership claims still conflict", async () => {
 });
 
 test("selecting an external Qwen migrates its dormant row", async () => {
-  // No load and no status follows an external pick, so setCheckpoint is the
-  // only chance to repair the row it just replayed.
+  // No load or status follows an external pick, so setCheckpoint must repair the row.
   const external = `external::openrouter::${encodeURIComponent(
     "Qwen/Qwen3.8-27B",
   )}`;
   resetHttp({
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
+    ...BUILTIN_DEFAULT,
     inferenceParamsByModel: { [external]: LEGACY_SNAPSHOT },
   });
   useChatRuntimeStore.setState((state) => ({
     params: { ...state.params, checkpoint: "unsloth/Llama-3.2-3B-Instruct-GGUF" },
     paramsByModel: { [external]: { ...LEGACY_SNAPSHOT } },
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
+    ...BUILTIN_DEFAULT,
     rememberParamsPerModel: true,
     reasoningAlwaysOn: false,
     reasoningEnabled: true,
@@ -562,7 +450,7 @@ test("selecting an external Qwen migrates its dormant row", async () => {
   }));
 
   useChatRuntimeStore.getState().setCheckpoint(external, null);
-  await new Promise((resolve) => setTimeout(resolve, 60));
+  await sleep(60);
 
   const row = serverRow(external);
   assert.equal(row.presencePenalty, 1.5);
@@ -575,15 +463,13 @@ test("the send barrier waits for a migration a model pick just scheduled", async
     "Qwen/Qwen3.6-9B",
   )}`;
   resetHttp({
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
+    ...BUILTIN_DEFAULT,
     inferenceParamsByModel: { [external]: LEGACY_SNAPSHOT },
   });
   useChatRuntimeStore.setState((state) => ({
     params: { ...state.params, checkpoint: "unsloth/Llama-3.2-3B-Instruct-GGUF" },
     paramsByModel: { [external]: { ...LEGACY_SNAPSHOT } },
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
+    ...BUILTIN_DEFAULT,
     rememberParamsPerModel: true,
     reasoningAlwaysOn: false,
     reasoningEnabled: true,
@@ -592,9 +478,7 @@ test("the send barrier waits for a migration a model pick just scheduled", async
   }));
 
   useChatRuntimeStore.getState().setCheckpoint(external, null);
-  // What the run does before sending. No sleep: the point is that this alone
-  // is enough, since the row is still legacy the microtask before it. Raced
-  // against a deadline so a regression fails here instead of hanging CI.
+  // Raced against a deadline so a regression fails instead of hanging CI.
   const settled = await Promise.race([
     awaitPendingQwenDefaultsMigration().then(() => "settled"),
     new Promise((resolve) => setTimeout(() => resolve("timeout"), 5000)),
@@ -607,7 +491,6 @@ test("the send barrier waits for a migration a model pick just scheduled", async
 
 test("an edit racing the conditional write does not strand local on legacy", async () => {
   resetHttp({ ...LEGACY_SETTINGS });
-  // The user moves a control after the confirming GET, while the write is out.
   settingsHttp.beforeConditionalApply = () => {
     useChatRuntimeStore.getState().setActivePresetSource("modified");
   };
@@ -618,10 +501,8 @@ test("an edit racing the conditional write does not strand local on legacy", asy
     { ...active.params, minP: 0, presencePenalty: 1.5 },
     { fromModelDefaults: true },
   );
-  await new Promise((resolve) => setTimeout(resolve, 60));
+  await sleep(60);
 
-  // The server took the migration, so the tab must not keep generating from the
-  // values it no longer holds.
   assert.equal(serverRow().presencePenalty, 1.5);
   const after = useChatRuntimeStore.getState();
   assert.equal(after.activePresetSource, "modified");
@@ -630,8 +511,7 @@ test("an edit racing the conditional write does not strand local on legacy", asy
 });
 
 test("a decision field that sanitizes away blocks the write", async () => {
-  // An explicit null cannot be asserted as a value or as an absence, so the
-  // migration declines rather than writing unfenced.
+  // An explicit null cannot be fenced as value or absence, so the migration declines.
   resetHttp({ ...LEGACY_SETTINGS, activePresetSource: null });
   seedActiveQwen();
 
@@ -640,22 +520,19 @@ test("a decision field that sanitizes away blocks the write", async () => {
     { ...active.params, minP: 0, presencePenalty: 1.5 },
     { fromModelDefaults: true },
   );
-  await new Promise((resolve) => setTimeout(resolve, 60));
+  await sleep(60);
 
-  // The row itself, not the queue: an earlier case's debounced PUT can land in
-  // this window and says nothing about whether the migration wrote.
+  // Check the row, not the queue: an earlier case's debounced PUT can land here.
   assert.equal(serverRow().presencePenalty, 0);
   assert.equal(serverRow().minP, 0.01);
 });
 
 test("a case-distinct external switch during the write is not migrated", async () => {
-  // Provider-qualified ids are opaque, so these are two different models even
-  // though normalizeModelIdentity would fold them together.
+  // Provider-qualified ids are opaque even though normalizeModelIdentity would fold them.
   const upper = `external::vendor::${encodeURIComponent("Vendor/Qwen3.8-27B")}`;
   const lower = `external::vendor::${encodeURIComponent("vendor/qwen3.8-27b")}`;
   resetHttp({
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
+    ...BUILTIN_DEFAULT,
     inferenceParamsByModel: {
       [upper]: LEGACY_SNAPSHOT,
       [lower]: LEGACY_SNAPSHOT,
@@ -672,8 +549,7 @@ test("a case-distinct external switch during the write is not migrated", async (
       [upper]: { ...LEGACY_SNAPSHOT },
       [lower]: { ...LEGACY_SNAPSHOT },
     },
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
+    ...BUILTIN_DEFAULT,
     rememberParamsPerModel: true,
     reasoningAlwaysOn: false,
     reasoningEnabled: true,
@@ -686,9 +562,8 @@ test("a case-distinct external switch during the write is not migrated", async (
     { ...active.params, minP: 0, presencePenalty: 1.5 },
     { fromModelDefaults: true },
   );
-  await new Promise((resolve) => setTimeout(resolve, 60));
+  await sleep(60);
 
-  // Only the row the write was for; the other model keeps its own values.
   const lowerRow = useChatRuntimeStore.getState().paramsByModel[lower] as Record<
     string,
     number
@@ -700,16 +575,13 @@ test("a case-distinct external switch during the write is not migrated", async (
 test("an earlier retry settling does not clear a later retry's barrier", async () => {
   const QWEN36 = "unsloth/Qwen3.6-14B-GGUF";
   const base = {
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
+    ...BUILTIN_DEFAULT,
     inferenceParamsByModel: {
       [QWEN38]: { ...LEGACY_SNAPSHOT },
       [QWEN36]: { ...LEGACY_SNAPSHOT },
     },
   };
   resetHttp({ ...base });
-  // Both confirming GETs are held, so the first retry finishes while the second
-  // is still deciding.
   const holdGet = (): [Promise<Record<string, unknown>>, () => void] => {
     let release: () => void = () => undefined;
     const held = new Promise<Record<string, unknown>>((resolve) => {
@@ -720,26 +592,19 @@ test("an earlier retry settling does not clear a later retry's barrier", async (
   const [firstGet, releaseFirst] = holdGet();
   const [secondGet, releaseSecond] = holdGet();
   settingsHttp.getResponses.push(firstGet, secondGet);
-  useChatRuntimeStore.setState((state) => ({
-    params: { ...state.params, ...LEGACY_SNAPSHOT, checkpoint: QWEN38 },
+  seedActiveQwen({
     paramsByModel: {
       [QWEN38]: { ...LEGACY_SNAPSHOT },
       [QWEN36]: { ...LEGACY_SNAPSHOT },
     },
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
-    rememberParamsPerModel: true,
-    reasoningAlwaysOn: false,
-    reasoningEnabled: true,
-    settingsHydrated: true,
-  }));
+  });
 
   const first = useChatRuntimeStore.getState();
   first.setParams(
     { ...first.params, minP: 0, presencePenalty: 1.5 },
     { fromModelDefaults: true },
   );
-  await new Promise((resolve) => setTimeout(resolve, 0));
+  await sleep(0);
   useChatRuntimeStore.setState((state) => ({
     params: { ...state.params, ...LEGACY_SNAPSHOT, checkpoint: QWEN36 },
   }));
@@ -748,13 +613,12 @@ test("an earlier retry settling does not clear a later retry's barrier", async (
     { ...second.params, minP: 0, presencePenalty: 1.5 },
     { fromModelDefaults: true },
   );
-  await new Promise((resolve) => setTimeout(resolve, 10));
+  await sleep(10);
   releaseFirst();
-  await new Promise((resolve) => setTimeout(resolve, 30));
+  await sleep(30);
   setTimeout(releaseSecond, 40);
 
-  // A barrier cleared by the wrong retry resolves here with the second row
-  // still legacy; the deadline keeps that a failure rather than a hang.
+  // The deadline keeps a wrongly cleared barrier a failure rather than a hang.
   await Promise.race([
     awaitPendingQwenDefaultsMigration(),
     new Promise((resolve) => setTimeout(resolve, 5000)),
@@ -765,8 +629,7 @@ test("an earlier retry settling does not clear a later retry's barrier", async (
 test("the send barrier follows a retry that replaces the one it captured", async () => {
   const QWEN36 = "unsloth/Qwen3.6-14B-GGUF";
   const base = {
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
+    ...BUILTIN_DEFAULT,
     inferenceParamsByModel: {
       [QWEN38]: { ...LEGACY_SNAPSHOT },
       [QWEN36]: { ...LEGACY_SNAPSHOT },
@@ -783,27 +646,19 @@ test("the send barrier follows a retry that replaces the one it captured", async
   const [firstGet, releaseFirst] = holdGet();
   const [secondGet, releaseSecond] = holdGet();
   settingsHttp.getResponses.push(firstGet, secondGet);
-  useChatRuntimeStore.setState((state) => ({
-    params: { ...state.params, ...LEGACY_SNAPSHOT, checkpoint: QWEN38 },
+  seedActiveQwen({
     paramsByModel: {
       [QWEN38]: { ...LEGACY_SNAPSHOT },
       [QWEN36]: { ...LEGACY_SNAPSHOT },
     },
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
-    rememberParamsPerModel: true,
-    reasoningAlwaysOn: false,
-    reasoningEnabled: true,
-    settingsHydrated: true,
-  }));
+  });
 
   const first = useChatRuntimeStore.getState();
   first.setParams(
     { ...first.params, minP: 0, presencePenalty: 1.5 },
     { fromModelDefaults: true },
   );
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  // The send joins here, so it captures the first retry.
+  await sleep(0);
   const barrier = awaitPendingQwenDefaultsMigration();
   useChatRuntimeStore.setState((state) => ({
     params: { ...state.params, ...LEGACY_SNAPSHOT, checkpoint: QWEN36 },
@@ -813,7 +668,7 @@ test("the send barrier follows a retry that replaces the one it captured", async
     { ...second.params, minP: 0, presencePenalty: 1.5 },
     { fromModelDefaults: true },
   );
-  await new Promise((resolve) => setTimeout(resolve, 10));
+  await sleep(10);
   releaseFirst();
   setTimeout(releaseSecond, 60);
 
@@ -821,7 +676,6 @@ test("the send barrier follows a retry that replaces the one it captured", async
     barrier,
     new Promise((resolve) => setTimeout(resolve, 5000)),
   ]);
-  // The checkpoint the send would generate from is the second one.
   assert.equal(serverRow(QWEN36).presencePenalty, 1.5);
 });
 
@@ -832,11 +686,9 @@ test("a write outlasting the flush timeout rearms the migration", async () => {
     releasePut = resolve;
   });
   seedActiveQwen();
-  // An unrelated setting write, held open past the debounce so it is still on
-  // the wire when the migration tries to land.
   const before = useChatRuntimeStore.getState();
   before.setAutoTitle(!before.autoTitle);
-  await new Promise((resolve) => setTimeout(resolve, 600));
+  await sleep(600);
 
   const active = useChatRuntimeStore.getState();
   active.setParams(
@@ -844,12 +696,12 @@ test("a write outlasting the flush timeout rearms the migration", async () => {
     { fromModelDefaults: true },
   );
   // Past the 2000 ms flush timeout with the ordinary write still outstanding.
-  await new Promise((resolve) => setTimeout(resolve, 2600));
+  await sleep(2600);
   assert.equal(serverRow().presencePenalty, 0);
 
   releasePut();
   settingsHttp.putGate = null;
-  await new Promise((resolve) => setTimeout(resolve, 200));
+  await sleep(200);
   await Promise.race([
     awaitPendingQwenDefaultsMigration(),
     new Promise((resolve) => setTimeout(resolve, 5000)),
@@ -858,25 +710,16 @@ test("a write outlasting the flush timeout rearms the migration", async () => {
 });
 
 test("a status-only reasoning marker does not pick the migration table", async () => {
-  // Status for a resident model lands before the settings GET, so the marker
-  // carries this browser's local default rather than an answer about the model.
+  // Status lands before the settings GET, so the marker holds the local default.
   resetHttp({
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
+    ...BUILTIN_DEFAULT,
     reasoningEnabled: false,
     inferenceParamsByModel: { [QWEN38]: LEGACY_SNAPSHOT },
   });
-  useChatRuntimeStore.setState((state) => ({
-    params: { ...state.params, ...LEGACY_SNAPSHOT, checkpoint: QWEN38 },
+  seedActiveQwen({
     paramsByModel: { [QWEN38]: { ...LEGACY_SNAPSHOT } },
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
-    rememberParamsPerModel: true,
     supportsReasoning: true,
-    reasoningAlwaysOn: false,
-    reasoningEnabled: true,
-    settingsHydrated: true,
-  }));
+  });
   noteLoadedModelReasoningMode(QWEN38, true);
 
   const active = useChatRuntimeStore.getState();
@@ -884,38 +727,28 @@ test("a status-only reasoning marker does not pick the migration table", async (
     { ...active.params, minP: 0, presencePenalty: 1.5 },
     { fromModelDefaults: true },
   );
-  await new Promise((resolve) => setTimeout(resolve, 60));
+  await sleep(60);
 
-  // The persisted toggle is off, so the non-thinking row is what the pill will
-  // hydrate against.
   assert.equal(serverRow().temperature, 0.7);
   assert.equal(serverRow().topP, 0.8);
 });
 
 test("a null model map is fenced rather than treated as empty", async () => {
-  // Only a genuinely empty map means "no per-model memory". A null is a key the
-  // row holds, so another tab can replace it with rows this write never saw,
-  // and the compare-and-set asserts neither its value nor its absence.
+  // A null map is a key another tab can replace, and the CAS asserts neither value nor absence.
   resetHttp({
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
+    ...BUILTIN_DEFAULT,
     inferenceParams: { ...LEGACY_SNAPSHOT },
     inferenceParamsByModel: null,
   });
-  useChatRuntimeStore.setState((state) => ({
-    params: { ...state.params, ...LEGACY_SNAPSHOT, checkpoint: QWEN38 },
+  seedActiveQwen({
     paramsByModel: {},
-    activePreset: "Default",
     activePresetSource: "custom",
     rememberParamsPerModel: false,
-    reasoningAlwaysOn: false,
-    reasoningEnabled: true,
     supportsReasoning: true,
-    settingsHydrated: true,
-  }));
+  });
 
   useChatRuntimeStore.getState().setActivePresetSource("builtin-default");
-  await new Promise((resolve) => setTimeout(resolve, 80));
+  await sleep(80);
 
   const globals = settingsHttp.settings.inferenceParams as Record<
     string,
@@ -927,29 +760,21 @@ test("a null model map is fenced rather than treated as empty", async () => {
 
 test("per-model memory enabled during the read cancels the global migration", async () => {
   const OTHER = "unsloth/Llama-3.2-3B-GGUF";
-  // Scheduled while the global snapshot was the active model's to rewrite; the
-  // confirming read shows per-model memory on, so it no longer is.
   resetHttp({
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
+    ...BUILTIN_DEFAULT,
     rememberParamsPerModel: true,
     inferenceParams: { ...LEGACY_SNAPSHOT },
     inferenceParamsByModel: { [OTHER]: { ...LEGACY_SNAPSHOT } },
   });
-  useChatRuntimeStore.setState((state) => ({
-    params: { ...state.params, ...LEGACY_SNAPSHOT, checkpoint: QWEN38 },
+  seedActiveQwen({
     paramsByModel: {},
-    activePreset: "Default",
     activePresetSource: "custom",
     rememberParamsPerModel: false,
-    reasoningAlwaysOn: false,
-    reasoningEnabled: true,
     supportsReasoning: true,
-    settingsHydrated: true,
-  }));
+  });
 
   useChatRuntimeStore.getState().setActivePresetSource("builtin-default");
-  await new Promise((resolve) => setTimeout(resolve, 80));
+  await sleep(80);
 
   const globals = settingsHttp.settings.inferenceParams as Record<
     string,
@@ -970,7 +795,7 @@ test("a wedged backend does not hold a send open forever", async () => {
     { ...active.params, minP: 0, presencePenalty: 1.5 },
     { fromModelDefaults: true },
   );
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  await sleep(20);
 
   const started = Date.now();
   let timedOut = false;
@@ -990,19 +815,15 @@ test("a wedged backend does not hold a send open forever", async () => {
 });
 
 test("adopting the startup model clears the unowned pre-hydration mark", async () => {
-  // Status finds a resident Qwen before hydration finishes. setCheckpoint marks
-  // any pre-hydration switch as an interactive pick, and adoption is the signal
-  // that says otherwise, so the global snapshot is still this model's.
+  // setCheckpoint marks pre-hydration switches interactive; adoption says otherwise.
   resetHttp({
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
+    ...BUILTIN_DEFAULT,
     inferenceParams: { ...LEGACY_SNAPSHOT },
   });
   useChatRuntimeStore.setState((state) => ({
     params: { ...state.params, ...LEGACY_SNAPSHOT, checkpoint: "" },
     paramsByModel: {},
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
+    ...BUILTIN_DEFAULT,
     rememberParamsPerModel: false,
     reasoningAlwaysOn: false,
     reasoningEnabled: true,
@@ -1021,7 +842,7 @@ test("adopting the startup model clears the unowned pre-hydration mark", async (
 
   settingsHttp.release?.();
   await hydrating;
-  await new Promise((resolve) => setTimeout(resolve, 60));
+  await sleep(60);
 
   const global = settingsHttp.settings.inferenceParams as Record<
     string,
@@ -1031,16 +852,13 @@ test("adopting the startup model clears the unowned pre-hydration mark", async (
 });
 
 test("a thread pin survives the race recovery path", async () => {
-  // Applying a thread snapshot advances no installation mutation version, so
-  // nothing in the recovery path would otherwise notice the pin.
+  // Applying a thread snapshot advances no mutation version, so recovery would miss the pin.
   resetHttp({ ...LEGACY_SETTINGS });
   seedActiveQwen();
   useChatRuntimeStore
     .getState()
     .applyThreadScopedSettings("thread-1", { presencePenalty: 0.9 });
   useChatRuntimeStore.setState({ activeThreadId: "thread-1" });
-  // Provenance moves while the conditional write is in flight, which is the
-  // branch that copies migrated fields straight into the live params.
   settingsHttp.beforeConditionalApply = () => {
     useChatRuntimeStore.getState().setActivePresetSource("modified");
   };
@@ -1050,7 +868,7 @@ test("a thread pin survives the race recovery path", async () => {
     { ...active.params, minP: 0, presencePenalty: 1.5 },
     { fromModelDefaults: true },
   );
-  await new Promise((resolve) => setTimeout(resolve, 80));
+  await sleep(80);
 
   assert.equal(
     useChatRuntimeStore.getState().params.presencePenalty,
@@ -1061,8 +879,6 @@ test("a thread pin survives the race recovery path", async () => {
 
 test("an unreachable backend does not spin the migration rearm", async () => {
   resetHttp({ ...LEGACY_SETTINGS });
-  // Every ordinary write is refused, so the patch is retained and each pass
-  // flushes it again.
   settingsHttp.putFailures = Array.from({ length: 400 }, () => ({
     status: 503,
   }));
@@ -1075,7 +891,7 @@ test("an unreachable backend does not spin the migration rearm", async () => {
     { ...active.params, minP: 0, presencePenalty: 1.5 },
     { fromModelDefaults: true },
   );
-  await new Promise((resolve) => setTimeout(resolve, 1500));
+  await sleep(1500);
 
   assert.ok(
     settingsHttp.puts.length < 40,
@@ -1087,45 +903,34 @@ test("an unreachable backend does not spin the migration rearm", async () => {
 test("a model switch during hydration still gets its own row migrated", async () => {
   const QWEN36 = "unsloth/Qwen3.6-14B-GGUF";
   const stored = {
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
+    ...BUILTIN_DEFAULT,
     inferenceParamsByModel: {
       [QWEN38]: { ...LEGACY_SNAPSHOT },
       [QWEN36]: { ...LEGACY_SNAPSHOT },
     },
   };
   resetHttp({ ...stored });
-  // The first GET is hydration's own read; the second is the confirming read
-  // taken immediately before the write, and that is the one to hold open.
   let releaseConfirm: () => void = () => undefined;
   const confirming = new Promise<Record<string, unknown>>((resolve) => {
     releaseConfirm = () => resolve(settingsHttp.settings);
   });
   settingsHttp.getResponses.push(stored, confirming);
-  useChatRuntimeStore.setState((state) => ({
-    params: { ...state.params, ...LEGACY_SNAPSHOT, checkpoint: QWEN38 },
+  seedActiveQwen({
     paramsByModel: {
       [QWEN38]: { ...LEGACY_SNAPSHOT },
       [QWEN36]: { ...LEGACY_SNAPSHOT },
     },
-    activePreset: "Default",
-    activePresetSource: "builtin-default",
-    rememberParamsPerModel: true,
-    reasoningAlwaysOn: false,
-    reasoningEnabled: true,
     supportsReasoning: true,
     settingsHydrated: false,
-  }));
+  });
   const hydrating = useChatRuntimeStore.getState().hydratePersistedSettings();
-  await new Promise((resolve) => setTimeout(resolve, 20));
-  // The model moves while the confirming read is out. Neither switch path can
-  // schedule a retry from here, since hydration has not finished.
+  await sleep(20);
   useChatRuntimeStore.setState((state) => ({
     params: { ...state.params, ...LEGACY_SNAPSHOT, checkpoint: QWEN36 },
   }));
   releaseConfirm();
   await hydrating;
-  await new Promise((resolve) => setTimeout(resolve, 80));
+  await sleep(80);
 
   const row = (
     settingsHttp.settings.inferenceParamsByModel as Record<
@@ -1141,9 +946,7 @@ test("a custom preset chosen mid-write keeps its own legacy-valued fields", asyn
   resetHttp({ ...LEGACY_SETTINGS });
   useChatRuntimeStore.getState().applyThreadScopedSettings(null, {});
   useChatRuntimeStore.setState({ activeThreadId: null });
-  // A custom preset can hold presencePenalty 0 on purpose. Applying it leaves
-  // that field's value alone, so its mutation counter does not move and the
-  // recovery path would read it as untouched.
+  // Applying a preset with presencePenalty 0 does not move its mutation counter.
   settingsHttp.beforeConditionalApply = () => {
     useChatRuntimeStore.getState().setActivePresetSource("custom");
   };
@@ -1154,9 +957,41 @@ test("a custom preset chosen mid-write keeps its own legacy-valued fields", asyn
     { ...active.params, minP: 0, presencePenalty: 1.5 },
     { fromModelDefaults: true },
   );
-  await new Promise((resolve) => setTimeout(resolve, 80));
+  await sleep(80);
 
   const after = useChatRuntimeStore.getState().params;
   assert.equal(after.presencePenalty, 0);
   assert.equal(after.minP, 0.01);
+});
+
+// #10671: a remembered "Max" is a marker, never a live cap; adopting a migrated
+// row that carries it must leave the load's window on screen.
+test("adopting a migrated row never puts the Max marker on screen", async () => {
+  const { REMEMBERED_MAX_TOKENS_MAX } = await import(
+    "../src/features/chat/lib/per-model-params.ts"
+  );
+  const alias = QWEN38.toLowerCase();
+  const legacyMax = { ...LEGACY_SNAPSHOT, maxTokens: REMEMBERED_MAX_TOKENS_MAX };
+  resetHttp({
+    ...BUILTIN_DEFAULT,
+    inferenceParamsByModel: { [alias]: legacyMax },
+  });
+  settingsHttp.beforeConditionalApply = () => {
+    useChatRuntimeStore.getState().setActivePresetSource("modified");
+  };
+  seedActiveQwen({
+    paramsByModel: { [alias]: { ...legacyMax, minPMode: "custom" } },
+  });
+
+  const active = useChatRuntimeStore.getState();
+  active.setParams(
+    { ...active.params, minP: 0, presencePenalty: 1.5 },
+    { fromModelDefaults: true },
+  );
+  await sleep(60);
+
+  assert.notEqual(
+    useChatRuntimeStore.getState().params.maxTokens,
+    REMEMBERED_MAX_TOKENS_MAX,
+  );
 });

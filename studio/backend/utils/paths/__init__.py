@@ -15,6 +15,8 @@ from .path_utils import (
 )
 from .storage_roots import (
     studio_root,
+    account_path,
+    workspace_root,
     assets_root,
     dataset_files_in_dir,
     datasets_root,
@@ -40,7 +42,10 @@ from .storage_roots import (
     hf_default_cache_dir,
     lmstudio_model_dirs,
     ollama_model_dirs,
+    hermes_model_dirs,
+    omlx_model_dirs,
     well_known_model_dirs,
+    ensure_account_dir,
     ensure_dir,
     ensure_studio_directories,
     resolve_under_root,
@@ -52,8 +57,7 @@ from .storage_roots import (
     resolve_dataset_path,
 )
 
-# Re-export shim: mark project-path helpers as used so the import-hoist
-# safety net does not flag them as unused.
+# Re-export shim: mark helpers used for the import-hoist safety net.
 _REEXPORTED = (documents_root, project_workspaces_root, resolve_export_write_dir)
 
 __all__ = [
@@ -66,6 +70,8 @@ __all__ = [
     "reset_cache_case_resolution_state",
     "reveal_in_file_manager",
     "studio_root",
+    "account_path",
+    "workspace_root",
     "assets_root",
     "dataset_files_in_dir",
     "datasets_root",
@@ -91,7 +97,10 @@ __all__ = [
     "hf_default_cache_dir",
     "lmstudio_model_dirs",
     "ollama_model_dirs",
+    "hermes_model_dirs",
+    "omlx_model_dirs",
     "well_known_model_dirs",
+    "ensure_account_dir",
     "ensure_dir",
     "ensure_studio_directories",
     "resolve_under_root",

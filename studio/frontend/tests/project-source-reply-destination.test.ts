@@ -1,26 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-// "Save to project sources" on a reply used to upload into useProjectStore's
-// activeProjectId. That id is the project the *sidebar* is showing, and it lags
-// a thread switch: opening a chat with no project query parameter leaves the
-// previous project selected, so the item stayed enabled and the reply went into
-// a project the chat has nothing to do with. One user's project then holds
-// another's content. The destination has to come from the thread being read.
-//
-// thread.tsx is 6k lines of TSX that node cannot load, so this reads the source,
-// the way rag-availability-marker.test.ts does for the same file.
+// The sidebar's activeProjectId lags thread switches; the destination must come from the thread.
+// thread.tsx cannot be loaded by node, so read the source.
 
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-const src = await readFile(
-  new URL("../src/components/assistant-ui/thread.tsx", import.meta.url),
-  "utf8",
-);
+import { readSrcAsync } from "./helpers/kit.ts";
 
-/** The onSelect body of the "Save to project sources" action bar item. */
+const src = await readSrcAsync("components/assistant-ui/thread.tsx");
+
 function saveHandler(): string {
   const marker = src.indexOf("Save to project sources");
   assert.ok(marker > 0, "the reply action is gone or was renamed");
@@ -72,12 +62,8 @@ test("the thread id is resolved before the menu can close", () => {
   );
 });
 
-// The action is still hidden outside a project, so the reply menu does not grow
-// an item that can only refuse itself.
 test("the item is only rendered while a project is selected", () => {
   const marker = src.indexOf("Save to project sources");
-  // From the item's own opening tag, so the window cannot miss the guard by
-  // being outgrown by the handler.
   const open = src.lastIndexOf("<ActionBarMorePrimitive.Item", marker);
   const before = src.slice(Math.max(0, open - 200), open);
   assert.match(

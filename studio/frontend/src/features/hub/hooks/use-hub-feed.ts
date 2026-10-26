@@ -2,9 +2,13 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useHfEndpoint } from "@/lib/hf-endpoint";
 import { type ChannelId, findChannel } from "../lib/channels";
-import { fingerprintToken } from "../lib/token-fingerprint";
-import { isChannelEntryFresh, useHubFeedStore } from "../stores/hub-feed-store";
+import {
+  feedIdentity,
+  isChannelEntryFresh,
+  useHubFeedStore,
+} from "../stores/hub-feed-store";
 import {
   type HfModelResult,
   fetchChannelFirstPage,
@@ -26,8 +30,6 @@ export interface UseHubFeedResult {
   refetch: (id: ChannelId) => void;
 }
 
-// Only the trending row is rendered in the feed now; "Fine-tune ready" moved
-// into the format dropdown and loads its channel on demand (channel-list mode).
 const CHANNEL_IDS: readonly ChannelId[] = ["unsloth-trending"];
 const FEED_PAGE_SIZE = 20;
 const MAX_RETRIES = 5;
@@ -58,9 +60,10 @@ export function useHubFeed(opts: {
   deviceType: string | null;
 }): UseHubFeedResult {
   const { accessToken, online, enabled, deviceType } = opts;
+  const hfEndpoint = useHfEndpoint();
   const tokenFingerprint = useMemo(
-    () => fingerprintToken(accessToken),
-    [accessToken],
+    () => feedIdentity(hfEndpoint, accessToken),
+    [hfEndpoint, accessToken],
   );
 
   const channels = useHubFeedStore((s) => s.channels);

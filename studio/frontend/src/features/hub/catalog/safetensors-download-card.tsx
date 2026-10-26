@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+import { useHubDownloadPlan } from "../download-manager/use-hub-download-queue";
+import { HubPlanProgress } from "../download-manager/hub-plan-progress";
+import { useRequiredAssetsDownload, type AssetRuntime } from "./use-required-assets-download";
+import { useHfEndpoint } from "@/lib/hf-endpoint";
 import {
   Tooltip,
   TooltipContent,
@@ -26,7 +30,10 @@ import {
 import { QuantOptionsMenu } from "./gguf-download-card";
 import { useCardDelete } from "./use-card-delete";
 import { DeleteImpactSummary, useDeleteImpact } from "./delete-impact";
-import { useDownloadCardState } from "./use-download-card-state";
+import {
+  isRepoDownloadProgress,
+  useDownloadCardState,
+} from "./use-download-card-state";
 
 function formatModelLabel(modelFormat?: ModelInventoryFormat | null): string {
   if (modelFormat === "adapter") return "Adapter";
@@ -47,6 +54,7 @@ export function SafetensorsDownloadCard({
   isPartial = false,
   partialTransport = null,
   partialResumable = false,
+  companionPrefetch = false,
   modelFormat,
   isActive,
   isLoadingThisModel,
@@ -55,25 +63,29 @@ export function SafetensorsDownloadCard({
   onRun,
   runPending = false,
   onChange,
+  assetRuntime,
 }: {
   repoId: string;
   isDownloaded: boolean;
   isPartial?: boolean;
   partialTransport?: string | null;
   partialResumable?: boolean;
+  companionPrefetch?: boolean;
   modelFormat?: ModelInventoryFormat | null;
   isActive: boolean;
   isLoadingThisModel: boolean;
-  /** Owning cache dir, threaded into delete so it targets this copy. */
   cachePath?: string | null;
   knownBytes?: number | null;
   onRun?: () => void;
   runPending?: boolean;
   onChange?: () => void;
+  assetRuntime?: AssetRuntime;
 }) {
   const hfToken = useHfTokenStore((s) => s.token);
   const online = useOnlineStatus();
-  const sizeKey = `${repoId}::${fingerprintToken(hfToken)}`;
+  const assets = useRequiredAssetsDownload({ repoId, runtime: assetRuntime });
+  const hfEndpoint = useHfEndpoint();
+  const sizeKey = `${hfEndpoint}::${repoId}::${fingerprintToken(hfToken)}`;
   const [modelSize, setModelSize] = useState<{
     key: string;
     bytes: number | null;
@@ -101,6 +113,7 @@ export function SafetensorsDownloadCard({
     repoId,
     activeVariant: null,
     autoAdopt: true,
+    includeScopedJobs: true,
   });
 
   const progress = job.progress;
@@ -136,11 +149,11 @@ export function SafetensorsDownloadCard({
     };
   }, [repoId, hfToken, sizeKey, setJobExpectedBytes, knownBytes, online]);
 
-  const downloading = progress !== null && progress.variant === null;
+  const downloading = isRepoDownloadProgress(progress);
   const partialsResumable = useHttpPartialsResumable();
   const downloadAction = useDownloadCardState({
     job,
-    variant: null,
+    variant: downloading ? (progress?.variant ?? null) : null,
     expectedBytes: modelTotalBytes ?? 0,
     downloading,
     disabled: isLoadingThisModel || cancelling || repoPeerActive,
@@ -149,9 +162,10 @@ export function SafetensorsDownloadCard({
     partialResumable,
     partialsResumable,
   });
-  const showDownloadAction =
-    !isDownloaded || downloading || cancelling || downloadAction.starting;
-  const showRunAction =
+  const hubPlan = useHubDownloadPlan(repoId);
+  const showDownloadAction = !hubPlan && (
+    !isDownloaded || downloading || cancelling || downloadAction.starting);
+  const showRunAction = !hubPlan &&
     Boolean(onRun) &&
     isDownloaded &&
     !isPartial &&
@@ -159,17 +173,16 @@ export function SafetensorsDownloadCard({
     !cancelling &&
     !downloadAction.starting &&
     !isLoadingThisModel;
+  const hasCachedFiles = isDownloaded || isPartial || companionPrefetch;
   const canDelete =
-    (isDownloaded || isPartial) &&
+    hasCachedFiles &&
     !downloading &&
     !repoPeerActive &&
     !isActive &&
     !isLoadingThisModel &&
     !runPending;
 
-  // Same preview the On Device and picker rows run: without it this card kept an enabled Delete
-  // for a companion base an installed image GGUF still needs, and the refusal arrived as a 400
-  // after the user confirmed.
+  // Without the preview, Delete stayed enabled for a base an installed image GGUF needs.
   const deleteImpact = useDeleteImpact(
     deleteRepoOpen && Boolean(repoId),
     repoId ?? "",
@@ -178,6 +191,7 @@ export function SafetensorsDownloadCard({
   return (
     <div className="flex w-full flex-col gap-2">
       <DownloadCard
+        footer={hubPlan ? <HubPlanProgress plan={hubPlan} /> : undefined}
         job={job}
         progress={downloading ? progress : null}
         dialogs={
@@ -208,6 +222,9 @@ export function SafetensorsDownloadCard({
         <div className="relative flex h-9 min-w-0 flex-1 items-center pl-3 pr-2">
           <span className="flex items-center gap-1.5 text-ui-12 text-muted-foreground">
             {isDownloaded && <DotTag tone="success" label="On device" />}
+            {!isDownloaded && downloading && (
+              <DotTag tone="downloading" label="Downloading" />
+            )}
             {!isDownloaded && isPartial && !downloading && (
               <Tooltip>
                 <TooltipTrigger asChild={true}>
@@ -216,7 +233,6 @@ export function SafetensorsDownloadCard({
                   </span>
                 </TooltipTrigger>
                 <TooltipContent side="top" sideOffset={4}>
-                  {/* The badge is a status dot, not a control. */}
                   {downloadAction.partialHint}
                 </TooltipContent>
               </Tooltip>
@@ -234,7 +250,8 @@ export function SafetensorsDownloadCard({
           <div className="ml-auto flex items-center gap-0.5">
             {/* Same 3-dots menu as GGUF, at repo level (no quant); pinning is
                 omitted here. Managed HF-cache repos only. */}
-            {(isDownloaded || (isPartial && !downloading)) &&
+            {(isDownloaded ||
+              ((isPartial || companionPrefetch) && !downloading)) &&
               !/^([/\\~.]|[A-Za-z]:)/.test(repoId) && (
               <QuantOptionsMenu
                 repoId={repoId}
@@ -249,21 +266,22 @@ export function SafetensorsDownloadCard({
             )}
           </div>
         </div>
-        {(showDownloadAction || showRunAction) && <CardDivider />}
+        {showDownloadAction && !(showRunAction && onRun) && <CardDivider />}
         {showDownloadAction && (
           <DownloadActionButton
             downloading={downloadAction.downloading}
             cancelling={downloadAction.cancelling}
-            loading={downloadAction.starting}
+            loading={downloadAction.starting || assets.checking}
             isPartial={downloadAction.isPartial}
             partialResumable={downloadAction.partialResumable}
             stopMode={downloadAction.stopMode}
             progressPercent={downloadAction.progressPercent}
-            disabled={downloadAction.disabled}
-            onClick={downloadAction.onClick}
+            disabled={downloadAction.disabled || assets.checking}
+            onClick={() => downloading ? downloadAction.onClick() : void assets.request(downloadAction.onClick)}
             className={repoPeerActive ? "opacity-70" : undefined}
           />
         )}
+        {hubPlan && <span className="px-3 text-ui-12 text-muted-foreground">Downloading…</span>}
         {showRunAction && onRun && (
           <ModelRunActionButton
             label={`Configure and run ${repoId}`}
@@ -272,6 +290,7 @@ export function SafetensorsDownloadCard({
           />
         )}
       </DownloadCard>
+      {assets.dialog}
     </div>
   );
 }

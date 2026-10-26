@@ -4,11 +4,9 @@
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
 import { createContext, runInContext } from "node:vm";
 
-const read = (relative: string): string =>
-  readFileSync(fileURLToPath(new URL(relative, import.meta.url)), "utf8");
+import { readText } from "./helpers/kit.ts";
 
 const HTML_COMMENT = /<!--[\s\S]*?-->/g;
 const POLYFILL_TAG = /<script\b[^>]*src="\/crypto-boot\.js"[^>]*>/;
@@ -18,11 +16,12 @@ const ASYNC_ATTR = /\basync\b/;
 const UUID_V4 =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
-// Check every HTML entry as raw markup so comments cannot satisfy the patterns.
 const PAGES = readdirSync(new URL("../", import.meta.url))
   .filter((name) => name.endsWith(".html"))
-  .map((name) => [name, read(`../${name}`).replace(HTML_COMMENT, "")] as const);
-const BOOT_SCRIPT = read("../public/crypto-boot.js");
+  .map(
+    (name) => [name, readText(`../${name}`).replace(HTML_COMMENT, "")] as const,
+  );
+const BOOT_SCRIPT = readText("../public/crypto-boot.js");
 
 function boot(cryptoStub: unknown): { randomUUID?: () => string } {
   const sandbox = { crypto: cryptoStub } as {
@@ -69,7 +68,6 @@ const generate = boot({
 }).randomUUID;
 
 test("the drawn bytes are what the UUID is built from", () => {
-  // A fixed byte stream catches changes to UUID masking and folding.
   cursor = 0;
   const uuid = generate?.() ?? "";
   assert.equal(uuid, "f799fac5-2c00-4cd8-8e79-8fac53c00cd8");

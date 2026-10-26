@@ -2,7 +2,6 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
@@ -11,6 +10,8 @@ import {
   measureOverlayScrollbarGutter,
   watchOverlayScrollbarGutter,
 } from "../src/lib/overlay-scrollbar.ts";
+
+import { readSrcAsync } from "./helpers/kit.ts";
 
 const PROBE_WIDTH = 60;
 
@@ -28,7 +29,6 @@ function optsIntoHitTesting(node: Node): boolean {
   return /(^|;)\s*pointer-events\s*:\s*auto\s*(;|$)/.test(node.style.cssText);
 }
 
-/** Simulates independent scrollbar hit-test and layout widths. */
 function fakeDocument({
   railPx,
   layoutPx,
@@ -42,7 +42,6 @@ function fakeDocument({
 }) {
   const vars = new Map<string, string>();
   const bodyChildren: Node[] = [];
-  // Mutable so a test can make a later sweep unreadable.
   const knobs = { contentReachable };
   const documentElement = {
     style: {
@@ -153,12 +152,11 @@ test("one unreadable sweep does not drop a gutter already in use", () => {
 
   assert.equal(applyOverlayScrollbarGutter(doc), 21);
 
-  // Same scrollbar, unreadable sweep: rows that reserved the strip must hold.
+  // Unreadable sweep: rows that reserved the strip must hold.
   knobs.contentReachable = false;
   assert.equal(applyOverlayScrollbarGutter(doc), 21);
   assert.equal(vars.get(OVERLAY_SCROLLBAR_GUTTER_VAR), "21px");
 
-  // A readable sweep still retires the gutter when the scrollbar really goes.
   const { doc: gone, vars: goneVars } = fakeDocument({
     railPx: 0,
     layoutPx: 0,
@@ -248,11 +246,7 @@ test("regaining focus re-measures, so a changed scrollbar setting is picked up",
 });
 
 test("right-edge action lists reserve the gutter they publish", async () => {
-  const css = await readFile(
-    new URL("../src/index.css", import.meta.url),
-    "utf8",
-  );
-  // The utility must read the variable written by the probe.
+  const css = await readSrcAsync("index.css");
   assert.match(
     css,
     new RegExp(
@@ -260,37 +254,32 @@ test("right-edge action lists reserve the gutter they publish", async () => {
     ),
   );
 
-  const pickers = await readFile(
-    new URL(
-      "../src/features/model-picker/components/model-selector/pickers.tsx",
-      import.meta.url,
-    ),
-    "utf8",
+  const pickers = await readSrcAsync(
+    "features/model-picker/components/model-selector/pickers.tsx",
   );
-  // Every model row must sit inside the gutter wrapper.
+  // Rows yield only the gutter part the list's reach into panel padding leaves uncovered.
   assert.match(
     pickers,
-    /"model-list-scroll[^"]*overflow-y-auto[^"]*"[\s\S]{0,800}"overlay-scrollbar-gutter",/,
+    /"model-list-scroll[^"]*overflow-y-auto[^"]*"[\s\S]{0,800}"model-list-gutter",/,
+  );
+  assert.match(
+    css,
+    new RegExp(
+      `\\.model-list-gutter\\s*\\{[^}]*padding-right:\\s*max\\(0px,\\s*var\\(${OVERLAY_SCROLLBAR_GUTTER_VAR},\\s*0px\\)\\s*-\\s*var\\(--list-room\\)\\)`,
+    ),
   );
 
-  const apiKeysTab = await readFile(
-    new URL("../src/features/settings/tabs/api-keys-tab.tsx", import.meta.url),
-    "utf8",
+  const apiKeysTab = await readSrcAsync(
+    "features/settings/tabs/api-keys-tab.tsx",
   );
-  // Preserve classic padding and move every API-key row into the gutter.
   assert.match(
     apiKeysTab,
-    /"hover-scrollbar[^"]*overflow-y-auto[^"]*\bpr-1\b[^"]*"[\s\S]{0,200}<div className="overlay-scrollbar-gutter">[\s\S]{0,300}<ApiKeyRow/,
+    /"hover-scrollbar[^"]*overflow-y-auto[^"]*\bpr-1\b[^"]*"[\s\S]{0,200}<div className=\{cn\("overlay-scrollbar-gutter", TOKEN_TABLE\)\}>[\s\S]{0,300}<ApiKeyRow/,
   );
 
-  const projectSourceDropzone = await readFile(
-    new URL(
-      "../src/features/rag/components/project-source-dropzone.tsx",
-      import.meta.url,
-    ),
-    "utf8",
+  const projectSourceDropzone = await readSrcAsync(
+    "features/rag/components/project-source-dropzone.tsx",
   );
-  // Keep staged-source remove actions inside the gutter.
   assert.match(
     projectSourceDropzone,
     /<ul className="[^"]*overlay-scrollbar-gutter[^"]*max-h-52[^"]*overflow-y-auto[^"]*">[\s\S]{0,1000}aria-label={`Remove \${entry\.name}`}/,

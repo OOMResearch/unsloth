@@ -1,16 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Gemma 4 base tokenizers must prepend <bos> at load time.
-
-Every google/gemma-4-* base repo prepends <bos>; no unsloth base mirror does. The delta is in
-tokenizer.json's post_processor, not tokenizer_config.json's add_bos_token key, which google
-omits on E4B, 31B and 26B-A4B while still prepending. Without the runtime fix, generation
-repeats degenerate text. See unslothai/unsloth#7903.
-
-Detection keys off the loaded tokenizer / config, not the Hub repo name, so
-local folders and extra quant suffixes still get the fix.
-"""
+"""Gemma 4 base tokenizers must get <bos> prepended at load time, detected via post_processor."""
 
 import types
 from unittest.mock import patch
@@ -96,7 +87,6 @@ def test_gemma4_config_nested_text_config():
 
 def test_name_alone_does_not_trigger_fix():
     tok = _Tok()
-    # Repo / folder names are ignored: a generic tokenizer must not flip BOS.
     fixed = tu._fix_gemma4_base_bos_token(tok)
     assert fixed.add_bos_token is False
 
@@ -160,7 +150,6 @@ def test_load_correct_tokenizer_skips_instruct():
 
 
 def test_load_correct_tokenizer_uses_model_config_when_tokenizer_is_generic():
-    # Stripped local tokenizers have no processor_class, but config.model_type is still gemma4.
     def from_pretrained(model_name, **kwargs):
         return _Tok(add_bos_token = False)
 
@@ -176,7 +165,6 @@ def test_load_correct_tokenizer_uses_model_config_when_tokenizer_is_generic():
 
 
 def test_fastmodel_processor_path_heals_from_config():
-    # FastModel loads Gemma4Processor, then heals after the processor is final.
     inner = _Tok(add_bos_token = False)
     processor = types.SimpleNamespace(
         tokenizer = inner,
@@ -215,7 +203,6 @@ def test_gemma4_e2b_hub_tokenizer_prepends_bos():
     ids = tok("This book is largely concerned with Hobbits,")["input_ids"]
     assert ids[0] == tok.bos_token_id
 
-    # Control: raw Hub tokenizer still omits BOS without the fix.
     raw = AutoTokenizer.from_pretrained("unsloth/gemma-4-E2B", trust_remote_code = True)
     raw_ids = raw("This book is largely concerned with Hobbits,")["input_ids"]
     assert raw_ids[0] != raw.bos_token_id
@@ -259,6 +246,49 @@ def test_real_tokenizer_chat_bos_survives_save_reload(tmp_path, prefix):
     assert tok("Hello")["input_ids"] == [2, 3]
 
 
+# Llama 2 puts bos_token inside a larger expression; stripping must keep the `{{ ... }}`.
+LLAMA2_TEMPLATE = (
+    "{% for message in messages %}"
+    "{% if message['role'] == 'user' %}"
+    "{{ bos_token + '[INST] ' + message['content'].strip() + ' [/INST]' }}"
+    "{% else %}"
+    "{{ ' ' + message['content'].strip() + ' ' + eos_token }}"
+    "{% endif %}"
+    "{% endfor %}"
+)
+
+
+def _render(template, **kwargs):
+    jinja2 = pytest.importorskip("jinja2")
+    return jinja2.Template(template).render(
+        messages = [{"role": "user", "content": "hi"}],
+        bos_token = "<s>",
+        eos_token = "</s>",
+        **kwargs,
+    )
+
+
+def test_stripping_bos_from_an_expression_keeps_the_template_valid():
+    stripped = tu._strip_bos_from_chat_template_text(LLAMA2_TEMPLATE)
+    assert "bos_token" not in stripped
+    assert stripped.count("{{") == stripped.count("}}")
+    assert _render(stripped) == "[INST] hi [/INST]"
+
+
+def test_stripping_a_standalone_bos_action_is_unchanged():
+    template = "{{ bos_token }}{% for m in messages %}<t>{{ m['content'] }}</t>{% endfor %}"
+    stripped = tu._strip_bos_from_chat_template_text(template)
+    assert stripped == "{% for m in messages %}<t>{{ m['content'] }}</t>{% endfor %}"
+    assert _render(stripped) == "<t>hi</t>"
+
+
+def test_dedupe_leaves_a_renderable_template_for_an_expression_bos():
+    tok = _gemma4_base(add_bos_token = True, chat_template = LLAMA2_TEMPLATE)
+    tu._dedupe_bos_chat_template(tok)
+    assert "bos_token" not in tok.chat_template
+    assert _render(tok.chat_template) == "[INST] hi [/INST]"
+
+
 def test_export_helper_strips_dict_chat_template_without_crash():
     tok = _gemma4_base(
         add_bos_token = True,
@@ -283,9 +313,6 @@ def test_instruct_template_is_not_stripped_when_tokenizer_does_not_add_bos():
     assert "bos_token" in tok.chat_template
 
 
-# Real backends: the fakes above accept any attribute, so they cannot tell a repair from a no-op.
-
-
 def _build_fast_tokenizer():
     tokenizers = pytest.importorskip("tokenizers")
     from transformers import PreTrainedTokenizerFast
@@ -300,8 +327,7 @@ def _build_fast_tokenizer():
 
 
 def _backend_honors_add_bos_token():
-    # Pre-5.x fast tokenizers store add_bos_token without changing what they emit. Gemma 4 needs
-    # transformers >= 5.5.0 anyway (loader.py SUPPORTS_GEMMA4), so record it rather than fail.
+    # Pre-5.x fast tokenizers ignore add_bos_token; Gemma 4 needs transformers >= 5.5.0 anyway.
     try:
         tokenizer = _build_fast_tokenizer()
     except Exception:
@@ -318,7 +344,6 @@ requires_working_add_bos_token = pytest.mark.skipif(
 
 def _real_tokenizer(add_bos = False):
     tokenizer = _build_fast_tokenizer()
-    # Gemma 4 is identified by its processor, not by this toy vocabulary.
     tokenizer.processor_class = "Gemma4Processor"
     if add_bos:
         tokenizer.add_bos_token = True
@@ -360,8 +385,7 @@ def test_real_backend_add_special_tokens_false_never_gains_bos():
 
 @requires_working_add_bos_token
 def test_real_backend_already_correct_tokenizer_is_left_alone():
-    # google base mirrors report add_bos_token = False and still prepend, so keying on the
-    # attribute would rebuild a post_processor that already works.
+    # google base mirrors report add_bos_token = False yet still prepend BOS.
     tok = _real_tokenizer(add_bos = True)
     before = str(tok._tokenizer.post_processor)
     ids_before = _ids(tok)
@@ -389,7 +413,6 @@ def test_real_backend_without_bos_token_does_not_claim_success():
         ("gemma3n_text", False),
         ("gemma2", False),
         ("llama", False),
-        # A future Gemma 4.5 is a different model with its own BOS policy.
         ("gemma_45", False),
         ("gemma-4.5", False),
         # Substring matching would catch unsloth's own diffusion_gemma4.
@@ -433,8 +456,7 @@ def test_bos_token_emitted_by_the_template_still_suppresses_the_fix():
 
 
 def test_processor_chat_template_is_deduped_too():
-    # ProcessorMixin.save_pretrained writes the processor's own chat_template.jinja, so leaving
-    # that copy alone exports a second BOS on a VLM.
+    # ProcessorMixin.save_pretrained writes its own chat_template.jinja, exporting a second BOS.
     emits_bos = "{{ bos_token }}{% for m in messages %}{{ m.content }}{% endfor %}"
     inner = _Tok(add_bos_token = True, chat_template = emits_bos)
     inner.bos_token_id = None  # force the attribute fallback in _tokenizer_auto_adds_bos
