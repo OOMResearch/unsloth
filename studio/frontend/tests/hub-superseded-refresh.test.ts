@@ -15,12 +15,10 @@ interface Status {
   ggufVariant: string;
 }
 
-/** What the store holds before an API request switches the resident model under the tab. */
 const STALE: Status = {
   checkpoint: "unsloth/Qwen3-8B-GGUF",
   ggufVariant: "Q8_0",
 };
-/** What every read of /api/inference/status answers once the switch has landed. */
 const SWITCHED: Status = {
   checkpoint: "unsloth/Llama-3.1-8B-Instruct-GGUF",
   ggufVariant: "Q4_K_M",
@@ -34,14 +32,9 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
-/** Let every pending microtask run, so "did not resolve" means it really has not. */
 const flush = () => new Promise((r) => setTimeout(r, 0));
 
-/**
- * hub-page.tsx's refreshResidentModelStatus, with the status read held open so a test can
- * choose the order responses land in. `coalesce` is the fix: whether a dropped response
- * resolves with the refresh that superseded it or with nothing.
- */
+/** hub-page.tsx's refreshResidentModelStatus with the status read held open. */
 function hubPageRefresh(coalesce: boolean) {
   let seq = 0;
   const supersession: RefreshSupersession = { latest: null };
@@ -54,7 +47,6 @@ function hubPageRefresh(coalesce: boolean) {
     inFlight.push(read.resolve);
     const settled = read.promise
       .then((status) => {
-        // hub-page.tsx:417, the drop: a newer read owns the store, so this writes nothing.
         if (mine !== seq) {
           return coalesce ? supersedingRefresh(supersession, mine) : undefined;
         }
@@ -69,16 +61,13 @@ function hubPageRefresh(coalesce: boolean) {
   return {
     refresh,
     store,
-    /** Deliver the status response for the nth refresh started. */
     deliver: (n: number, status: Status = SWITCHED) => inFlight[n](status),
-    /** The unmount cleanup: invalidate everything in flight without starting a read. */
     unmount: () => {
       seq += 1;
     },
   };
 }
 
-/** Resolves to true only if `promise` settles before the microtask queue drains. */
 async function settledEarly(promise: Promise<void>): Promise<boolean> {
   let done = false;
   void promise.then(() => {
@@ -88,19 +77,16 @@ async function settledEarly(promise: Promise<void>): Promise<boolean> {
   return done;
 }
 
-test("a settings open waits out the focus refresh that superseded its own read", async () => {
-  // openModelSettings awaits a status read before it resolves a quant and builds the settings
-  // target. A window focus refresh started while that read was out takes the sequence number,
-  // so the settings read's response is dropped without writing the store.
+test("the initial safety read waits out a newer focus refresh", async () => {
   const hub = hubPageRefresh(true);
-  const settingsRead = hub.refresh();
+  const initialRead = hub.refresh();
   hub.refresh();
 
   hub.deliver(0);
   assert.equal(
-    await settledEarly(settingsRead),
+    await settledEarly(initialRead),
     false,
-    "a dropped response must not release the settings open",
+    "a dropped response must not release the safety gate",
   );
   assert.deepEqual(
     hub.store,
@@ -109,57 +95,50 @@ test("a settings open waits out the focus refresh that superseded its own read",
   );
 
   hub.deliver(1);
-  await settingsRead;
+  await initialRead;
   assert.deepEqual(hub.store, SWITCHED);
 });
 
-test("without it the dropped response opens settings on the displaced model", async () => {
-  // The failure this guards: the settings handler's own sequence guard only counts settings
-  // opens, so a focus refresh supersedes it silently and it proceeds on the pre-switch store,
-  // naming the displaced model's quant in a target that Apply then loads and saves under.
+test("without coalescing the dropped response releases stale state", async () => {
   const hub = hubPageRefresh(false);
-  const settingsRead = hub.refresh();
+  const initialRead = hub.refresh();
   hub.refresh();
 
   hub.deliver(0);
-  assert.equal(await settledEarly(settingsRead), true);
+  assert.equal(await settledEarly(initialRead), true);
   assert.deepEqual(hub.store, STALE);
 });
 
 test("every dropped response in a chain waits for the one read that wins", async () => {
-  // Focus and visibilitychange fire as a pair, so more than one refresh can pile up behind
-  // the settings read, and each one in turn is dropped.
+  // Focus and visibilitychange can fire as a pair, so several reads may overlap.
   const hub = hubPageRefresh(true);
-  const settingsRead = hub.refresh();
+  const initialRead = hub.refresh();
   hub.refresh();
   hub.refresh();
 
   hub.deliver(0);
   hub.deliver(1);
-  assert.equal(await settledEarly(settingsRead), false);
+  assert.equal(await settledEarly(initialRead), false);
   assert.deepEqual(hub.store, STALE);
 
   hub.deliver(2);
-  await settingsRead;
+  await initialRead;
   assert.deepEqual(hub.store, SWITCHED);
 });
 
 test("responses that land out of order still leave the store on the newest read", async () => {
   const hub = hubPageRefresh(true);
-  const settingsRead = hub.refresh();
+  const initialRead = hub.refresh();
   hub.refresh();
 
-  // The newest read answers first and writes the store; the older response is dropped and
-  // finds its superseder already settled.
   hub.deliver(1);
   hub.deliver(0);
-  await settingsRead;
+  await initialRead;
   assert.deepEqual(hub.store, SWITCHED);
 });
 
 test("an unmount strands nobody, since it bumps the sequence without starting a read", async () => {
-  // hub-page.tsx's cleanup only invalidates. The newest refresh is then its own superseder,
-  // and handing it its own promise would leave every caller waiting forever.
+  // Cleanup only invalidates, so the newest refresh is its own superseder and must not await itself.
   const hub = hubPageRefresh(true);
   const read = hub.refresh();
   hub.unmount();

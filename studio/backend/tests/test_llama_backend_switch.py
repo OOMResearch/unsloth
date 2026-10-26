@@ -1,14 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""Switching the llama.cpp backend from the app.
-
-The picker in Settings > System reads utils.llama_cpp_update.get_backend_status
-and applies with start_backend_switch. Both run on the update job, so a switch and
-an update can never write to the same install at once.
-
-The installer subprocess is stubbed; no download or GPU needed.
-"""
+"""Switch and update both run on the update job, so they never write to the same install at once."""
 
 from __future__ import annotations
 
@@ -30,8 +23,9 @@ import utils.whisper_cpp_update as whisper_upd  # noqa: E402
 
 MARKER = "UNSLOTH_PREBUILT_INFO.json"
 
-# Captured before the autouse fixture stubs it out on the module.
+# Captured before the autouse fixture stubs them out on the module.
 _whisper_phase_plan = upd._whisper_phase_plan
+_resolve_backends_for_host = upd._resolve_backends_for_host
 
 
 class _FakeInstallerPopen:
@@ -93,6 +87,25 @@ def _write_install(dir_: Path, **marker_fields) -> str:
     return str(binary)
 
 
+def _write_vulkan_install(
+    *args,
+    asset = "app-b9596-mix-abc-linux-x64-vulkan.tar.gz",
+    backend = "vulkan",
+    backend_request = "auto",
+    install_kind = "linux-vulkan",
+    **kwargs,
+):
+    """_write_install for the stock linux vulkan build."""
+    return _write_install(
+        *args,
+        asset = asset,
+        backend = backend,
+        backend_request = backend_request,
+        install_kind = install_kind,
+        **kwargs,
+    )
+
+
 @pytest.fixture(autouse = True)
 def _clean_state(monkeypatch, tmp_path):
     freshness.reset_caches()
@@ -102,7 +115,7 @@ def _clean_state(monkeypatch, tmp_path):
     monkeypatch.setattr(freshness, "_cache_dir", lambda: tmp_path / ".freshness_cache")
     for name in ("UNSLOTH_LLAMA_CPP_BACKEND", "UNSLOTH_FORCE_VULKAN"):
         monkeypatch.delenv(name, raising = False)
-    # Nothing in this suite may touch the network or the real whisper install.
+    # nothing here may touch the network or the real whisper install
     monkeypatch.setattr(freshness, "_fetch_latest_release_tag", lambda repo, timeout = 5.0: None)
     monkeypatch.setattr(upd, "_whisper_phase_plan", lambda *a, **k: {})
     monkeypatch.setattr(
@@ -144,29 +157,126 @@ def _await_job(state = ("success", "error")) -> dict:
     raise AssertionError(f"job never reached {state}: {upd.get_update_status()['job']}")
 
 
-# ── Applying ──
+def _drifted(monkeypatch, resolved_backend = "vulkan"):
+    """Detection now resolves somewhere other than what the marker records."""
+    monkeypatch.setattr(
+        upd,
+        "_resolve_backends_for_host",
+        lambda install_dir, **kwargs: {
+            "backends": [
+                {
+                    "backend": backend,
+                    "available": True,
+                    "resolved_backend": (resolved_backend if backend == "auto" else backend),
+                    "asset": f"app-b9596-mix-abc-linux-x64-{backend}.tar.gz",
+                }
+                for backend in ("auto", "cpu", "cuda", "rocm", "vulkan")
+            ]
+        },
+    )
+
+
+def test_a_drifted_automatic_install_is_offered_as_an_update(monkeypatch, tmp_path):
+    _install(monkeypatch, tmp_path, backend = "rocm", backend_request = "auto")
+    _drifted(monkeypatch)
+    status = upd.get_update_status()
+    assert status["update_available"] is False
+    assert status["backend_migration_available"] is True
+    assert (status["from_backend"], status["to_backend"]) == ("rocm", "vulkan")
+
+
+def test_a_deliberate_backend_choice_is_never_offered_a_migration(monkeypatch, tmp_path):
+    _install(monkeypatch, tmp_path, backend = "rocm", backend_request = "rocm")
+    _drifted(monkeypatch)
+    status = upd.get_update_status()
+    assert status["backend_migration_available"] is False
+    assert status["to_backend"] is None
+
+
+def test_an_undrifted_automatic_install_is_offered_nothing(monkeypatch, tmp_path):
+    _install(monkeypatch, tmp_path, backend = "cuda", backend_request = "auto")
+    status = upd.get_update_status()
+    assert status["backend_migration_available"] is False
+
+
+def test_an_environment_override_suppresses_the_migration_offer(monkeypatch, tmp_path):
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_BACKEND", "rocm")
+    _install(monkeypatch, tmp_path, backend = "rocm", backend_request = "auto")
+    _drifted(monkeypatch)
+    assert upd.get_update_status()["backend_migration_available"] is False
+
+
+def test_applying_a_migration_re_applies_auto_and_stays_an_update(monkeypatch, tmp_path):
+    # "auto", not "vulkan": naming it stores a choice nobody made and drops rocm_gfx
+    install_dir = _install(monkeypatch, tmp_path, backend = "rocm", backend_request = "auto")
+    _drifted(monkeypatch)
+    seen: dict = {}
+
+    def _on_start(cmd, kwargs):
+        seen["cmd"] = cmd
+        seen["env"] = kwargs.get("env") or {}
+        _write_vulkan_install(install_dir)
+
+    _patch_installer(monkeypatch, on_start = _on_start)
+
+    assert upd.start_update()["started"] is True
+    job = _await_job()
+
+    assert job["state"] == "success", job
+    assert job["operation"] == "update"
+    assert job["requested_backend"] == "auto"
+    assert seen["cmd"][seen["cmd"].index("--llama-backend") + 1] == "auto"
+    assert seen["cmd"][seen["cmd"].index("--published-release-tag") + 1] == "b9596-mix-abc"
+
+
+def test_a_migration_that_lands_back_on_the_old_backend_says_so(monkeypatch, tmp_path):
+    install_dir = _install(monkeypatch, tmp_path, backend = "rocm", backend_request = "auto")
+    _drifted(monkeypatch)
+
+    def _on_start(cmd, kwargs):
+        _write_install(install_dir, backend = "rocm", backend_request = "auto")
+
+    _patch_installer(monkeypatch, on_start = _on_start)
+
+    assert upd.start_update()["started"] is True
+    job = _await_job()
+
+    assert job["state"] == "success", job
+    assert "could not be moved to vulkan" in job["message"]
+    assert "now running on rocm" not in job["message"]
+
+
+def test_a_migration_that_lands_on_its_target_reports_the_new_backend(monkeypatch, tmp_path):
+    install_dir = _install(monkeypatch, tmp_path, backend = "rocm", backend_request = "auto")
+    _drifted(monkeypatch)
+    _patch_installer(
+        monkeypatch,
+        on_start = lambda cmd, kwargs: _write_vulkan_install(install_dir),
+    )
+
+    assert upd.start_update()["started"] is True
+    job = _await_job()
+
+    assert job["state"] == "success", job
+    assert "now running on vulkan" in job["message"]
+
+
+def test_an_up_to_date_install_with_no_drift_still_refuses(monkeypatch, tmp_path):
+    _install(monkeypatch, tmp_path, backend = "cuda", backend_request = "auto")
+    result = upd.start_update()
+    assert result["started"] is False
+    assert result["reason"] == "up_to_date"
 
 
 def test_a_switch_names_the_backend_and_keeps_the_installed_release(monkeypatch, tmp_path):
-    """A switch changes the backend and nothing else.
-
-    Pinned to the release already installed rather than the latest: bundling an
-    update into it would also break the paired whisper.cpp install, whose slim
-    bundle names the exact llama.cpp release it borrows ggml modules from.
-    """
+    """A switch keeps the installed release, because the paired whisper.cpp borrows its ggml modules."""
     install_dir = _install(monkeypatch, tmp_path)
     seen: dict = {}
 
     def _on_start(cmd, kwargs):
         seen["cmd"] = cmd
         seen["env"] = kwargs.get("env") or {}
-        _write_install(
-            install_dir,
-            asset = "app-b9596-mix-abc-linux-x64-vulkan.tar.gz",
-            install_kind = "linux-vulkan",
-            backend = "vulkan",
-            backend_request = "vulkan",
-        )
+        _write_vulkan_install(install_dir, backend_request = "vulkan")
 
     _patch_installer(monkeypatch, on_start = _on_start)
 
@@ -202,7 +312,6 @@ def test_environment_override_refuses_a_switch(monkeypatch, tmp_path, name, valu
 
 
 def test_a_backend_with_no_build_here_is_reported_by_name(monkeypatch, tmp_path):
-    # Hardware or published bundles can change after option resolution.
     _install(monkeypatch, tmp_path)
     _patch_installer(monkeypatch, returncode = upd._EXIT_BACKEND_UNAVAILABLE)
 
@@ -210,7 +319,7 @@ def test_a_backend_with_no_build_here_is_reported_by_name(monkeypatch, tmp_path)
     job = _await_job()
 
     assert job["state"] == "error"
-    assert "Could not install the rocm llama.cpp build on this machine" in job["error"]
+    assert "Could not install a rocm llama.cpp build on this machine" in job["error"]
 
 
 @pytest.mark.parametrize(
@@ -248,20 +357,48 @@ def test_update_failure_names_the_environment_pinned_backend(
     job = _await_job()
 
     assert job["state"] == "error"
-    assert f"Could not install the {expected} llama.cpp build on this machine" in job["error"]
+    assert f"Could not install a {expected} llama.cpp build on this machine" in job["error"]
+
+
+def test_an_automatic_update_does_not_blame_a_backend_nobody_requested(monkeypatch, tmp_path):
+    """An automatic update has no backend_request, so its failure must not blame a requested backend."""
+    install_dir = _install(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        upd,
+        "_plan_llama_phase",
+        lambda backend_request = None: {
+            "spec": {
+                "install_dir": install_dir,
+                "repo": "unslothai/llama.cpp",
+                "asset": None,
+                "script": tmp_path / "install_llama_prebuilt.py",
+                "pin_release_tag": "b9597-mix-new",
+                "from_tag": "b9596-mix-abc",
+                "llama_backend": "auto",
+                "rocm_gfx": None,
+                "backend_request": None,
+            }
+        },
+    )
+    _patch_installer(monkeypatch, returncode = upd._EXIT_BACKEND_UNAVAILABLE)
+
+    assert upd.start_update()["started"] is True
+    job = _await_job()
+
+    assert job["state"] == "error"
+    assert "Could not install a llama.cpp build on this machine" in job["error"]
+    assert "requested" not in job["error"]
 
 
 def test_a_switch_rejects_a_cross_repository_result(monkeypatch, tmp_path):
     install_dir = _install(monkeypatch, tmp_path)
 
     def _on_start(cmd, kwargs):
-        _write_install(
+        _write_vulkan_install(
             install_dir,
             release_tag = "b9596",
             published_repo = "ggml-org/llama.cpp",
             asset = "llama-b9596-bin-ubuntu-vulkan-arm64.tar.gz",
-            install_kind = "linux-vulkan",
-            backend = "vulkan",
             backend_request = "vulkan",
         )
 
@@ -272,9 +409,6 @@ def test_a_switch_rejects_a_cross_repository_result(monkeypatch, tmp_path):
 
     assert job["state"] == "error"
     assert "backend switch must preserve" in job["error"]
-
-
-# ── Refusing ──
 
 
 def test_switching_to_the_recorded_choice_is_refused(monkeypatch, tmp_path):
@@ -293,14 +427,7 @@ def test_switching_to_the_recorded_choice_is_refused(monkeypatch, tmp_path):
 
 
 def test_a_failed_whisper_repair_can_be_retried_from_the_same_selection(monkeypatch):
-    """The one already-selected request that must still start a job.
-
-    The llama phase runs first and records the new backend, so a retryable whisper
-    failure (a dropped download, an install that was busy) ends with llama switched and
-    dictation still hardlinked to the old runtime. Retrying is then "already selected",
-    and refusing it leaves the reported failure unfixable except by switching llama.cpp
-    away and back.
-    """
+    """Retrying a failed whisper repair must start a job even though the backend is already selected."""
     monkeypatch.setattr(whisper_upd, "slim_pairing_is_stale", lambda: True)
     monkeypatch.setattr(whisper_upd, "repair_pairing_plan", lambda: {"phase": {"repair": True}})
 
@@ -310,11 +437,7 @@ def test_a_failed_whisper_repair_can_be_retried_from_the_same_selection(monkeypa
 
 
 def test_an_already_selected_request_with_a_healthy_pairing_stays_refused(monkeypatch):
-    """Staleness is what separates an owed repair from an ordinary no-op.
-
-    Without it every already-selected request would start a whisper job that finds
-    nothing to do and reports success, replacing a clear refusal with a false one.
-    """
+    """Only a stale pairing is an owed repair; a healthy re-selection must stay refused, not succeed."""
     planned = []
     monkeypatch.setattr(
         whisper_upd, "repair_pairing_plan", lambda: planned.append(1) or {"phase": {"repair": True}}
@@ -326,19 +449,13 @@ def test_an_already_selected_request_with_a_healthy_pairing_stays_refused(monkey
         == {}
     )
 
-    # Every other refusal stays refused whatever the pairing looks like.
     monkeypatch.setattr(whisper_upd, "slim_pairing_is_stale", lambda: True)
     assert _whisper_phase_plan("cuda", llama_will_run = False, llama_skip_reason = "local_link") == {}
     assert planned == []
 
 
 def test_re_selecting_a_backend_is_refused_even_when_its_asset_moved(monkeypatch, tmp_path):
-    """The picker chooses a backend, not a bundle.
-
-    A newer per-architecture asset for the backend already selected is an update,
-    which the update flow offers on its own schedule. Making Apply mean "reinstall
-    too" would hand the same install to two jobs with two different triggers.
-    """
+    """Re-selecting the installed backend is refused even if its asset moved; updates own that."""
     _install(
         monkeypatch,
         tmp_path,
@@ -471,7 +588,6 @@ def test_a_source_build_has_no_backend_to_switch(monkeypatch, tmp_path):
 
 
 def test_a_switch_and_an_update_cannot_run_at_once(monkeypatch, tmp_path):
-    # The shared job prevents concurrent installers.
     _install(monkeypatch, tmp_path)
     with upd._job_lock:
         upd._job.update(state = upd._JOB_RUNNING, message = "busy")
@@ -524,9 +640,6 @@ def test_backend_resolution_is_part_of_the_serialized_operation(monkeypatch, tmp
     assert not upd._operation_lock.locked()
 
 
-# ── Status ──
-
-
 def test_status_reports_the_install_and_the_options(monkeypatch, tmp_path):
     _install(monkeypatch, tmp_path)
     monkeypatch.setattr(
@@ -542,7 +655,6 @@ def test_status_reports_the_install_and_the_options(monkeypatch, tmp_path):
                     "asset": "app-b9596-mix-abc-linux-x64-cuda12.tar.gz",
                 },
                 {"backend": "rocm", "available": False, "reason": "unavailable"},
-                # Older pickers ignore backends they cannot label.
                 {"backend": "sycl", "available": True},
             ]
         },
@@ -569,6 +681,24 @@ def test_status_reports_the_install_and_the_options(monkeypatch, tmp_path):
     assert "sycl" not in by_backend
 
 
+def test_status_skips_the_resolver_when_update_checks_disabled(monkeypatch, tmp_path):
+    _install(monkeypatch, tmp_path)
+    monkeypatch.setenv("UNSLOTH_DISABLE_UPDATE_CHECK", "1")
+
+    def _no_resolve(*args, **kwargs):
+        raise AssertionError("resolved backends despite UNSLOTH_DISABLE_UPDATE_CHECK=1")
+
+    monkeypatch.setattr(upd, "_resolve_backends_for_host", _no_resolve)
+    monkeypatch.setattr(upd, "latest_release_assets", _no_resolve)
+
+    status = upd.get_backend_status(force_refresh = True)
+
+    assert status["supported"] is False
+    assert status["reason"] == "update_checks_disabled"
+    assert status["backend"] == "cuda"
+    assert status["options"] == []
+
+
 def test_status_reports_when_auto_now_resolves_to_another_backend(monkeypatch, tmp_path):
     _install(monkeypatch, tmp_path, backend = "cpu", backend_request = "auto")
 
@@ -580,8 +710,6 @@ def test_status_reports_when_auto_now_resolves_to_another_backend(monkeypatch, t
 
 
 def test_status_keeps_a_concrete_choice_applied_when_its_asset_moves(monkeypatch, tmp_path):
-    # The recorded name and the installed backend agree, which is all a concrete
-    # choice claims. A newer asset for it is an update, not an unapplied selection.
     _install(
         monkeypatch,
         tmp_path,
@@ -598,9 +726,7 @@ def test_status_keeps_a_concrete_choice_applied_when_its_asset_moves(monkeypatch
 
 
 def test_a_switch_that_installs_nothing_plans_no_whisper_phase(monkeypatch):
-    # Whisper only re-pairs because llama's ggml is being replaced. Without a llama
-    # phase there is nothing to re-pair, so a refusal stays a refusal instead of
-    # turning into a whisper-only job that reports a switch nobody performed.
+    # whisper re-pairs only because llama's ggml is replaced; no llama phase, nothing to re-pair
     planned = []
     monkeypatch.setattr(
         whisper_upd, "repair_pairing_plan", lambda: planned.append(1) or {"phase": {"repair": True}}
@@ -631,12 +757,12 @@ def test_only_a_slim_whisper_install_is_re_paired(monkeypatch, tmp_path):
     assert whisper_upd.repair_pairing_plan()["phase"]["repair"] is True
 
     _slim_whisper(monkeypatch, tmp_path, install_kind = "fat")
-    # A fat bundle ships its own ggml, so llama's backend is not its backend.
+    # a fat bundle ships its own ggml, so llama's backend is not its backend
     assert whisper_upd.repair_pairing_plan()["skip_reason"] == "self_contained"
 
 
 def test_whisper_repair_installs_the_backend_llama_landed_on(monkeypatch, tmp_path):
-    _slim_whisper(monkeypatch, tmp_path)  # marker backend "cuda"
+    _slim_whisper(monkeypatch, tmp_path)
     monkeypatch.setattr(
         whisper_upd,
         "_installed_llama_bundle",
@@ -654,16 +780,14 @@ def test_whisper_repair_installs_the_backend_llama_landed_on(monkeypatch, tmp_pa
         lambda progress: None,
     )
 
-    # The llama asset carries the AMD arch the new bundle was built for.
     assert calls[0][2] == "app-b9596-linux-x64-rocm-gfx1100.tar.gz"
     assert calls[0][3] == "rocm"
     assert "rocm backend" in result["message"]
 
 
 def test_whisper_repair_skips_a_backend_it_is_already_built_against(monkeypatch, tmp_path):
-    # Detection can land back where it was; the release is preserved either way,
-    # so the hardlinks still point at the same build.
-    _slim_whisper(monkeypatch, tmp_path)  # marker backend "cuda"
+    # _slim_whisper records marker backend "cuda"
+    _slim_whisper(monkeypatch, tmp_path)
     monkeypatch.setattr(whisper_upd, "_installed_llama_bundle", lambda: ("cuda", "asset.tar.gz"))
     monkeypatch.setattr(
         whisper_upd, "_install_latest", lambda *a, **k: pytest.fail("reinstalled needlessly")
@@ -673,7 +797,7 @@ def test_whisper_repair_skips_a_backend_it_is_already_built_against(monkeypatch,
 
 
 def test_whisper_repair_treats_only_incompatibility_as_unavailable(monkeypatch, tmp_path):
-    _slim_whisper(monkeypatch, tmp_path)  # marker backend "cuda"
+    _slim_whisper(monkeypatch, tmp_path)
     monkeypatch.setattr(whisper_upd, "_installed_llama_bundle", lambda: ("vulkan", "asset.tar.gz"))
     monkeypatch.setattr(
         whisper_upd,
@@ -690,7 +814,7 @@ def test_whisper_repair_treats_only_incompatibility_as_unavailable(monkeypatch, 
 
 @pytest.mark.parametrize("returncode", [1, 3])
 def test_whisper_repair_surfaces_retryable_installer_failures(monkeypatch, tmp_path, returncode):
-    _slim_whisper(monkeypatch, tmp_path)  # marker backend "cuda"
+    _slim_whisper(monkeypatch, tmp_path)
     monkeypatch.setattr(whisper_upd, "_installed_llama_bundle", lambda: ("vulkan", "asset.tar.gz"))
     monkeypatch.setattr(
         whisper_upd,
@@ -709,7 +833,6 @@ def test_whisper_repair_surfaces_retryable_installer_failures(monkeypatch, tmp_p
 
 
 def test_status_surfaces_an_environment_pin(monkeypatch, tmp_path):
-    # Surface environment overrides instead of accepting an ineffective choice.
     monkeypatch.setenv("UNSLOTH_LLAMA_CPP_BACKEND", "vulkan")
     _install(monkeypatch, tmp_path)
     monkeypatch.setattr(upd, "_resolve_backends_for_host", lambda install_dir, **kwargs: {})
@@ -730,7 +853,6 @@ def test_status_says_why_an_unmanaged_install_cannot_be_switched(monkeypatch, tm
 
 
 def test_status_degrades_when_the_options_cannot_be_resolved(monkeypatch, tmp_path):
-    # Offline status keeps the installed backend without guessing alternatives.
     _install(monkeypatch, tmp_path)
     monkeypatch.setattr(upd, "_resolve_backends_for_host", lambda install_dir, **kwargs: None)
 
@@ -773,6 +895,283 @@ def test_backend_resolution_failures_are_not_cached(monkeypatch, tmp_path):
     assert responses == []
 
 
+def test_the_migration_resolver_replays_the_arch_the_marker_recorded(monkeypatch, tmp_path):
+    """Replay the marker's arch, or a working ROCm install reads as drifted and offers a CPU migration."""
+    install_dir = _install(
+        monkeypatch,
+        tmp_path,
+        backend = "rocm",
+        install_kind = "linux-rocm",
+        asset = "app-b9596-mix-abc-linux-x64-rocm-gfx1151.tar.gz",
+        rocm_gfx = "gfx1151",
+    )
+    marker = upd.read_install_marker(upd._find_binary())
+    seen: list = []
+
+    def _resolver(**kwargs):
+        seen.append(kwargs.get("extra_env"))
+        gfx = (kwargs.get("extra_env") or {}).get("UNSLOTH_ROCM_GFX_REMEMBERED")
+        resolved = "rocm" if gfx else "cpu"
+        return {"backends": [{"backend": "auto", "available": True, "resolved_backend": resolved}]}
+
+    monkeypatch.setattr(upd, "_resolve_backends_for_host", _resolve_backends_for_host)
+    monkeypatch.setattr(upd._flow, "resolve_prebuilt_for_host", _resolver)
+    upd._backends_memo.clear()
+
+    assert upd._pending_backend_migration(upd._find_binary(), marker) is None
+    assert seen == [{"UNSLOTH_ROCM_GFX_REMEMBERED": "gfx1151"}]
+    assert install_dir.exists()
+
+
+def test_a_marker_with_no_recorded_arch_passes_no_replay(monkeypatch, tmp_path):
+    _install(monkeypatch, tmp_path)
+    marker = upd.read_install_marker(upd._find_binary())
+    seen: list = []
+
+    def _resolver(**kwargs):
+        seen.append(kwargs.get("extra_env"))
+        return {"backends": [{"backend": "auto", "available": True, "resolved_backend": "cpu"}]}
+
+    monkeypatch.setattr(upd, "_resolve_backends_for_host", _resolve_backends_for_host)
+    monkeypatch.setattr(upd._flow, "resolve_prebuilt_for_host", _resolver)
+    upd._backends_memo.clear()
+
+    upd._pending_backend_migration(upd._find_binary(), marker)
+    assert seen == [None]
+
+
+def test_the_picker_describes_the_same_host_the_update_check_does(monkeypatch, tmp_path):
+    """The picker's resolve must replay the recovered arch, or it reads an AMD host as CPU-only."""
+    _install(
+        monkeypatch,
+        tmp_path,
+        backend = "rocm",
+        backend_request = "auto",
+        install_kind = "windows-rocm",
+        asset = "app-b9596-mix-abc-windows-x64-rocm-gfx1151.zip",
+    )
+    assert upd.read_install_marker(upd._find_binary()).get("rocm_gfx") is None
+
+    def _resolver(**kwargs):
+        gfx = (kwargs.get("extra_env") or {}).get("UNSLOTH_ROCM_GFX_REMEMBERED")
+        return {
+            "backends": [
+                {
+                    "backend": backend,
+                    "available": bool(gfx) or backend in ("auto", "cpu", "vulkan"),
+                    "resolved_backend": (
+                        ("vulkan" if gfx else "cpu") if backend == "auto" else backend
+                    ),
+                }
+                for backend in ("auto", "cpu", "rocm", "vulkan")
+            ]
+        }
+
+    monkeypatch.setattr(upd, "_resolve_backends_for_host", _resolve_backends_for_host)
+    monkeypatch.setattr(upd._flow, "resolve_prebuilt_for_host", _resolver)
+    monkeypatch.setattr(upd, "latest_release_assets", lambda repo, force_refresh = False: {})
+    upd._backends_memo.clear()
+
+    status = upd.get_backend_status()
+    by_backend = {option["backend"]: option for option in status["options"]}
+    assert by_backend["auto"]["resolved_backend"] == "vulkan"
+    assert by_backend["rocm"]["available"] is True
+
+
+def test_the_arch_is_recovered_from_the_installed_bundle_when_none_was_recorded(
+    monkeypatch, tmp_path
+):
+    _install(
+        monkeypatch,
+        tmp_path,
+        backend = "rocm",
+        install_kind = "windows-rocm",
+        asset = "app-b9596-mix-abc-windows-x64-rocm-gfx1151.zip",
+    )
+    marker = upd.read_install_marker(upd._find_binary())
+    assert marker.get("rocm_gfx") is None
+    seen: list = []
+
+    def _resolver(**kwargs):
+        seen.append(kwargs.get("extra_env"))
+        gfx = (kwargs.get("extra_env") or {}).get("UNSLOTH_ROCM_GFX_REMEMBERED")
+        return {
+            "backends": [
+                {
+                    "backend": "auto",
+                    "available": True,
+                    "resolved_backend": "rocm" if gfx else "cpu",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(upd, "_resolve_backends_for_host", _resolve_backends_for_host)
+    monkeypatch.setattr(upd._flow, "resolve_prebuilt_for_host", _resolver)
+    upd._backends_memo.clear()
+
+    assert upd._pending_backend_migration(upd._find_binary(), marker) is None
+    assert seen == [{"UNSLOTH_ROCM_GFX_REMEMBERED": "gfx1151"}]
+
+
+def test_a_gpu_install_is_never_offered_a_migration_onto_cpu(monkeypatch, tmp_path):
+    # an empty probe and a host that lost its GPU look the same here; Settings still can
+    _install(
+        monkeypatch,
+        tmp_path,
+        backend = "rocm",
+        install_kind = "linux-rocm",
+        asset = "app-b9596-mix-abc-linux-x64-rocm-gfx1151.tar.gz",
+        rocm_gfx = "gfx1151",
+    )
+    marker = upd.read_install_marker(upd._find_binary())
+
+    monkeypatch.setattr(upd, "_resolve_backends_for_host", _resolve_backends_for_host)
+    monkeypatch.setattr(
+        upd._flow,
+        "resolve_prebuilt_for_host",
+        lambda **_kw: {
+            "backends": [{"backend": "auto", "available": True, "resolved_backend": "cpu"}]
+        },
+    )
+    upd._backends_memo.clear()
+    assert upd._pending_backend_migration(upd._find_binary(), marker) is None
+
+    monkeypatch.setattr(
+        upd._flow,
+        "resolve_prebuilt_for_host",
+        lambda **_kw: {
+            "backends": [{"backend": "auto", "available": True, "resolved_backend": "vulkan"}]
+        },
+    )
+    upd._backends_memo.clear()
+    assert upd._pending_backend_migration(upd._find_binary(), marker) == "vulkan"
+
+
+def test_applying_a_migration_replays_the_arch_the_offer_was_made_with(monkeypatch, tmp_path):
+    """Apply must re-resolve with the offer's arch, or it reads as already applied and refuses silently."""
+    install_dir = _install(
+        monkeypatch,
+        tmp_path,
+        backend = "rocm",
+        backend_request = "auto",
+        install_kind = "linux-rocm",
+        asset = "app-b9596-mix-abc-linux-x64-rocm-gfx1151.tar.gz",
+        rocm_gfx = "gfx1151",
+    )
+
+    def _resolver(**kwargs):
+        gfx = (kwargs.get("extra_env") or {}).get("UNSLOTH_ROCM_GFX_REMEMBERED")
+        auto = "vulkan" if gfx else "rocm"
+        return {
+            "backends": [
+                {
+                    "backend": backend,
+                    "available": True,
+                    "resolved_backend": (auto if backend == "auto" else backend),
+                    "asset": f"app-b9596-mix-abc-linux-x64-{backend}.tar.gz",
+                }
+                for backend in ("auto", "cpu", "rocm", "vulkan")
+            ]
+        }
+
+    monkeypatch.setattr(upd, "_resolve_backends_for_host", _resolve_backends_for_host)
+    monkeypatch.setattr(upd._flow, "resolve_prebuilt_for_host", _resolver)
+    upd._backends_memo.clear()
+
+    assert upd.get_update_status()["backend_migration_available"] is True
+
+    seen: dict = {}
+
+    def _on_start(cmd, kwargs):
+        seen["cmd"] = cmd
+        _write_vulkan_install(install_dir)
+
+    _patch_installer(monkeypatch, on_start = _on_start)
+
+    result = upd.start_update()
+    assert result["started"] is True, result
+    job = _await_job()
+    assert job["state"] == "success", job
+    assert seen["cmd"][seen["cmd"].index("--llama-backend") + 1] == "auto"
+
+
+def test_applying_a_migration_replays_an_arch_only_the_bundle_names(monkeypatch, tmp_path):
+    """Apply must use the same recovered arch as the offer, including one only the bundle names."""
+    install_dir = _install(
+        monkeypatch,
+        tmp_path,
+        backend = "rocm",
+        backend_request = "auto",
+        install_kind = "linux-rocm",
+        asset = "app-b9596-mix-abc-linux-x64-rocm-gfx1151.tar.gz",
+    )
+    assert upd.read_install_marker(upd._find_binary()).get("rocm_gfx") is None
+
+    def _resolver(**kwargs):
+        gfx = (kwargs.get("extra_env") or {}).get("UNSLOTH_ROCM_GFX_REMEMBERED")
+        auto = "vulkan" if gfx else "rocm"
+        return {
+            "backends": [
+                {
+                    "backend": backend,
+                    "available": True,
+                    "resolved_backend": (auto if backend == "auto" else backend),
+                    "asset": f"app-b9596-mix-abc-linux-x64-{backend}.tar.gz",
+                }
+                for backend in ("auto", "cpu", "rocm", "vulkan")
+            ]
+        }
+
+    monkeypatch.setattr(upd, "_resolve_backends_for_host", _resolve_backends_for_host)
+    monkeypatch.setattr(upd._flow, "resolve_prebuilt_for_host", _resolver)
+    upd._backends_memo.clear()
+
+    assert upd.get_update_status()["backend_migration_available"] is True
+
+    def _on_start(cmd, kwargs):
+        _write_vulkan_install(install_dir)
+
+    _patch_installer(monkeypatch, on_start = _on_start)
+
+    result = upd.start_update()
+    assert result["started"] is True, result
+    job = _await_job()
+    assert job["state"] == "success", job
+
+
+def test_an_apply_that_no_longer_drifts_still_refuses(monkeypatch, tmp_path):
+    _install(
+        monkeypatch,
+        tmp_path,
+        backend = "vulkan",
+        backend_request = "auto",
+        install_kind = "linux-vulkan",
+        asset = "app-b9596-mix-abc-linux-x64-vulkan.tar.gz",
+        rocm_gfx = "gfx1151",
+    )
+
+    def _resolver(**kwargs):
+        return {
+            "backends": [
+                {
+                    "backend": backend,
+                    "available": True,
+                    "resolved_backend": ("vulkan" if backend == "auto" else backend),
+                    "asset": f"app-b9596-mix-abc-linux-x64-{backend}.tar.gz",
+                }
+                for backend in ("auto", "cpu", "rocm", "vulkan")
+            ]
+        }
+
+    monkeypatch.setattr(upd, "_resolve_backends_for_host", _resolve_backends_for_host)
+    monkeypatch.setattr(upd._flow, "resolve_prebuilt_for_host", _resolver)
+    upd._backends_memo.clear()
+
+    result = upd.start_update()
+    assert result["started"] is False
+    assert result["reason"] == "up_to_date"
+
+
 def test_running_job_status_does_not_resolve_options_again(monkeypatch, tmp_path):
     _install(monkeypatch, tmp_path)
 
@@ -789,3 +1188,81 @@ def test_running_job_status_does_not_resolve_options_again(monkeypatch, tmp_path
 
     assert status["job"]["state"] == "running"
     assert status["options"] == []
+
+
+def test_an_explicit_auto_in_the_environment_still_gets_the_migration(monkeypatch, tmp_path):
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_BACKEND", "auto")
+    _install(monkeypatch, tmp_path, backend = "rocm", backend_request = "auto")
+    _drifted(monkeypatch)
+    assert upd.get_update_status()["backend_migration_available"] is True
+
+
+def test_an_explicit_recheck_re_resolves_the_backend(monkeypatch, tmp_path):
+    # The resolver is memoized for 24h, so force_refresh has to reach it or "check again"
+    # answers from the pre-change resolve for the rest of the TTL.
+    _install(monkeypatch, tmp_path, backend = "rocm", backend_request = "auto")
+    _drifted(monkeypatch)
+    seen: list = []
+    real = upd._pending_backend_migration
+
+    def _spy(
+        binary,
+        marker,
+        *,
+        force_refresh = False,
+    ):
+        seen.append(force_refresh)
+        return real(binary, marker, force_refresh = force_refresh)
+
+    monkeypatch.setattr(upd, "_pending_backend_migration", _spy)
+    upd.get_update_status(force_refresh = True)
+    assert seen == [True], seen
+
+
+def test_a_migration_keeps_a_pending_whisper_update(monkeypatch):
+    chained = {"phase": {"kind": "whisper", "tag": "w2"}, "update_available": True}
+    monkeypatch.setattr(upd, "_whisper_chain_status", lambda **kw: chained)
+    repair_calls = []
+    monkeypatch.setattr(
+        whisper_upd, "repair_pairing_plan", lambda: (repair_calls.append(True), {})[1]
+    )
+    monkeypatch.setattr(whisper_upd, "slim_pairing_is_stale", lambda: True)
+
+    plan = _whisper_phase_plan("auto", llama_will_run = True, migration = True)
+    assert plan == chained, plan
+    assert repair_calls == [], "a migration must not take the repair-only branch"
+
+
+def test_a_plain_update_that_can_move_the_backend_still_re_pairs_whisper(monkeypatch, tmp_path):
+    # an update passes no --llama-backend, so the "auto" default can move under it
+    _install(monkeypatch, tmp_path)
+    monkeypatch.setattr(upd, "_whisper_chain_status", lambda **kw: {"skip_reason": "up_to_date"})
+    repair = {"update_available": True, "phase": {"repair": True}}
+    monkeypatch.setattr(whisper_upd, "repair_pairing_plan", lambda: repair)
+
+    assert _whisper_phase_plan(None, llama_will_run = True) is repair
+    assert _whisper_phase_plan(None, llama_will_run = False)["skip_reason"] == "up_to_date"
+
+
+def test_a_recorded_backend_choice_does_not_schedule_a_re_pair(monkeypatch, tmp_path):
+    _install(monkeypatch, tmp_path, backend_request = "cuda")
+    monkeypatch.setattr(upd, "_whisper_chain_status", lambda **kw: {"skip_reason": "up_to_date"})
+    monkeypatch.setattr(whisper_upd, "repair_pairing_plan", lambda: {"phase": {"repair": True}})
+    assert _whisper_phase_plan(None, llama_will_run = True)["skip_reason"] == "up_to_date"
+
+
+def test_a_self_contained_whisper_keeps_its_up_to_date_reason(monkeypatch, tmp_path):
+    _install(monkeypatch, tmp_path)
+    monkeypatch.setattr(upd, "_whisper_chain_status", lambda **kw: {"skip_reason": "up_to_date"})
+    monkeypatch.setattr(
+        whisper_upd, "repair_pairing_plan", lambda: {"skip_reason": "self_contained", "phase": None}
+    )
+    assert _whisper_phase_plan(None, llama_will_run = True)["skip_reason"] == "up_to_date"
+
+
+def test_a_deliberate_switch_still_takes_the_repair_branch(monkeypatch):
+    monkeypatch.setattr(upd, "_whisper_chain_status", lambda **kw: {"phase": {"kind": "whisper"}})
+    marker = {"repaired": True}
+    monkeypatch.setattr(whisper_upd, "repair_pairing_plan", lambda: marker)
+    monkeypatch.setattr(whisper_upd, "slim_pairing_is_stale", lambda: True)
+    assert _whisper_phase_plan("vulkan", llama_will_run = True) is marker

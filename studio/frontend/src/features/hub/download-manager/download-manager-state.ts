@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-import { isTauri } from "@/lib/api-base";
+import { reportDownloadsActive } from "@/lib/downloads-activity";
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 import { INVENTORY_HINT_KIND } from "../inventory/constants";
@@ -23,7 +23,6 @@ import {
 import {
   ACTIVE_STATES,
   MAX_PROGRESS_FRACTION,
-  isPersistedJobState,
 } from "./download-manager-config";
 import {
   type DownloadManagerState,
@@ -32,6 +31,7 @@ import {
   downloadInventoryHintKind,
   scopedDownloadInventoryKind,
 } from "./download-manager-types";
+import { presentationForExpectedBytesUpdate } from "./download-presentation";
 import {
   clearRuntimeTimer,
   pruneSuppressedCompletedInventoryHints as pruneRuntimeSuppressedHints,
@@ -40,7 +40,7 @@ import {
 } from "./runtime-registry";
 
 const PERSIST_KEY = "unsloth.studio.downloads";
-// Below version 2 an absent measuredTransfer marker is not evidence of anything, so the migration decides.
+// Below version 2 an absent measuredTransfer is not evidence, so the migration decides.
 const PERSIST_VERSION = 2;
 const MEASURED_TRANSFER_VERSION = 2;
 const PERSIST_THROTTLE_MS = 1_000;
@@ -57,11 +57,36 @@ function nonNegativeNumber(value: unknown, fallback = 0): number {
   return Math.max(0, finiteNumber(value, fallback));
 }
 
-/**
- * Inventory kind of a persisted job. Records written before the field carry `scopedFiles`, the same evidence
- * `startJob` classifies a fresh scoped request from: without it a scoped GGUF download comes back as a model
- * download, so its row changes format until backend adoption repairs it.
- */
+function presentationOfPersisted(value: Record<string, unknown>) {
+  if (!isRecord(value.presentation)) return {};
+  const { label, filename, expectedBytes, cachedPlanPrefixBytes } =
+    value.presentation;
+  if (
+    typeof label !== "string" ||
+    !label.trim() ||
+    typeof filename !== "string" ||
+    !filename.trim() ||
+    typeof expectedBytes !== "number" ||
+    !Number.isFinite(expectedBytes) ||
+    expectedBytes <= 0
+  ) {
+    return {};
+  }
+  return {
+    presentation: {
+      label: label.trim(),
+      filename: filename.trim(),
+      expectedBytes,
+      ...(typeof cachedPlanPrefixBytes === "number" &&
+      Number.isFinite(cachedPlanPrefixBytes) &&
+      cachedPlanPrefixBytes >= 0
+        ? { cachedPlanPrefixBytes }
+        : {}),
+    },
+  };
+}
+
+/** Legacy records lack the kind; `scopedFiles` classifies scoped GGUF downloads, as startJob does. */
 function inventoryKindOfPersisted(
   value: Record<string, unknown>,
   variant: string | null,
@@ -92,7 +117,7 @@ function sanitizePersistedJob(
   const kind = isDownloadKind(value.kind) ? value.kind : null;
   const repoId = typeof value.repoId === "string" ? value.repoId : null;
   const state = value.state as DownloadJobState;
-  if (!kind || !repoId || !isPersistedJobState(state)) return null;
+  if (!kind || !repoId || !ACTIVE_STATES.has(state)) return null;
 
   const variant = typeof value.variant === "string" ? value.variant : null;
   const key = jobKeyOf(kind, repoId, variant);
@@ -106,6 +131,7 @@ function sanitizePersistedJob(
     completedBytes: nonNegativeNumber(value.completedBytes),
     completeOnDisk: false,
     expectedBytes: nonNegativeNumber(value.expectedBytes),
+    ...presentationOfPersisted(value),
     fraction: Math.min(Math.max(finiteNumber(value.fraction, 0), 0), 1),
     bytesPerSec: 0,
     etaSeconds: 0,
@@ -113,6 +139,9 @@ function sanitizePersistedJob(
     startedAt: nonNegativeNumber(value.startedAt, Date.now()),
     ...(Number.isSafeInteger(value.serverGeneration)
       ? { serverGeneration: Number(value.serverGeneration) }
+      : {}),
+    ...(Number.isSafeInteger(value.serverAttempt)
+      ? { serverAttempt: Number(value.serverAttempt) }
       : {}),
     ...(Array.isArray(value.scopedFiles) &&
     value.scopedFiles.every((f) => typeof f === "string")
@@ -122,8 +151,8 @@ function sanitizePersistedJob(
       ? { checkpoint: value.checkpoint }
       : {}),
     ...inventoryKindOfPersisted(value, variant),
-    // A held reading must survive the reload: dropping the flag restores the stale downloadedBytes reading as measured, the "0 B left" the guard exists to stop.
-    // Absent means "never polled" only since the field existed, so a legacy record already carrying counters is read as held.
+    // A held reading must survive reload or the stale bytes read as measured ("0 B left").
+    // A legacy record already carrying counters is read as held.
     ...(typeof value.measuredTransfer === "boolean"
       ? { measuredTransfer: value.measuredTransfer }
       : legacy && nonNegativeNumber(value.downloadedBytes) > 0
@@ -134,6 +163,9 @@ function sanitizePersistedJob(
       : {}),
     ...(isResolvedTransport(value.cancelTransport)
       ? { cancelTransport: value.cancelTransport }
+      : {}),
+    ...(typeof value.downloadDir === "string" || value.downloadDir === null
+      ? { downloadDir: value.downloadDir }
       : {}),
   };
 }
@@ -168,11 +200,17 @@ function toPersistedJob(
     downloadedBytes: job.downloadedBytes,
     completedBytes: job.completedBytes,
     expectedBytes: job.expectedBytes,
+    ...(job.presentation !== undefined
+      ? { presentation: job.presentation }
+      : {}),
     fraction: job.fraction,
     error: job.error,
     startedAt: job.startedAt,
     ...(job.serverGeneration !== undefined
       ? { serverGeneration: job.serverGeneration }
+      : {}),
+    ...(job.serverAttempt !== undefined
+      ? { serverAttempt: job.serverAttempt }
       : {}),
     ...(job.scopedFiles !== undefined ? { scopedFiles: job.scopedFiles } : {}),
     ...(job.checkpoint !== undefined ? { checkpoint: job.checkpoint } : {}),
@@ -183,14 +221,15 @@ function toPersistedJob(
       ? { measuredTransfer: job.measuredTransfer }
       : {}),
     ...(job.transport !== undefined ? { transport: job.transport } : {}),
-    // Alongside the transport, never instead of it: a fallback run reads as plain HTTP and the reloaded card offers Pause for a restart-only stop.
+    // Alongside the transport: a fallback run would otherwise reload offering Pause for a restart-only stop.
     ...(job.cancelTransport !== undefined
       ? { cancelTransport: job.cancelTransport }
       : {}),
+    ...(job.downloadDir !== undefined ? { downloadDir: job.downloadDir } : {}),
   };
 }
 
-// Mirrors the backend's normalize_repo_key (strip().lower()) for keys only; `repoId` keeps its casing for display and API calls.
+// Mirrors the backend's normalize_repo_key (strip().lower()); `repoId` keeps its casing for display.
 function normalizeRepoIdentity(repoId: string): string {
   return repoId.trim().toLowerCase();
 }
@@ -236,7 +275,7 @@ function collectCompletedInventoryHints(
 ): InventoryHint[] {
   return Object.values(jobs).flatMap((job) => {
     if (job.state !== "complete") return [];
-    // A dictation download is not a chat model arriving: a custom Whisper repo stays visible in chat for the hint's whole TTL until the backend scans its config.
+    // A dictation download is not a chat model arriving.
     if (job.external) return [];
     const kind = downloadInventoryHintKind(
       job.kind,
@@ -300,10 +339,7 @@ export const useDownloadManagerStore = create<DownloadManagerState>()(
     partialize: (state) => ({
       jobs: Object.fromEntries(
         Object.entries(state.jobs)
-          // External jobs have no hub job to resume into, so they are not saved.
-          // Failed and cancelled jobs stay: the Downloads list is the resume
-          // entry after a mid-transfer failure or a restart (#9780).
-          .filter(([, job]) => !job.external && isPersistedJobState(job.state))
+          .filter(([, job]) => !job.external && ACTIVE_STATES.has(job.state))
           .map(([key, job]) => [key, toPersistedJob(job)] as const),
       ),
       conflicts: {},
@@ -314,31 +350,15 @@ export const useDownloadManagerStore = create<DownloadManagerState>()(
 export const setState = useDownloadManagerStore.setState;
 export const getState = useDownloadManagerStore.getState;
 
-/**
- * A Tauri quit never fires beforeunload, and only this store knows a backend download is in flight. */
 export function hasActiveDownloadJob(
   jobs: Record<string, ManagedDownload>,
 ): boolean {
-  // External jobs count too, unlike in `partialize`: their STT sidecars go through the backend, so a quit kills those transfers.
+  // External jobs count too, unlike in `partialize`: quitting kills their backend STT transfers.
   return Object.values(jobs).some((job) => ACTIVE_STATES.has(job.state));
 }
 
-function publishDownloadsActive(active: boolean): void {
-  if (!isTauri) return;
-  void import("@tauri-apps/api/core")
-    .then(({ invoke }) =>
-      invoke("set_renderer_activity", { kind: "downloads", active }),
-    )
-    .catch(() => {});
-}
-
-let lastPublishedDownloadsActive: boolean | null = null;
-
 function syncDownloadsActivity(state: DownloadManagerState): void {
-  const active = hasActiveDownloadJob(state.jobs);
-  if (active === lastPublishedDownloadsActive) return;
-  lastPublishedDownloadsActive = active;
-  publishDownloadsActive(active);
+  reportDownloadsActive("hub", hasActiveDownloadJob(state.jobs));
 }
 
 syncDownloadsActivity(getState());
@@ -375,6 +395,32 @@ export function findActiveJobForRepo(
   const repoIdentity = normalizeRepoIdentity(repoId);
   for (const job of Object.values(jobs)) {
     if (job.kind !== kind || normalizeRepoIdentity(job.repoId) !== repoIdentity)
+      continue;
+    if (!ACTIVE_STATES.has(job.state)) continue;
+    if (isPreferredRepoActiveJob(job, selected)) {
+      selected = job;
+    }
+  }
+  return selected;
+}
+
+export function findActiveScopedJobForRepo(
+  jobs: Record<string, ManagedDownload>,
+  kind: DownloadKind,
+  repoId: string,
+  inventoryKind?: "model" | "gguf",
+): ManagedDownload | null {
+  let selected: ManagedDownload | null = null;
+  const repoIdentity = normalizeRepoIdentity(repoId);
+  for (const job of Object.values(jobs)) {
+    if (job.kind !== kind || normalizeRepoIdentity(job.repoId) !== repoIdentity)
+      continue;
+    if (!job.variant?.startsWith("@")) continue;
+    if (
+      inventoryKind &&
+      downloadInventoryHintKind(job.kind, job.variant, job.inventoryKind) !==
+        inventoryKind
+    )
       continue;
     if (!ACTIVE_STATES.has(job.state)) continue;
     if (isPreferredRepoActiveJob(job, selected)) {
@@ -618,7 +664,7 @@ export function discardDeletedModelInventoryHints(
     return;
   }
   const job = getState().jobs[jobKeyOf(DOWNLOAD_KIND.MODEL, repoId, variant)];
-  // Every other hint site classifies a scoped `@variant` as a model download; hardcoding "gguf" leaves a scoped model download's hint behind, so the deleted row returns until it expires.
+  // Use the shared classifier: hardcoding "gguf" leaves a scoped model download's hint behind.
   const kind = downloadInventoryHintKind(
     DOWNLOAD_KIND.MODEL,
     variant,
@@ -661,7 +707,12 @@ export function setExpectedBytesForJob(
   if (!job || job.state !== "running" || bytes <= job.expectedBytes) return;
   patchJob(job.key, {
     expectedBytes: bytes,
-    // Measured against the old, smaller total, so wrong the moment the total grows.
+    presentation: presentationForExpectedBytesUpdate(
+      job.presentation,
+      job.expectedBytes,
+      bytes,
+    ),
+    // Measured against the old, smaller total.
     etaSeconds: 0,
     fraction:
       job.fraction > 0

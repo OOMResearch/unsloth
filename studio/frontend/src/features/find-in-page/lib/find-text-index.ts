@@ -1,37 +1,25 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-// Flatten searchable text once and retain offsets back to its text nodes. The module is pure, so
-// the Node tests can use a hand-rolled DOM.
+// Pure module, so the Node tests can use a hand-rolled DOM.
 
 import { FIND_SKIP_ATTRIBUTE } from "./find-attributes.ts";
 
-/** `Node.ELEMENT_NODE` / `Node.TEXT_NODE`, spelled out so this module needs no DOM globals. */
 export const ELEMENT_NODE = 1;
 export const TEXT_NODE = 3;
 
-/** Written at block boundaries so a match cannot run from one paragraph into the next. NUL because
- *  no query can contain it, and `findMatches` rejects the one route that could (a paste). */
+/** NUL: no typed query can contain it, and `normalizeQuery` rejects pasted ones. */
 export const BLOCK_SEPARATOR = "\u0000";
 
-/** Ceiling on the flattened text. A thread is bounded by what a person scrolled through, a tool
- *  result is not: a Bash step can paste a megabyte of build log in. Scanning 4M costs about 2ms. */
 export const MAX_INDEX_CHARS = 4_000_000;
 
-/** Ceiling on matches for one query. Every match is a `Range` the highlight registry has to paint,
- *  and a single letter in a long thread has thousands. */
 export const MAX_MATCHES = 5_000;
 
-/** Ceiling on what ONE text node may contribute. A Bash step's log arrives as a single text node,
- *  and left to itself it spends the whole budget on the top of the document, so the messages the
- *  reader is looking at are not indexed at all. A share each, and the walk goes on. */
+/** A log arrives as one text node and would otherwise spend the whole budget on its own. */
 export const MAX_NODE_CHARS = 100_000;
 
-/** Reserve space for visible portaled surfaces after walking the workspace. */
 export const PORTAL_RESERVE_CHARS = 100_000;
 
-/** Elements whose subtree holds no findable text. Form controls carry theirs in `value`; a `Range`
- *  over `SVG` or `CANVAS` content is not paintable on every engine. */
 const SKIP_TAGS: ReadonlySet<string> = new Set([
   "SCRIPT",
   "STYLE",
@@ -50,9 +38,7 @@ const SKIP_TAGS: ReadonlySet<string> = new Set([
   "EMBED",
 ]);
 
-/** Elements that end the line they sit on, so a separator goes in either side of them. A tag set,
- *  not `getComputedStyle`: this runs on every element in the thread. Being wrong about an exotic
- *  one inserts a break that was not needed, never invents a match. */
+/** A tag set, not `getComputedStyle`: being wrong inserts a needless break, never a match. */
 const BLOCK_TAGS: ReadonlySet<string> = new Set([
   "ADDRESS",
   "ARTICLE",
@@ -97,16 +83,14 @@ const BLOCK_TAGS: ReadonlySet<string> = new Set([
   "UL",
 ]);
 
-// Re-exported so this module stays the one import for everything about the index.
 export {
   FIND_SCOPE_ATTRIBUTE,
   FIND_SKIP_ATTRIBUTE,
 } from "./find-attributes.ts";
 
-/** Spaces that render as a space but are not one. Each is one UTF-16 unit, which keeps the map valid. */
+/** Each is one UTF-16 unit, keeping the offset map valid. */
 const HARD_SPACE_PATTERN = /[\u00A0\u2002\u2003\u2007\u2009\u202F]/g;
 
-/** Only the shape this module reads, so a test can hand it plain objects. */
 export interface FindTextNodeLike {
   readonly nodeType: number;
   readonly data: string;
@@ -117,7 +101,6 @@ export interface FindElementLike {
   readonly tagName: string;
   readonly childNodes: ArrayLike<FindTextNodeLike | FindElementLike>;
   getAttribute(name: string): string | null;
-  /** Optional so a test can hand this plain objects; every browser we ship on has it. */
   checkVisibility?(options?: {
     contentVisibilityAuto?: boolean;
     opacityProperty?: boolean;
@@ -130,13 +113,10 @@ export interface FindElementLike {
 
 export type FindNodeLike = FindTextNodeLike | FindElementLike;
 
-/** One text node's contribution, at the offset its first character took in `text`. */
 export interface TextSegment {
   node: FindTextNodeLike;
   start: number;
-  /** Always the node's own `data.length`, so an offset inside the run maps straight through. */
   length: number;
-  /** True inside a `<pre>` or anything else that keeps its whitespace. See `findMatches`. */
   preserved: boolean;
 }
 
@@ -147,15 +127,12 @@ interface IndexedSurface {
 }
 
 export interface FindTextIndex {
-  /** Case-folded haystack, block boundaries written as `BLOCK_SEPARATOR`. */
   text: string;
-  /** Sorted by `start`, gapped wherever a separator was written. */
   segments: TextSegment[];
-  /** True when `MAX_INDEX_CHARS` stopped the walk early. */
   truncated: boolean;
-  /** Where the portaled surfaces begin. The whole length when none are open. */
+  /** Offsets where text was dropped; a match may not end on one. */
+  seams: ReadonlySet<number>;
   rootLength: number;
-  /** Stable portal roots and the offsets occupied by their searchable text. */
   surfaces: IndexedSurface[];
 }
 
@@ -163,26 +140,17 @@ export const EMPTY_TEXT_INDEX: FindTextIndex = {
   text: "",
   segments: [],
   truncated: false,
+  seams: new Set<number>(),
   rootLength: 0,
   surfaces: [],
 };
 
-/** Dotted I, the only code point whose `toLowerCase` grows (scanned all of them). Mapped to bare
- *  `i`, the Turkic fold: the default adds a combining dot, and one index char must stand for one
- *  document char. */
+/** The only code point whose `toLowerCase` grows; folded to `i` to keep lengths equal. */
 const DOTTED_I_PATTERN = /\u0130/g;
 
-/** Final sigma, mapped to medial as `CaseFolding.txt` does. `toLowerCase` picks between them by
- *  what follows, so only one of the two spellings a reader can type would match. One unit each. */
+/** Mapped to medial sigma as CaseFolding.txt does, so both spellings match. */
 const FINAL_SIGMA_PATTERN = /\u03c2/g;
 
-/**
- * Case-fold the flattened document without changing its length.
- *
- * The two mappings above are what the default fold misses. With dotted I gone first `toLowerCase`
- * cannot change a length, so this is one pass: 11ms at the 4M ceiling, against 146ms walking code
- * points.
- */
 export function foldText(raw: string): string {
   const spaced = raw
     .replace(HARD_SPACE_PATTERN, " ")
@@ -191,8 +159,6 @@ export function foldText(raw: string): string {
   if (folded.length === spaced.length) {
     return folded.replace(FINAL_SIGMA_PATTERN, "\u03c3");
   }
-  // Nothing reaches this: dotted I was the only expansion and it is gone by here. But a wrong
-  // length would misplace every offset after it, so fall back to the fold that cannot drift.
   let plain = "";
   for (const point of spaced) {
     const lower = point.toLowerCase();
@@ -201,20 +167,15 @@ export function foldText(raw: string): string {
   return plain.replace(FINAL_SIGMA_PATTERN, "\u03c3");
 }
 
-/** Check cheap markup before resolving styles, which avoids layout work for skipped subtrees. */
 function hasClassToken(element: FindElementLike, token: string): boolean {
   return (element.getAttribute("class") ?? "").split(/\s+/).includes(token);
 }
 function skipsByMarkup(element: FindElementLike): boolean {
-  // Uppercased first: only HTML elements report their tag that way. SVG and MathML keep their source
-  // casing, so an inline `<svg>` answers "svg" and walked straight past this set, putting Mermaid
-  // labels in the index as matches no engine can paint. Already uppercase for everything else.
+  // Uppercased: SVG and MathML keep their source casing.
   if (SKIP_TAGS.has(element.tagName.toUpperCase())) return true;
   if (hasClassToken(element, "katex-mathml")) return true;
   if (element.getAttribute(FIND_SKIP_ATTRIBUTE) !== null) return true;
-  // Boolean attributes, so presence is the whole signal. The shell parks an off-route workspace
-  // under `inert`; Radix marks the page `aria-hidden` behind a modal. KaTeX is the narrow exception:
-  // its painted HTML tree is deliberately aria-hidden because a clipped MathML mirror speaks it.
+  // KaTeX's painted HTML is deliberately aria-hidden, so it is excepted.
   if (element.getAttribute("hidden") !== null) return true;
   if (element.getAttribute("inert") !== null) return true;
   return (
@@ -223,31 +184,13 @@ function skipsByMarkup(element: FindElementLike): boolean {
   );
 }
 
-/**
- * True when the walk must not descend into this element.
- *
- * `style` is the element's resolved style, passed in by the walk so the read is made once per
- * element rather than once here and once again in `visit` -- which is what the measurement quoted
- * on `computedStyle` was taken to mean, and was not what the code did. Optional because the
- * exported signature is one the tests call directly; resolving it here is the same answer.
- */
 export function skipsSubtree(
   element: FindElementLike,
   style: ResolvedStyle | null = computedStyle(element),
 ): boolean {
   if (skipsByMarkup(element)) return true;
-  // Anything the engine is not painting. Attributes miss the common case: `hidden lg:flex` is a
-  // CLASS, and text under it would be counted and walked to while nobody can see it.
-  //
-  // `contentVisibilityAuto` off: such a subtree is skipped, not hidden, and asking would drop the
-  // far half of a Hub README and of a maths thread, with nothing to put it back (scrolling renders
-  // without mutating, so the observer never fires). Opacity off, so a message fading in stays
-  // findable.
-  //
-  // Both spellings of each option: `visibilityProperty`/`opacityProperty` are renames of
-  // `checkVisibilityCSS`/`checkOpacity`, an engine reads only the name it knows, and Web IDL drops
-  // an unknown member silently. The modern name alone is a no-op on Chrome 105-120 and Firefox
-  // 106-121, which would then index and highlight `visibility: hidden` text.
+  // contentVisibilityAuto and opacity off; both spellings since older Chrome and Firefox
+  // read only the old names.
   const painted = element.checkVisibility?.({
     contentVisibilityAuto: false,
     opacityProperty: false,
@@ -256,15 +199,10 @@ export function skipsSubtree(
     checkVisibilityCSS: true,
   });
   if (painted === false) {
-    // `display: contents` has no box, and no box is the first thing `checkVisibility` calls
-    // invisible, so a wrapper whose children are all on screen answers false. The shell and the
-    // training page both use one, which is most of what there is to search. A real box is what
-    // makes an element hidden rather than absent.
+    // Shell wrappers are `display: contents`, which checkVisibility calls invisible.
     return style?.display !== "contents";
   }
-  // No `checkVisibility` to ask: it landed in Safari 17.4, and WebKitGTK is a supported engine
-  // here, so this is a real path and the visible branch would index every `display: none` subtree.
-  // `paintsNothing` mirrors what the call above asks for.
+  // `checkVisibility` landed in Safari 17.4 and WebKitGTK is supported here, so this is a real path.
   if (painted === undefined && paintsNothing(style)) return true;
   return clippedAway(style);
 }
@@ -277,14 +215,7 @@ interface ResolvedStyle {
   clipPath?: string;
 }
 
-/**
- * True when this element keeps its own text off screen while still being descended into.
- *
- * Only `display: contents` reaches this, and `skipsSubtree` lets it through on purpose. But
- * `visibility` inherits, and only ELEMENT children are re-checked, so a direct text child of a
- * hidden `contents` wrapper would be indexed and highlighted. Scoped to the element's own text:
- * a descendant restoring `visibility: visible` is painted again and still reached.
- */
+/** `visibility` inherits and only element children are re-checked, so check own text. */
 function hidesOwnText(style: ResolvedStyle | null): boolean {
   return (
     style?.display === "contents" &&
@@ -292,18 +223,13 @@ function hidesOwnText(style: ResolvedStyle | null): boolean {
   );
 }
 
-/** True when this element paints no box, for engines with no `checkVisibility`. `display: contents`
- *  is boxless rather than hidden, so it is excluded here and `hidesOwnText` covers its own text,
- *  which is what the branch above does when the API answers. */
 function paintsNothing(style: ResolvedStyle | null): boolean {
   if (style?.display === "none") return true;
   if (style?.display === "contents") return false;
   return style?.visibility === "hidden" || style?.visibility === "collapse";
 }
 
-/** The two spellings of Tailwind's `sr-only`: a real box, full opacity, clipped to nothing.
- *  `checkVisibility` calls that visible, so without this the app's 46 screen-reader labels are
- *  counted and walked to under a highlight clipped away with them. */
+/** Tailwind's `sr-only`: a real box at full opacity, which `checkVisibility` calls visible. */
 function clippedAway(style: ResolvedStyle | null): boolean {
   return (
     style?.clipPath === "inset(50%)" ||
@@ -311,13 +237,6 @@ function clippedAway(style: ResolvedStyle | null): boolean {
   );
 }
 
-/**
- * `display` and `white-space` as resolved, or null off the DOM where the tag sets stand in.
- *
- * Used for three things: telling a boxless wrapper from a hidden one, the block boundaries no tag
- * name carries, and where whitespace is preserved. At 8000 elements: 2.5ms for the visibility check
- * alone, 4.3ms with this, against a 300ms floor between rebuilds.
- */
 function computedStyle(element: FindElementLike): ResolvedStyle | null {
   const view = globalThis as unknown as {
     getComputedStyle?: (element: FindElementLike) => ResolvedStyle;
@@ -325,9 +244,7 @@ function computedStyle(element: FindElementLike): ResolvedStyle | null {
   return view.getComputedStyle?.(element) ?? null;
 }
 
-/** True when this element ends the line it sits on. `inline-block` and friends do not, `contents`
- *  has no box. Being wrong inserts a needless separator, which can only lose a match and never
- *  invent one, so anything unrecognised counts as a boundary. */
+/** Anything unrecognised is a boundary: a needless separator can lose a match, never invent one. */
 function isBlockDisplay(display: string | undefined): boolean {
   if (display === undefined) return false;
   return !(
@@ -337,8 +254,7 @@ function isBlockDisplay(display: string | undefined): boolean {
   );
 }
 
-/** True where whitespace is kept rather than collapsed. `pre-line` is excluded: it still collapses
- *  runs of spaces, which is the half the query flexibility below cares about. */
+/** `pre-line` is excluded: it still collapses runs of spaces. */
 function preservesWhitespace(whiteSpace: string | undefined): boolean {
   return (
     whiteSpace === "pre" ||
@@ -347,51 +263,40 @@ function preservesWhitespace(whiteSpace: string | undefined): boolean {
   );
 }
 
-/**
- * Flatten `root` into one case-folded string plus the map back to its text nodes.
- *
- * Recursive rather than a `TreeWalker`: the walker reports entering an element but not leaving one,
- * and the closing separator is what stops `<p>a</p>b` reading as "ab".
- */
+/** Recursive, not a TreeWalker, which cannot report leaving an element. */
 export function buildTextIndex(
   root: FindElementLike,
-  /** Subtrees to index after `root`, in the order they sit in the document. Portaled surfaces. */
   extraRoots: readonly FindElementLike[] = [],
 ): FindTextIndex {
   const parts: string[] = [];
   const segments: TextSegment[] = [];
 
   const surfaces: IndexedSurface[] = [];
+  const seams = new Set<number>();
+  let tail = "";
+  let dropped: string | null = null;
   let length = 0;
-  /** The index does not hold everything: a node was clipped, or the ceiling was reached. */
   let truncated = false;
-  /** The ceiling was reached, which is the only thing that stops the walk. */
   let full = false;
-  /** What `full` is measured against. Raised for the portaled surfaces below, which the workspace
-   *  gives up a share of the budget for, and only when there is one of them to give it to. */
   let ceiling =
     MAX_INDEX_CHARS - (extraRoots.length > 0 ? PORTAL_RESERVE_CHARS : 0);
-  // Written lazily, so a run of empty blocks costs nothing and no separator lands at either end.
+  // Written lazily, so no separator lands at either end.
   let pendingSeparator = false;
 
   const visit = (element: FindElementLike, inherited: boolean): void => {
-    // Markup first, so a subtree turned down on a tag or an attribute costs no layout read at all.
-    // Then one resolved style, shared with the rest of the skip rule: both halves need it, and
-    // resolving it separately in each doubled the cost the comment on `computedStyle` quotes.
     if (skipsByMarkup(element)) return;
     const style = computedStyle(element);
     if (skipsSubtree(element, style)) return;
-    // The tag set answers `<br>`, whose display is inline. Layout is the rest: two `span.block`
-    // run together without a boundary, so "Open" above "AI" reads as one word.
     const block =
       BLOCK_TAGS.has(element.tagName) || isBlockDisplay(style?.display);
-    if (block) pendingSeparator = true;
+    if (block) {
+      pendingSeparator = true;
+      dropped = null;
+    }
     const preserved =
       style?.whiteSpace === undefined
         ? inherited
         : preservesWhitespace(style.whiteSpace);
-    // Asked once per element, not per text node: a boxless wrapper that is also invisible paints
-    // none of its own text, and that text is the one thing `skipsSubtree` never gets to judge.
     const ownTextHidden = hidesOwnText(style);
     const children = element.childNodes;
     for (let i = 0; i < children.length; i += 1) {
@@ -402,25 +307,39 @@ export function buildTextIndex(
         const node = child as FindTextNodeLike;
         const data = node.data;
         if (data.length === 0) continue;
-        // Before the separator, not after: one emitted past the ceiling makes `take` negative, and
-        // `slice(0, negative)` takes all but the last character of the next node.
+        // Before the separator: past the ceiling `take` goes negative and slice misbehaves.
         if (length >= ceiling) {
           truncated = true;
+          if (!pendingSeparator && joinsAcross(tail, firstPointOf(data))) {
+            seams.add(length);
+          }
           full = true;
           return;
         }
+        let separated = false;
         if (pendingSeparator) {
           pendingSeparator = false;
           if (length > 0) {
             parts.push(BLOCK_SEPARATOR);
             length += 1;
+            tail = BLOCK_SEPARATOR;
+            separated = true;
           }
         }
-        // A share, not all of it: the prefix keeps one huge node findable, while the whole
-        // remaining budget for it would leave out everything after, messages on screen included.
-        const take = Math.min(ceiling - length, MAX_NODE_CHARS);
+        if (dropped !== null) {
+          if (joinsAcross(dropped, firstPointOf(data))) seams.add(length);
+          dropped = null;
+        }
+        // A share, not all: one huge node must not starve everything after it.
+        let take = Math.min(ceiling - length, MAX_NODE_CHARS);
+        // Never cut between surrogate halves; drop the lead one so the cut is a real boundary.
+        if (take > 0 && take < data.length && isPairedHalf(data, take))
+          take -= 1;
         if (take <= 0) {
           truncated = true;
+          if (!separated && joinsAcross(tail, firstPointOf(data))) {
+            seams.add(length);
+          }
           full = true;
           return;
         }
@@ -428,10 +347,13 @@ export function buildTextIndex(
         parts.push(raw);
         segments.push({ node, start: length, length: raw.length, preserved });
         length += raw.length;
-        // Siblings still get indexed, but what was dropped must leave a boundary or the prefix
-        // runs into the next node and a match across that seam paints over the gap.
+        tail = (tail + raw).slice(-JOIN_CONTEXT);
+        // Dropped text must leave a boundary, or a match across the seam paints over the gap.
         if (raw.length < data.length) {
           truncated = true;
+          if (joinsAcross(raw, firstPointOf(data.slice(take))))
+            seams.add(length);
+          dropped = data.slice(-JOIN_CONTEXT);
           pendingSeparator = true;
         }
       } else if (child.nodeType === ELEMENT_NODE) {
@@ -439,21 +361,22 @@ export function buildTextIndex(
         if (full) return;
       }
     }
-    if (block) pendingSeparator = true;
+    if (block) {
+      pendingSeparator = true;
+      dropped = null;
+    }
   };
 
   visit(root, false);
-  // Before the surfaces and the separator joining them, so this slice is exactly the workspace.
-  // `foldText` cannot change a length, so the offset survives it.
+  // `foldText` cannot change a length, so this offset survives it.
   const rootLength = length;
-  // The reserve, handed over. Portaled surfaces come after the workspace, so without this the one
-  // thing in front of the reader is the one left out. `truncated` stays as the workspace left it.
+  // Hand portals the reserve, or the surface in front of the reader is the one left out.
   ceiling = MAX_INDEX_CHARS;
   full = false;
   for (const extra of extraRoots) {
     if (full) break;
-    // A boundary between roots: they are separate surfaces, and a match must not run across.
     pendingSeparator = true;
+    dropped = null;
     const firstSegment = segments.length;
     visit(extra, false);
     if (segments.length > firstSegment) {
@@ -464,47 +387,32 @@ export function buildTextIndex(
       });
     }
   }
-  // Folded once, over the joined document: see foldText for why it cannot be done a node at a time.
+  // Folded once over the joined document; see foldText.
   return {
     text: foldText(parts.join("")),
     segments,
     truncated,
+    seams,
     rootLength,
     surfaces,
   };
 }
 
-/**
- * True when a rebuild renumbers the match list, so the search has to re-anchor to the viewport.
- *
- * The index is the workspace followed by the surfaces portaled in front of it, joined at
- * `rootLength`. A monitor stays searchable while it is up and rewrites its reading on a timer, so
- * judged as one string every poll reads as a renumbered document and throws the reader out of the
- * conversation behind it. What decides is whether text moved AHEAD of the reader's offset.
- *
- * This is the cheap half of the answer. `search` asks the exact question afterwards, by looking for
- * a match still starting at that offset, so this only has to turn down the rebuilds where the
- * offset would be meaningless.
- *
- * Here rather than beside its caller: the hook imports React and cannot run under `node --test`.
- */
+/** True when a rebuild moved text ahead of the reader's offset, so search re-anchors.
+ *  Kept here, not in the hook, so it runs under `node --test`. */
 export function renumbersMatches(
   before: FindTextIndex,
   after: FindTextIndex,
-  /** Where the reader's occurrence started in `before`, or null when there was none. */
   activeStart: number | null,
 ): boolean {
-  // One slice, and none at all without a surface open, where the workspace is the whole text.
   const workspaceGrewAtTail =
     before.rootLength <= after.rootLength &&
     after.text.startsWith(before.text.slice(0, before.rootLength));
-  // The workspace is the prefix, so no surface can move an offset inside it. `search` re-anchors on
-  // its own when there was no occurrence to keep.
+  // The workspace is the prefix, so no surface can move an offset inside it.
   if (activeStart === null || activeStart < before.rootLength) {
     return !workspaceGrewAtTail;
   }
-  // A stable surface root tells whether another portal was inserted, removed, or reordered ahead of
-  // the occurrence. Equal-width polling within that root keeps its start and therefore the reader.
+  // A stable surface root tells whether a portal was inserted or reordered ahead.
   const beforeSurface = before.surfaces.find(
     ({ start, end }) => start <= activeStart && activeStart < end,
   );
@@ -521,8 +429,6 @@ export function renumbersMatches(
   return !workspaceGrewAtTail || after.rootLength !== before.rootLength;
 }
 
-/** Fold a query the way the haystack was folded. Null when it cannot match: empty, or carrying the
- *  separator, which only a paste could produce. */
 export function normalizeQuery(query: string): string | null {
   if (query.length === 0) return null;
   const folded = foldText(query);
@@ -532,28 +438,14 @@ export function normalizeQuery(query: string): string | null {
 
 export interface FindMatch {
   start: number;
-  /** Exclusive, as a `Range` end is. */
   end: number;
 }
 
-/** Regex metacharacters, so a query of "a.b" does not match "axb". */
 const REGEX_META_PATTERN = /[.*+?^${}()|[\]\\]/g;
 
-/** Combining dot above, the tail of a decomposed dotted I. */
 const COMBINING_DOT = "̇";
 
-/**
- * The canonically equivalent spellings of `needle`, longest first so the fuller one wins.
- *
- * Composed and decomposed spellings look identical on screen and both turn up in one thread.
- * Normalizing the index would change its length, and every offset stands for one document
- * character, so the variants go into the pattern instead and the document is left alone.
- *
- * `dotted` adds the spelling a decomposed dotted I leaves behind. U+0130 decomposes to `I` plus a
- * combining dot, which folds to `i` plus that dot, and `i` + dot has no precomposed form, so NFC
- * cannot put it back and the plain query misses a word plainly on screen. Only offered when the
- * index carries a combining dot, so an ordinary document keeps the single-variant `indexOf` path.
- */
+/** Longest first. The index itself is never normalized, to keep offsets 1:1. */
 function canonicalVariants(needle: string, dotted: boolean): string[] {
   const variants = [needle];
   for (const form of ["NFC", "NFD"] as const) {
@@ -570,10 +462,7 @@ function canonicalVariants(needle: string, dotted: boolean): string[] {
   return variants;
 }
 
-/**
- * One canonical cluster. Hangul conjoining sequences can contain repeated leading, vowel, and
- * trailing Jamo, so the whole L*V*T* run has to win before the generic character alternative.
- */
+/** Hangul L*V*T* runs must win before the generic character alternative. */
 const CLUSTER_PATTERN =
   // biome-ignore lint/suspicious/noMisleadingCharacterClass: Jamo and combining marks intentionally form canonical clusters.
   /(?:[ᄀ-ᅟꥠ-꥿]+[ᅠ-ᆧힰ-ퟆ]+[ᆨ-ᇿퟋ-ퟻ]*|[\s\S])[̀-ͯ҃-҉᪰-᫿᷀-᷿⃐-⃰︠-︯]*/gu;
@@ -586,16 +475,10 @@ const VOWEL_OR_TRAILING_HANGUL_JAMO_SOURCE =
   "[\\u1160-\\u11a7\\ud7b0-\\ud7c6\\u11a8-\\u11ff\\ud7cb-\\ud7fb]";
 const TRAILING_HANGUL_JAMO_SOURCE = "[\\u11a8-\\u11ff\\ud7cb-\\ud7fb]";
 
-/** Any Hangul at all, asked first so an ASCII query pays one test and stops. */
 const HANGUL_HINT_PATTERN = /[ᄀ-ᇿꥠ-꥿가-ퟻ]/u;
 
-/**
- * True when a cluster needs the trailing-jamo boundary, which only the pattern path writes.
- *
- * Extended and Old Hangul jamo have no precomposed form, so NFC and NFD spell them the same way and
- * the single-spelling query would take the literal scan, where an open syllable prefix-matches a
- * closed one. Modern Hangul always has two spellings and reaches the pattern anyway.
- */
+/** Old and Extended Hangul jamo have one spelling, so force the pattern path to get the
+ * trailing-jamo boundary; otherwise an open syllable prefix-matches a closed one. */
 function needsHangulBoundary(needle: string): boolean {
   if (!HANGUL_HINT_PATTERN.test(needle)) return false;
   for (const [cluster] of needle.normalize("NFD").matchAll(CLUSTER_PATTERN)) {
@@ -608,14 +491,10 @@ function needsHangulBoundary(needle: string): boolean {
   return false;
 }
 
-/** A closed syllable's L+V pair and everything after it. */
 const HANGUL_LVT_PATTERN =
   /^([\u1100-\u115f\ua960-\ua97f][\u1160-\u11a7\ud7b0-\ud7c6])([\u11a8-\u11ff\ud7cb-\ud7fb][\s\S]*)$/u;
 
-/**
- * The half-composed spelling of a closed syllable: the L+V pair precomposed, the trailing jamo left
- * as it is. Neither NFC nor NFD writes it, so a document holding one is invisible to both.
- */
+/** L+V precomposed with a loose trailing jamo; neither NFC nor NFD writes this form. */
 function partiallyComposedHangul(cluster: string): string | null {
   const parts = HANGUL_LVT_PATTERN.exec(cluster);
   if (!parts) return null;
@@ -623,37 +502,35 @@ function partiallyComposedHangul(cluster: string): string | null {
   return partial === cluster ? null : partial;
 }
 
-/**
- * The needle as a regex source in which each cluster may match either of its spellings.
- *
- * Alternating whole spellings of the WHOLE query only reaches text that is all-composed or
- * all-decomposed. A single occurrence can be neither: joining two text nodes joins two sources, so
- * `café` in one and `café` in the next make one visible word with a spelling the query
- * cannot be written in. Every engine's own find matches that (measured on chromium, firefox and
- * webkit), so it is below the baseline the rest of this file is held to.
- *
- * Per cluster rather than per query, which is also SMALLER: the old form repeated the query once
- * per spelling, this writes it once and pays about eight characters for each cluster that actually
- * has two spellings. Decomposed first, since it is the longer of the two.
- */
+/** A lone low surrogate is a character in its own right, so only a real pair counts. */
+function isPairedHalf(text: string, at: number): boolean {
+  const low = text.charCodeAt(at);
+  if (!(low >= 0xdc00 && low <= 0xdfff) || at === 0) return false;
+  const high = text.charCodeAt(at - 1);
+  return high >= 0xd800 && high <= 0xdbff;
+}
+
+/** Per cluster: joined text nodes can mix composed and decomposed spellings in one word. */
 function canonicalSource(needle: string, dotted: boolean): string {
   let out = "";
   for (const [cluster] of needle.normalize("NFD").matchAll(CLUSTER_PATTERN)) {
     if (/^\s/.test(cluster)) {
-      // A whitespace run in the query matches a run in the document, however it is spelt there.
+      // Only one `\s+` per run, so marks attached to the last space still follow it.
       out += out.endsWith("\\s+") ? "" : "\\s+";
+      out += escapeForRegex(cluster.slice(1));
       continue;
     }
     const spellings = [cluster];
     const composed = cluster.normalize("NFC");
     if (composed !== cluster) spellings.push(composed);
-    // Hangul composes in two steps, and text can stop after the first.
+    // Joined text nodes can split Hangul after its first composition step.
     const partial = partiallyComposedHangul(cluster);
     if (partial !== null && !spellings.includes(partial))
       spellings.push(partial);
-    // A decomposed dotted I folds to `i` plus a combining dot, which has no precomposed form, so
-    // NFC cannot put it back and the plain query would miss a word plainly on screen.
+    // A decomposed dotted I folds to `i` plus a combining dot, which NFC cannot recompose.
     if (dotted && cluster === "i") spellings.push(`i${COMBINING_DOT}`);
+    // Longest first: alternation takes the first fit, so a prefix spelling would end mid-grapheme.
+    if (spellings.length > 1) spellings.sort((a, b) => b.length - a.length);
     const spellingSource =
       spellings.length === 1
         ? escapeForRegex(spellings[0])
@@ -668,17 +545,178 @@ function canonicalSource(needle: string, dotted: boolean): string {
   return out;
 }
 
+/** Built lazily per index; `containing` seeks, so no full walk is needed. */
+const segmentsCache = new WeakMap<FindTextIndex, GraphemeSegments>();
+
+/** All boundaries, tabulated once seek time exceeds what a full scan would cost. Budgeted
+ *  in time since seek cost varies by script (1.3M chars scanned in 82ms). */
+const boundaryCache = new WeakMap<FindTextIndex, Uint8Array>();
+const seekCosts = new WeakMap<
+  FindTextIndex,
+  { spent: number; since: number; seen?: number }
+>();
+const SCAN_CHARS_PER_MS = 16_000;
+const MIN_SEEK_BUDGET_MS = 8;
+/** Timed per block so the clock is read twice per block, not per seek. */
+const SEEK_BLOCK = 32;
+
+/** Drop a block left open between searches so idle time is not billed to the next query. */
+function endSeekWindow(index: FindTextIndex): void {
+  const cost = seekCosts.get(index);
+  if (cost === undefined) return;
+  cost.seen = (cost.seen ?? 0) - ((cost.seen ?? 0) % SEEK_BLOCK);
+  cost.since = 0;
+}
+
+/** CRLF is the only pair below U+0300 that joins (GB3); seen intact inside `<pre>`. */
+function splitsCrlf(text: string, at: number): boolean {
+  return at > 0 && text.charCodeAt(at - 1) === 13 && text.charCodeAt(at) === 10;
+}
+
+const JOINS_GRAPHEME = /[^\u0000-\u02ff]/;
+
+interface GraphemeSegments {
+  containing(at: number): { index: number } | undefined;
+  [Symbol.iterator](): IterableIterator<{ index: number }>;
+}
+
+let segmenter: { segment(input: string): GraphemeSegments } | null | undefined;
+
+function graphemeSegmenter() {
+  if (segmenter !== undefined) return segmenter;
+  const scope = globalThis as unknown as {
+    Intl?: { Segmenter?: new (locale?: string, options?: object) => never };
+  };
+  segmenter =
+    typeof scope.Intl?.Segmenter === "function"
+      ? new scope.Intl.Segmenter(undefined, { granularity: "grapheme" })
+      : null;
+  return segmenter;
+}
+
+/** WebKit's `containing` answers the segment ending at the offset; there, tabulate instead. */
+let seeksBoundaries: boolean | undefined;
+function segmenterSeeksBoundaries(platform: {
+  segment(input: string): GraphemeSegments;
+}): boolean {
+  if (seeksBoundaries !== undefined) return seeksBoundaries;
+  try {
+    const probe = platform.segment("x\u{1f44d}");
+    seeksBoundaries =
+      probe.containing(1)?.index === 1 && probe.containing(0)?.index === 0;
+  } catch {
+    seeksBoundaries = false;
+  }
+  return seeksBoundaries;
+}
+
+const JOIN_CONTEXT = 32;
+
+/** Back to a char below U+0300, which always begins a cluster; regional indicators pair from
+ *  the start of a run, so a fixed window would not do. */
+function exactTail(before: string): string | null {
+  const from = Math.max(0, before.length - JOIN_CONTEXT);
+  for (let at = before.length - 1; at >= from; at -= 1) {
+    if (before.charCodeAt(at) < 0x300) return before.slice(at);
+  }
+  return null;
+}
+
+function firstPointOf(text: string): string {
+  return text.length === 0
+    ? ""
+    : String.fromCodePoint(text.codePointAt(0) as number);
+}
+
+/** False without a segmenter, keeping the old behaviour. */
+function joinsAcross(before: string, point: string): boolean {
+  if (before.length === 0 || point.length === 0) return false;
+  const platform = graphemeSegmenter();
+  if (platform === null) return false;
+  const window = exactTail(before);
+  if (window === null) return true;
+  const at = window.length;
+  const body = window + point;
+  if (segmenterSeeksBoundaries(platform)) {
+    return platform.segment(body).containing(at)?.index !== at;
+  }
+  for (const { index: start } of platform.segment(body)) {
+    if (start === at) return false;
+    if (start > at) break;
+  }
+  return true;
+}
+
+/** Asks the platform segmenter one offset at a time; hand-rolled UAX 29 kept missing cases. */
+function alignsToGraphemes(
+  index: FindTextIndex,
+  start: number,
+  end: number,
+): boolean {
+  const text = index.text;
+  // Before the cheap test: at the end of a truncated index there is no `text[end]` to read.
+  if (
+    index.seams.size > 0 &&
+    (index.seams.has(start) || index.seams.has(end))
+  ) {
+    return false;
+  }
+  // Fast path: nothing below U+0300 joins a grapheme, so skip the segmenter there.
+  if (
+    !splitsCrlf(text, start) &&
+    !splitsCrlf(text, end) &&
+    !(start > 0 && JOINS_GRAPHEME.test(text[start - 1])) &&
+    !JOINS_GRAPHEME.test(text[start]) &&
+    !JOINS_GRAPHEME.test(text[end - 1]) &&
+    !(end < text.length && JOINS_GRAPHEME.test(text[end]))
+  ) {
+    return true;
+  }
+  return startsGrapheme(index, start) && startsGrapheme(index, end);
+}
+
+/** True with no segmenter (Firefox before 125) rather than hand-rolling UAX 29. */
+function startsGrapheme(index: FindTextIndex, at: number): boolean {
+  const text = index.text;
+  if (at === 0 || at === text.length) return true;
+  const platform = graphemeSegmenter();
+  if (platform === null) return true;
+  const marked = boundaryCache.get(index);
+  if (marked !== undefined) return marked[at] === 1;
+  let segments = segmentsCache.get(index);
+  if (segments === undefined) {
+    segments = platform.segment(text);
+    segmentsCache.set(index, segments);
+  }
+  let cost = seekCosts.get(index);
+  if (cost === undefined) {
+    cost = { spent: 0, since: 0 };
+    seekCosts.set(index, cost);
+  }
+  const budget = Math.max(MIN_SEEK_BUDGET_MS, text.length / SCAN_CHARS_PER_MS);
+  if (segmenterSeeksBoundaries(platform) && cost.spent <= budget) {
+    if (cost.since === 0) cost.since = performance.now();
+    const answer = segments.containing(at)?.index === at;
+    cost.seen = (cost.seen ?? 0) + 1;
+    if (cost.seen % SEEK_BLOCK === 0) {
+      cost.spent += performance.now() - cost.since;
+      cost.since = 0;
+    }
+    return answer;
+  }
+  // Past the budget, tabulate once: a capped search can walk candidates up to three times.
+  const marks = new Uint8Array(text.length + 1);
+  for (const { index: start } of segments) marks[start] = 1;
+  marks[text.length] = 1;
+  boundaryCache.set(index, marks);
+  return marks[at] === 1;
+}
+
 function escapeForRegex(text: string): string {
   return text.replace(REGEX_META_PATTERN, "\\$&");
 }
 
-/**
- * A pattern for a query spanning whitespace or spelt more than one way, or null for a plain scan.
- *
- * HTML collapses whitespace, so a soft-wrapped paragraph renders as one line while its node holds
- * the newline; each run in the query matches a run in the document. The separator is not
- * whitespace, so block boundaries stay closed. Single-word ASCII queries keep the `indexOf` path.
- */
+/** Null for a plain scan. Whitespace flexes for soft-wrapped text; the separator does not. */
 function matchPattern(variants: string[], needle: string): RegExp | null {
   const dotted = variants.some((variant) => variant.includes(COMBINING_DOT));
   if (
@@ -689,29 +727,17 @@ function matchPattern(variants: string[], needle: string): RegExp | null {
     return null;
   try {
     const pattern = new RegExp(canonicalSource(needle, dotted), "g");
-    // V8 compiles lazily, so an oversized pattern is accepted here and throws on the first `exec`
-    // instead, back outside this `try`. One run against nothing forces the compile while it can
-    // still be caught, and leaves `lastIndex` at 0 for the real scan.
+    // V8 compiles lazily, so an oversized pattern is accepted here and throws on the first `exec`,
+    // outside this `try`. One run against nothing forces the compile while it is catchable.
     pattern.exec("");
     return pattern;
   } catch {
-    // Every engine caps how large a pattern it will compile, and the cap is its own business:
-    // the spec sets none, so there is no length to test against that would be right everywhere.
-    // A pasted log reaches it -- measured at 15,651 characters on V8 -- and the throw came out
-    // through the keystroke that caused it and took the bar down with it. Falling back to the
-    // literal scan below costs the flexed whitespace and keeps the search working.
+    // Engines cap pattern size with no spec limit; a pasted log can hit it and must not throw.
     return null;
   }
 }
 
-/**
- * Walk every match for `needle` in document order, stopping when `visit` says so. Non-overlapping,
- * like every browser's own find, which is what terminates a self-overlapping query.
- *
- * One place, so the two ways of matching stay one behaviour. Flexed whitespace is for prose; inside
- * a `<pre>` the whitespace on screen IS the whitespace in the node, so "foo bar" must not land on
- * "foo   bar" there. The platform's own find draws the same line.
- */
+/** Non-overlapping like browser find. Whitespace in `<pre>` cannot flex. */
 function eachMatch(
   index: FindTextIndex,
   needle: string,
@@ -721,17 +747,11 @@ function eachMatch(
     needle,
     index.text.includes(COMBINING_DOT),
   );
-  // Nothing longer than the haystack can be inside it. Measured against the SHORTEST spelling,
-  // since a decomposed query is longer than the precomposed text it is meant to find. This is
-  // ahead of `matchPattern` because that is the expensive half: escaping a pasted log, repeating
-  // it once per variant and handing the result to the regex compiler.
+  // Against the shortest spelling: a decomposed query is longer than the text it finds.
   if (
     Math.min(...variants.map((variant) => variant.length)) > index.text.length
   )
     return;
-  // What counts as "spelt the way it was typed": any whole-query spelling, or any mixture of the
-  // per-cluster ones, which compare equal once composed. Whitespace flexing survives NFC, so a hit
-  // that only flexed a space is still told apart from one that merely spells a letter differently.
   const composedNeedle = needle.normalize("NFC");
   const asTyped = (hit: string): boolean =>
     variants.includes(hit) || hit.normalize("NFC") === composedNeedle;
@@ -741,7 +761,10 @@ function eachMatch(
       const hit = pattern.exec(index.text);
       if (hit === null) return;
       const end = hit.index + hit[0].length;
-      // Any spelling of the query counts as typed exactly; only flexed whitespace does not.
+      if (!alignsToGraphemes(index, hit.index, end)) {
+        pattern.lastIndex = hit.index + 1;
+        continue;
+      }
       if (
         touchesPreserved(index.segments, hit.index, end) &&
         !asTyped(hit[0])
@@ -757,12 +780,16 @@ function eachMatch(
   for (;;) {
     const at = index.text.indexOf(needle, from);
     if (at === -1) return;
-    if (!visit(at, at + needle.length)) return;
-    from = at + needle.length;
+    const end = at + needle.length;
+    if (!alignsToGraphemes(index, at, end)) {
+      from = at + 1;
+      continue;
+    }
+    if (!visit(at, end)) return;
+    from = end;
   }
 }
 
-/** `limit` matches starting from the `skip`-th one. */
 function collectMatches(
   index: FindTextIndex,
   needle: string,
@@ -780,17 +807,7 @@ function collectMatches(
   return out;
 }
 
-/**
- * Matches for `query`, at most `limit` of them, as a window around `anchor`.
- *
- * A common letter in a long thread has tens of thousands of matches, and keeping the first `limit`
- * keeps only the top of the document, walking a reader at the bottom away from the occurrences
- * beside them. When the cap bites the kept matches are the ones nearest the reader; under the cap
- * this is the same single pass it always was.
- *
- * `anchor` may be a thunk, because working it out reads layout and a plain argument is evaluated
- * whether or not it is wanted. A number still means the same thing.
- */
+/** A window of `limit` around `anchor`; `anchor` may be a thunk since it reads layout. */
 export function findMatches(
   index: FindTextIndex,
   query: string,
@@ -799,20 +816,14 @@ export function findMatches(
 ): FindMatch[] {
   const needle = normalizeQuery(query);
   if (needle === null) return [];
+  endSeekWindow(index);
   const head = collectMatches(index, needle, limit, 0);
   // Before resolving the anchor, so an under-cap query never pays for it.
   if (head.length < limit) return head;
   const at = typeof anchor === "function" ? anchor() : anchor;
   if (at <= 0) return head;
 
-  // Capped, so where the window sits matters. Two more passes, no allocation in the first.
-  //
-  // The count stops early: `total` only keeps the window from running off the end, and once
-  // `total - limit` reaches the left edge it can no longer pull it back, so later matches are
-  // counted for nothing. Past the anchor `before` is final, which is what makes the edge knowable.
-  // The clamp is safe because it only binds near the end, where the true total is under the
-  // ceiling and the walk never stops early. At 4M chars, 444,444 matches, anchored halfway:
-  // 6.4ms over all of them to 3.3ms over 224,722, same window either way.
+  // The count may stop early once the window can no longer move.
   let total = 0;
   let before = 0;
   let enough = Number.POSITIVE_INFINITY;
@@ -827,7 +838,6 @@ export function findMatches(
     }
     return total < enough;
   });
-  // Centred on the reader, then pushed back inside the list at either end.
   const start = Math.min(
     Math.max(before - (limit >> 1), 0),
     Math.max(total - limit, 0),
@@ -835,28 +845,12 @@ export function findMatches(
   return start === 0 ? head : collectMatches(index, needle, limit, start);
 }
 
-/**
- * Throw away the one match asked for over the cap, from whichever end the reader is further from.
- *
- * The caller asks for `MAX_MATCHES + 1` so that a page holding exactly the cap does not have to
- * read as a floor, then throws the extra one away. Taking it off the tail is right only while the
- * window starts at the top of the document. Once the reader is far enough down the anchored window
- * IS the tail, and its last entry is the document's final occurrence -- the one nearest them, and
- * the one the walk was then unable to reach at all.
- *
- * Measured on 6000 matches with the reader at the bottom: the window covered the final occurrence
- * at offset 11998, and trimming the tail left the walk ending at 11996.
- *
- * Lives here rather than beside its caller for the same reason `mutatesSearchableText` does: the
- * hook imports React and cannot be loaded under `node --test`.
- */
+/** Drop the over-cap probe match from the end farther from the reader. */
 export function dropProbeFurthestFrom(
   matches: FindMatch[],
   anchor: number | null,
   limit = MAX_MATCHES,
 ): void {
-  // No anchor means `findMatches` never resolved one, which only happens under the cap. A window
-  // that already starts at the document's first match has nothing above the reader to give up.
   if (
     anchor !== null &&
     matches.length > 0 &&
@@ -868,14 +862,13 @@ export function dropProbeFurthestFrom(
   matches.length = limit;
 }
 
-/** True when `[start, end)` reaches into a run whose whitespace is kept rather than collapsed. */
 function touchesPreserved(
   segments: TextSegment[],
   start: number,
   end: number,
 ): boolean {
   let at = segmentAt(segments, start);
-  // A match can open on a separator, which belongs to no segment; take the next one along.
+  // A match can open on a separator, which belongs to no segment; take the next one.
   if (at === -1) {
     at = segments.findIndex((segment) => segment.start >= start);
     if (at === -1) return false;
@@ -888,7 +881,6 @@ function touchesPreserved(
   return false;
 }
 
-/** The segment holding `offset`, or -1 when it lands on a separator or past the end. */
 export function segmentAt(segments: TextSegment[], offset: number): number {
   let lo = 0;
   let hi = segments.length - 1;
@@ -906,13 +898,11 @@ export function segmentAt(segments: TextSegment[], offset: number): number {
   return -1;
 }
 
-/** A text node and an offset inside it, which is what a `Range` boundary takes. */
 export interface TextPosition {
   node: FindTextNodeLike;
   offset: number;
 }
 
-/** Where a match starts. */
 export function startPositionAt(
   segments: TextSegment[],
   offset: number,
@@ -923,10 +913,7 @@ export function startPositionAt(
   return { node: segment.node, offset: offset - segment.start };
 }
 
-/**
- * Where a match ends. Located from its last character, since an exclusive end sits one past the run
- * whenever the match finishes a text node, and that is the boundary `setEnd` wants there.
- */
+/** From the last char: an exclusive end at a node's end is the boundary `setEnd` wants. */
 export function endPositionAt(
   segments: TextSegment[],
   end: number,

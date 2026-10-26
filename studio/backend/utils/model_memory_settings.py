@@ -6,8 +6,9 @@
 ``keep_resident``  -- weights never go back to system RAM while loaded: no idle
 auto-unload, and ``--mlock`` so the OS cannot page them out and re-fault them in.
 
-``no_ram_reserve`` -- no full host-RAM copy: keeps llama.cpp's default mmap path
-and drops ``--no-mmap`` / ``--mlock``.
+``no_ram_reserve`` -- avoids locked or reserved weight buffers. Uses DirectIO on
+supported Windows builds when full GPU offload is confirmed, otherwise keeps
+llama.cpp's default mmap path. Required CPU buffers can still use host RAM.
 
 Both on means "live in VRAM, keep no RAM copy, never idle-unload". ``--mlock`` is
 itself a full-model RAM reservation, so ``no_ram_reserve`` wins on that flag.
@@ -19,20 +20,20 @@ import threading
 import time
 from typing import Any, Optional
 
+from utils.account_context import OWNER, run_as
+
 KEEP_RESIDENT_SETTING_KEY = "model_memory_keep_resident"
 NO_RAM_RESERVE_SETTING_KEY = "model_memory_no_ram_reserve"
 
 DEFAULT_KEEP_RESIDENT = False
 DEFAULT_NO_RAM_RESERVE = False
 
-# Read on the load path and every idle poll, so memo briefly to spare SQLite.
-# Matches openai_auto_switch_settings.
+# Read on hot paths, so memo briefly to spare SQLite.
 _CACHE_TTL_S = 2.0
 _cache_lock = threading.Lock()
-_cache: dict[str, tuple[float, Any]] = {}
-# Bumped on every write. A read that began before a write must not fill the cache with the value it already fetched, or
-# the new setting would appear to revert for the rest of the TTL and a load could launch contradicting it.
-_generation: dict[str, int] = {}
+_cache: dict[tuple[str, str], tuple[float, Any]] = {}
+# Bumped on every write so an earlier read cannot cache the old value; else a load could launch contradicting the new setting for the rest of the TTL.
+_generation: dict[tuple[str, str], int] = {}
 
 
 def _coerce_bool(value: Any) -> Optional[bool]:
@@ -47,43 +48,41 @@ def _coerce_bool(value: Any) -> Optional[bool]:
     return None
 
 
-# A write racing a read is rare, so a couple of retries always converges. The
-# bound only exists so a pathological write storm cannot spin here forever.
+# Bound only guards against a pathological write storm.
 _MAX_REREADS = 3
 
 
 def _cached_setting(key: str) -> Any:
+    cache_key = (OWNER.account_id, key)
     for _attempt in range(_MAX_REREADS):
         with _cache_lock:
-            hit = _cache.get(key)
+            hit = _cache.get(cache_key)
             if hit is not None and time.monotonic() - hit[0] < _CACHE_TTL_S:
                 return hit[1]
-            generation = _generation.get(key, 0)
+            generation = _generation.get(cache_key, 0)
         try:
             from storage.studio_db import get_app_setting
-            stored = get_app_setting(key, None)
+            stored = run_as(OWNER, get_app_setting, key, None)
         except Exception:
             # An unreadable DB must not fail a load; fall back to the default.
             return None
         with _cache_lock:
-            if _generation.get(key, 0) == generation:
-                _cache[key] = (time.monotonic(), stored)
+            if _generation.get(cache_key, 0) == generation:
+                _cache[cache_key] = (time.monotonic(), stored)
                 return stored
-        # A write committed while this read was in flight, so `stored` predates
-        # it. Returning it would let a load launch with flags contradicting the
-        # setting that was just saved, so read again against the new generation.
+        # A write landed mid-read, so stored predates it; returning it would let a load launch with flags contradicting the setting just saved. Read again.
     return stored
 
 
 def _invalidate(*keys: str) -> None:
-    """Drop these keys in ONE acquisition. The write commits the pair in one
-    transaction, so invalidating them separately would let a load in between read
-    a new keep_resident against a cached old no_ram_reserve and emit --mlock for
-    a combination that was never stored."""
+    """Drop all keys in one acquisition so a load cannot pair new keep_resident with stale
+    no_ram_reserve."""
+    account_id = OWNER.account_id
     with _cache_lock:
         for key in keys:
-            _cache.pop(key, None)
-            _generation[key] = _generation.get(key, 0) + 1
+            cache_key = (account_id, key)
+            _cache.pop(cache_key, None)
+            _generation[cache_key] = _generation.get(cache_key, 0) + 1
 
 
 def get_keep_resident() -> bool:
@@ -99,11 +98,7 @@ def get_no_ram_reserve() -> bool:
 
 
 def should_mlock() -> bool:
-    """Whether to pass ``--mlock``.
-
-    mlock pins the whole model in host RAM, so it is emitted only when residency
-    is on and no-reserve is off. The two conflict, and no-reserve wins.
-    """
+    """Needs keep_resident on and no_ram_reserve off, since mlock pins the whole model in host RAM."""
     keep_resident, no_ram_reserve = get_model_memory_settings()
     return keep_resident and not no_ram_reserve
 
@@ -111,19 +106,24 @@ def should_mlock() -> bool:
 def _pair_generations() -> tuple[int, int]:
     with _cache_lock:
         return (
-            _generation.get(KEEP_RESIDENT_SETTING_KEY, 0),
-            _generation.get(NO_RAM_RESERVE_SETTING_KEY, 0),
+            _generation.get((OWNER.account_id, KEEP_RESIDENT_SETTING_KEY), 0),
+            _generation.get((OWNER.account_id, NO_RAM_RESERVE_SETTING_KEY), 0),
         )
 
 
-def get_model_memory_settings() -> tuple[bool, bool]:
-    """``(keep_resident, no_ram_reserve)`` from ONE coherent snapshot.
+def capture_model_memory_settings(publish) -> tuple[bool, bool]:
+    """Publishes the pair, rereading if a save bumped the generation mid-read; else reload_required=false for a child on pre-save flags. No lock across DB I/O."""
+    for _attempt in range(_MAX_REREADS):
+        before = _pair_generations()
+        pair = get_model_memory_settings()
+        publish(pair)
+        if _pair_generations() == before:
+            return pair
+    return pair
 
-    Read one after the other, a save landing in between returns a pair that was
-    never stored, and the launch then strips for one setting while locking for
-    the other. The write drops both keys in a single acquisition, so a bumped
-    generation on either side is enough to spot it and read again.
-    """
+
+def get_model_memory_settings() -> tuple[bool, bool]:
+    """One coherent snapshot of both flags: a save between separate reads could give a never-stored pair."""
     pair = (get_keep_resident(), get_no_ram_reserve())
     for _attempt in range(_MAX_REREADS):
         before = _pair_generations()
@@ -160,12 +160,7 @@ def set_model_memory_settings(
 
 
 def memlock_limit_bytes() -> Optional[int]:
-    """Soft RLIMIT_MEMLOCK, or None when unlimited or unavailable.
-
-    mlock cannot exceed this. Linux commonly defaults to 8 MB, where llama.cpp
-    logs "failed to mlock" and carries on, so residency would silently do
-    nothing. None on Windows (no RLIMIT_MEMLOCK) and on macOS (unlimited).
-    """
+    """Soft RLIMIT_MEMLOCK in bytes, None when unlimited or unavailable; the Linux 8 MB default makes llama.cpp mlock fail silently, disabling residency."""
     try:
         import resource
     except ImportError:

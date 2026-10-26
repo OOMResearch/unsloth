@@ -11,14 +11,14 @@ import { cn } from "@/lib/utils";
 import { useState } from "react";
 
 export function Navbar() {
-  const { isMobile, pinned, togglePinned } = useSidebar();
+  const { isMobile, pinned, peeking, togglePinned } = useSidebar();
   const [usesNativeMacTitlebar] = useState(shouldUseNativeMacWindowTitlebar);
   const [usesCustomTitlebar] = useState(shouldUseCustomWindowTitlebar);
 
   if (!isMobile) {
     return (
       <>
-        <header className="pointer-events-none absolute inset-x-0 top-0 z-40 h-[48px]">
+        <header className="pointer-events-none absolute inset-x-0 top-0 z-40 h-[calc(48px*var(--ui-space-scale,1))]">
           {usesNativeMacTitlebar && (
             <div
               data-tauri-drag-region
@@ -28,25 +28,24 @@ export function Navbar() {
           )}
         </header>
 
-        {usesNativeMacTitlebar && !pinned && (
+        {usesNativeMacTitlebar && !pinned && !peeking && (
           <DesktopTitlebarNavigation
             expanded={false}
             onToggleSidebar={togglePinned}
-            className="pointer-events-auto absolute left-[calc(var(--studio-mac-traffic-light-inset,78px)+6px)] top-px z-[60]"
+            className="pointer-events-auto absolute left-[calc(var(--studio-mac-traffic-light-inset,78px)+calc(6px*var(--ui-space-scale,1)))] top-px z-[60]"
           />
         )}
       </>
     );
   }
-  // Desktop windows can land here under Windows text scaling, so sit inside the
-  // custom titlebar band instead of under its z-[70].
+  // Under Windows text scaling, sit inside the custom titlebar band rather than under its z-[70].
   return (
     <header
       className={cn(
         "absolute top-0 inset-x-0 pointer-events-none",
         usesCustomTitlebar
           ? "z-[80] h-[var(--studio-custom-titlebar-height,34px)]"
-          : "z-[45] h-[48px]",
+          : "z-[45] h-[calc(48px*var(--ui-space-scale,1))]",
       )}
     >
       <div
@@ -54,10 +53,19 @@ export function Navbar() {
           "flex h-full",
           usesCustomTitlebar
             ? "items-center pl-3"
-            : "items-start pt-[11px] pl-2",
+            : usesNativeMacTitlebar
+              ? "items-start pt-[calc(11px*var(--ui-space-scale,1))] pl-[calc(var(--studio-mac-traffic-light-inset,78px)+calc(6px*var(--ui-space-scale,1)))]"
+              : "items-start pt-[calc(11px*var(--ui-space-scale,1))] pl-2",
         )}
       >
-        <SidebarTrigger className="pointer-events-auto !size-[34px]" />
+        <SidebarTrigger
+          className={cn(
+            "pointer-events-auto",
+            usesCustomTitlebar
+              ? "!size-[calc(34px*var(--ui-space-scale,1))]"
+              : "!size-[calc(34px*var(--ui-space-scale,1))]",
+          )}
+        />
       </div>
     </header>
   );

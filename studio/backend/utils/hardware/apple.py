@@ -18,6 +18,7 @@ Public API (never raises; returns None when sensors are unavailable):
 
 import ctypes
 import struct
+import threading
 import time
 from typing import Iterable, Optional
 
@@ -38,9 +39,6 @@ _SMC_CMD_KEY_INFO = 9
 _MAX_VALID_TEMP_C = 150.0
 _CF_STRING_ENCODING_UTF8 = 0x08000100
 _ENERGY_UNIT_DIVISORS = {"mJ": 1e3, "uJ": 1e6, "nJ": 1e9}
-
-
-# ========== Pure helpers ==========
 
 
 def _fourcc(key: str) -> int:
@@ -68,12 +66,8 @@ def _average_valid_temps(values: Iterable[float]) -> Optional[float]:
 
 
 def _is_gpu_energy_channel(name: str) -> bool:
-    # Exact "GPU Energy" plus "DIE_N_GPU Energy" on Ultra chips; the separate
     # "GPU SRAM*" channels are not GPU core power.
     return name.endswith("GPU Energy") and "SRAM" not in name
-
-
-# ========== AppleSMC structs (layout must match the kernel exactly) ==========
 
 
 class _SMCKeyDataVers(ctypes.Structure):
@@ -116,9 +110,6 @@ class _SMCKeyData(ctypes.Structure):
         ("data32", ctypes.c_uint32),
         ("bytes", ctypes.c_uint8 * 32),
     ]
-
-
-# ========== Library loaders ==========
 
 
 def _load_iokit() -> ctypes.CDLL:
@@ -214,9 +205,6 @@ def _from_cfstr(cf: ctypes.CDLL, ref: Optional[int]) -> str:
     if not cf.CFStringGetCString(ref, buf, len(buf), _CF_STRING_ENCODING_UTF8):
         return ""
     return buf.value.decode("utf-8", errors = "replace").strip()
-
-
-# ========== SMC connection (GPU temperature) ==========
 
 
 class _SMCConnection:
@@ -327,9 +315,6 @@ class _SMCConnection:
         return _average_valid_temps(value for value in readings if value is not None)
 
 
-# ========== IOReport subscription (GPU power) ==========
-
-
 class _IOReportEnergy:
     """Persistent subscription to the "Energy Model" group for GPU wattage."""
 
@@ -347,8 +332,7 @@ class _IOReportEnergy:
         )
         if not self._sub:
             raise OSError("IOReportCreateSubscription failed")
-        # Sample with the channels IOReport subscribes us to, not the requested
-        # group (matches macmon); fall back if the OS leaves it unset.
+        # Sample the channels IOReport subscribed (as macmon does); fall back if unset.
         self._sample_channels = subscribed if subscribed else self._channels
         self._channels_key = _cfstr(self._cf, "IOReportChannels")
         self._prev: Optional[tuple[int, float]] = None
@@ -391,12 +375,12 @@ class _IOReportEnergy:
         return round(total, 1)
 
 
-# ========== Public API (module singletons, failure-latched) ==========
-
 _smc: Optional[_SMCConnection] = None
 _smc_failed = False
 _energy: Optional[_IOReportEnergy] = None
 _energy_failed = False
+# Two polling threads: gpu_power_w releases the previous CF sample, so unlocked it double-frees.
+_sensor_lock = threading.Lock()
 
 
 def read_gpu_temperature_c() -> Optional[float]:
@@ -405,9 +389,10 @@ def read_gpu_temperature_c() -> Optional[float]:
     if _smc_failed:
         return None
     try:
-        if _smc is None:
-            _smc = _SMCConnection()
-        return _smc.gpu_temperature_c()
+        with _sensor_lock:
+            if _smc is None:
+                _smc = _SMCConnection()
+            return _smc.gpu_temperature_c()
     except Exception as e:
         _smc_failed = True
         logger.warning("Apple SMC GPU temperature unavailable: %s", e)
@@ -415,17 +400,15 @@ def read_gpu_temperature_c() -> Optional[float]:
 
 
 def read_gpu_power_w() -> Optional[float]:
-    """Average GPU power in watts since the previous call, or None.
-
-    The first call establishes the baseline sample and returns None.
-    """
+    """Average GPU watts since the previous call; the first call only sets the baseline and returns None."""
     global _energy, _energy_failed
     if _energy_failed:
         return None
     try:
-        if _energy is None:
-            _energy = _IOReportEnergy()
-        return _energy.gpu_power_w()
+        with _sensor_lock:
+            if _energy is None:
+                _energy = _IOReportEnergy()
+            return _energy.gpu_power_w()
     except Exception as e:
         _energy_failed = True
         logger.warning("Apple IOReport GPU power unavailable: %s", e)

@@ -7,17 +7,20 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tauri::{AppHandle, Manager, State, WebviewWindow};
+use tauri::{AppHandle, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
 const MAX_TRAINING_CONFIG_BYTES: u64 = 1024 * 1024;
-/// Per redeemed range, not per file: the frontend streams a large import in
-/// pieces, and a piece has to fit in one IPC response.
+/// Per redeemed range, not per file: each piece of a large import must fit one IPC response.
 const MAX_CHAT_IMPORT_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const NATIVE_FILE_NAME_HEADER: &str = "x-unsloth-default-name";
-const CHAT_IMPORT_EXTENSIONS: &[&str] = &["json", "jsonl", "ndjson", "csv"];
-const CHAT_IMPORT_TYPE_ERROR: &str = "Chat import must be a .json, .jsonl, .ndjson, or .csv file.";
+const NATIVE_FILE_SAVE_TOKEN_HEADER: &str = "x-unsloth-save-token";
+const MAX_NATIVE_FILE_SAVE_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+const CHAT_IMPORT_EXTENSIONS: &[&str] = &["json", "jsonl", "ndjson", "csv", "md", "markdown"];
+const CHAT_IMPORT_TYPE_ERROR: &str =
+    "Chat import must be a .json, .jsonl, .ndjson, .csv, or .md file.";
 const TRAINING_CONFIG_EXTENSIONS: &[&str] = &["yaml", "yml"];
+const LAST_SAVE_DIR_FILE: &str = "last-save-dir.txt";
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -26,7 +29,6 @@ pub struct NativeImportedFile {
     content: String,
 }
 
-/// A picked chat import addressed by an opaque token instead of a path.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeChatImport {
@@ -35,19 +37,16 @@ pub struct NativeChatImport {
     token: String,
 }
 
-/// Keep active handles valid while bounding registry growth.
 const CHAT_IMPORT_HANDLE_LIMIT: usize = 8;
 
 #[derive(Default)]
 pub struct ChatImportRegistry {
-    /// Oldest first, so the eviction below drops the least recent pick.
+    /// Oldest first, so eviction drops the least recent pick.
     files: Mutex<Vec<(String, PathBuf, Arc<Mutex<File>>)>>,
 }
 
 impl ChatImportRegistry {
-    /// Holds the file the picker opened, not just its path. Resolving a path
-    /// again per range would read whatever occupies it by then, so a file
-    /// replaced mid-import could splice its bytes into the stream.
+    /// Holds the opened file, not its path, so a file replaced mid-import cannot splice in bytes.
     fn register(&self, path: PathBuf, file: File) -> String {
         let token: String = (0..4)
             .map(|_| format!("{:016x}", rand::random::<u64>()))
@@ -66,6 +65,50 @@ impl ChatImportRegistry {
             .iter()
             .find(|(candidate, _, _)| candidate == token)
             .map(|(_, path, file)| (path.clone(), Arc::clone(file)))
+    }
+}
+
+struct NativeSave {
+    destination: PathBuf,
+    temporary: tempfile::NamedTempFile,
+}
+
+const NATIVE_SAVE_HANDLE_LIMIT: usize = 8;
+
+#[derive(Default)]
+pub struct NativeSaveRegistry {
+    files: Mutex<Vec<(String, Arc<Mutex<NativeSave>>)>>,
+}
+
+impl NativeSaveRegistry {
+    fn register(&self, save: NativeSave) -> String {
+        let token: String = (0..4)
+            .map(|_| format!("{:016x}", rand::random::<u64>()))
+            .collect();
+        let mut files = self.files.lock().expect("native save registry poisoned");
+        files.push((token.clone(), Arc::new(Mutex::new(save))));
+        while files.len() > NATIVE_SAVE_HANDLE_LIMIT {
+            files.remove(0);
+        }
+        token
+    }
+
+    fn resolve(&self, token: &str) -> Option<Arc<Mutex<NativeSave>>> {
+        let files = self.files.lock().expect("native save registry poisoned");
+        files
+            .iter()
+            .find(|(candidate, _)| candidate == token)
+            .map(|(_, save)| Arc::clone(save))
+    }
+
+    fn take(&self, token: &str) -> Option<Arc<Mutex<NativeSave>>> {
+        let mut files = self.files.lock().expect("native save registry poisoned");
+        let index = files.iter().position(|(candidate, _)| candidate == token)?;
+        Some(files.remove(index).1)
+    }
+
+    fn cancel(&self, token: &str) {
+        let _ = self.take(token);
     }
 }
 
@@ -117,8 +160,7 @@ fn save_filter(file_name: &str) -> (&'static str, Vec<String>) {
         Some("ts") | Some("tsx") => ("TypeScript", filter_extensions(["ts", "tsx"])),
         Some("sql") => ("SQL", filter_extensions(["sql"])),
         Some("zip") => ("ZIP archive", filter_extensions(["zip"])),
-        // Saved chat attachments, not just exports: a name outside the active
-        // filter can be rejected or silently re-extensioned by the OS dialog.
+        // A name outside the active filter can be rejected or re-extensioned by the OS dialog.
         Some("txt") | Some("log") => ("Text", filter_extensions(["txt", "log"])),
         Some("png") => ("PNG image", filter_extensions(["png"])),
         Some("jpg") | Some("jpeg") => ("JPEG image", filter_extensions(["jpg", "jpeg"])),
@@ -159,13 +201,32 @@ fn invoke_body_bytes(body: &tauri::ipc::InvokeBody) -> Option<Cow<'_, [u8]>> {
     }
 }
 
+/// GTK keeps no per-app last folder, so without this every Linux save starts from scratch.
+fn last_save_dir(config_dir: &Path) -> Option<PathBuf> {
+    let saved = fs::read_to_string(config_dir.join(LAST_SAVE_DIR_FILE)).ok()?;
+    let dir = PathBuf::from(saved.trim_end_matches(['\r', '\n']));
+    (dir.is_absolute() && dir.is_dir()).then_some(dir)
+}
+
+/// Best effort: failing to remember a folder must not fail a save that already landed.
+fn remember_save_dir(config_dir: &Path, saved_path: &Path) {
+    let Some(dir) = saved_path.parent().filter(|dir| dir.is_absolute()) else {
+        return;
+    };
+    let Some(dir) = dir.to_str() else {
+        return;
+    };
+    let _ = fs::create_dir_all(config_dir)
+        .and_then(|()| fs::write(config_dir.join(LAST_SAVE_DIR_FILE), dir));
+}
+
 fn local_dialog_path(path: tauri_plugin_dialog::FilePath) -> Result<PathBuf, String> {
     path.into_path()
         .map_err(|_| "Only local filesystem paths are supported.".to_string())
 }
 
 /// Stage the write beside the destination so a partial file never replaces a real one.
-fn staged_temp_file(path: &Path) -> Result<tempfile::NamedTempFile, String> {
+pub(crate) fn staged_temp_file(path: &Path) -> Result<tempfile::NamedTempFile, String> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -195,7 +256,7 @@ fn saved_file_name(path: &Path) -> String {
 fn save_selected_file(
     selected_path: Option<PathBuf>,
     content: &[u8],
-) -> Result<Option<String>, String> {
+) -> Result<Option<PathBuf>, String> {
     let Some(path) = selected_path else {
         return Ok(None);
     };
@@ -207,12 +268,50 @@ fn save_selected_file(
     temporary
         .persist(&path)
         .map_err(|error| format!("Failed to save {}: {}", path.display(), error.error))?;
-    Ok(Some(saved_file_name(&path)))
+    Ok(Some(path))
 }
 
-/// Only the local backend, or the webview could write any host's reply to disk. Parsed
-/// rather than sliced: in `http://127.0.0.1:8888@evil.test/clip` the loopback-looking part
-/// is userinfo and the client would connect to `evil.test`.
+fn native_save_chunk(body: &tauri::ipc::InvokeBody) -> Result<Cow<'_, [u8]>, String> {
+    let content = invoke_body_bytes(body)
+        .ok_or_else(|| "Native export content must be binary.".to_string())?;
+    if content.len() > MAX_NATIVE_FILE_SAVE_CHUNK_BYTES {
+        return Err("Native export chunk is too large.".to_string());
+    }
+    Ok(content)
+}
+
+fn append_native_save(save: &Arc<Mutex<NativeSave>>, content: &[u8]) -> Result<(), String> {
+    let mut save = save
+        .lock()
+        .map_err(|_| "Native export handle is unavailable.".to_string())?;
+    let destination = save.destination.clone();
+    save.temporary
+        .write_all(content)
+        .map_err(|error| format!("Failed to save {}: {error}", destination.display()))
+}
+
+fn finish_native_save(save: Arc<Mutex<NativeSave>>) -> Result<String, String> {
+    let save = Arc::try_unwrap(save)
+        .map_err(|_| "Native export is still being written.".to_string())?
+        .into_inner()
+        .map_err(|_| "Native export handle is unavailable.".to_string())?;
+    let NativeSave {
+        destination,
+        mut temporary,
+    } = save;
+    temporary
+        .flush()
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|error| format!("Failed to save {}: {error}", destination.display()))?;
+    let name = saved_file_name(&destination);
+    temporary
+        .persist(&destination)
+        .map_err(|error| format!("Failed to save {}: {}", destination.display(), error.error))?;
+    Ok(name)
+}
+
+/// Only the local backend. Parsed, not sliced: in `http://127.0.0.1:8888@evil.test/clip` the
+/// loopback-looking part is userinfo.
 fn require_loopback_url(url: &str) -> Result<(), String> {
     const REJECT: &str = "Only local http URLs can be saved.";
     let parsed = reqwest::Url::parse(url).map_err(|_| REJECT.to_string())?;
@@ -268,8 +367,7 @@ fn read_selected_text_import(
         ));
     }
 
-    // Limit the read too, so a file that grows after metadata inspection cannot
-    // make the command allocate without bound.
+    // Limit the read too, so a file that grows after the stat cannot force unbounded allocation.
     let file =
         File::open(&path).map_err(|error| format!("Failed to open {}: {error}", path.display()))?;
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
@@ -292,7 +390,6 @@ fn read_selected_text_import(
     Ok(Some(NativeImportedFile { name, content }))
 }
 
-/// Register a picked file for bounded range reads through an opaque token.
 fn open_selected_import(
     registry: &ChatImportRegistry,
     selected_path: Option<PathBuf>,
@@ -322,9 +419,7 @@ fn open_selected_import(
         .unwrap_or_else(|| format!("chat-import.{extension}"));
     let file =
         File::open(&path).map_err(|error| format!("Failed to open {}: {error}", path.display()))?;
-    // Size from the handle the token keeps, not from the path: a file swapped in
-    // between the two describes a different object, and this number is what
-    // bounds the streamed read.
+    // Size from the token's handle, not the path, since this bounds the streamed read.
     let opened = file
         .metadata()
         .map_err(|error| format!("Failed to inspect {}: {error}", path.display()))?;
@@ -351,11 +446,23 @@ fn read_selected_training_config(
 
 #[tauri::command]
 pub async fn save_native_file(
-    window: WebviewWindow,
+    webview: tauri::Webview,
     app: AppHandle,
     request: tauri::ipc::Request<'_>,
 ) -> Result<Option<String>, String> {
-    crate::native_intents::ensure_main_window(&window)?;
+    crate::native_intents::ensure_main_window(&webview)?;
+    let config_dir = app.path().app_config_dir().ok();
+    let start = config_dir.as_deref().and_then(last_save_dir);
+    let saved = save_request_with_dialog(&app, &request, start.as_deref()).await?;
+    if let (Some(config_dir), Some(path)) = (&config_dir, &saved) {
+        remember_save_dir(config_dir, path);
+    }
+    Ok(saved.map(|path| saved_file_name(&path)))
+}
+
+pub(crate) fn request_file<'a>(
+    request: &'a tauri::ipc::Request<'_>,
+) -> Result<(String, Cow<'a, [u8]>), String> {
     let encoded_name = request
         .headers()
         .get(NATIVE_FILE_NAME_HEADER)
@@ -365,23 +472,197 @@ pub async fn save_native_file(
     let file_name = decode_default_file_name(encoded_name)?;
     let content = invoke_body_bytes(request.body())
         .ok_or_else(|| "Native export content must be binary.".to_string())?;
+    Ok((file_name, content))
+}
+
+/// Save the request body where the user picks, starting in `directory`; None if cancelled.
+pub(crate) async fn save_request_with_dialog(
+    app: &AppHandle,
+    request: &tauri::ipc::Request<'_>,
+    directory: Option<&Path>,
+) -> Result<Option<PathBuf>, String> {
+    let (file_name, content) = request_file(request)?;
     let (filter_name, extensions) = save_filter(&file_name);
     let extension_refs = extensions.iter().map(String::as_str).collect::<Vec<_>>();
     let (tx, rx) = tokio::sync::oneshot::channel();
-    app.dialog()
+    let mut dialog = app
+        .dialog()
         .file()
         .set_title("Save Unsloth export")
         .set_file_name(file_name)
-        .add_filter(filter_name, &extension_refs)
-        .save_file(move |path| {
-            let _ = tx.send(path);
-        });
+        .add_filter(filter_name, &extension_refs);
+    if let Some(directory) = directory {
+        dialog = dialog.set_directory(directory);
+    }
+    dialog.save_file(move |path| {
+        let _ = tx.send(path);
+    });
     let selected_path = rx
         .await
         .map_err(|_| "Save dialog closed unexpectedly.".to_string())?
         .map(local_dialog_path)
         .transpose()?;
     save_selected_file(selected_path, content.as_ref())
+}
+
+#[tauri::command]
+pub async fn begin_native_file_save(
+    webview: tauri::Webview,
+    app: AppHandle,
+    registry: State<'_, NativeSaveRegistry>,
+    file_name: String,
+) -> Result<Option<String>, String> {
+    crate::native_intents::ensure_main_window(&webview)?;
+    let file_name = default_file_name(&file_name);
+    let (filter_name, extensions) = save_filter(&file_name);
+    let extension_refs = extensions.iter().map(String::as_str).collect::<Vec<_>>();
+    let config_dir = app.path().app_config_dir().ok();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let mut dialog = app
+        .dialog()
+        .file()
+        .set_title("Save Unsloth export")
+        .set_file_name(file_name)
+        .add_filter(filter_name, &extension_refs);
+    if let Some(dir) = config_dir.as_deref().and_then(last_save_dir) {
+        dialog = dialog.set_directory(dir);
+    }
+    dialog.save_file(move |path| {
+        let _ = tx.send(path);
+    });
+    let selected_path = rx
+        .await
+        .map_err(|_| "Save dialog closed unexpectedly.".to_string())?
+        .map(local_dialog_path)
+        .transpose()?;
+    let Some(destination) = selected_path else {
+        return Ok(None);
+    };
+    let temporary = staged_temp_file(&destination)?;
+    Ok(Some(registry.register(NativeSave {
+        destination,
+        temporary,
+    })))
+}
+
+#[tauri::command]
+pub async fn append_native_file_save_chunk(
+    webview: tauri::Webview,
+    registry: State<'_, NativeSaveRegistry>,
+    request: tauri::ipc::Request<'_>,
+) -> Result<(), String> {
+    crate::native_intents::ensure_main_window(&webview)?;
+    let token = request
+        .headers()
+        .get(NATIVE_FILE_SAVE_TOKEN_HEADER)
+        .ok_or_else(|| "Native export token is missing.".to_string())?
+        .to_str()
+        .map_err(|_| "Invalid native export token.".to_string())?;
+    let save = registry
+        .resolve(token)
+        .ok_or_else(|| "That native export is no longer available.".to_string())?;
+    let content = native_save_chunk(request.body())?.into_owned();
+    tokio::task::spawn_blocking(move || append_native_save(&save, &content))
+        .await
+        .map_err(|error| format!("Failed to write the native export: {error}"))?
+}
+
+#[tauri::command]
+pub async fn finish_native_file_save(
+    webview: tauri::Webview,
+    app: AppHandle,
+    registry: State<'_, NativeSaveRegistry>,
+    token: String,
+) -> Result<String, String> {
+    crate::native_intents::ensure_main_window(&webview)?;
+    let save = registry
+        .take(&token)
+        .ok_or_else(|| "That native export is no longer available.".to_string())?;
+    let destination = save
+        .lock()
+        .map(|save| save.destination.clone())
+        .map_err(|_| "Native export handle is unavailable.".to_string())?;
+    let name = tokio::task::spawn_blocking(move || finish_native_save(save))
+        .await
+        .map_err(|error| format!("Failed to finish the native export: {error}"))??;
+    if let Ok(config_dir) = app.path().app_config_dir() {
+        remember_save_dir(&config_dir, &destination);
+    }
+    Ok(name)
+}
+
+#[tauri::command]
+pub fn cancel_native_file_save(
+    webview: tauri::Webview,
+    registry: State<'_, NativeSaveRegistry>,
+    token: String,
+) -> Result<(), String> {
+    crate::native_intents::ensure_main_window(&webview)?;
+    registry.cancel(&token);
+    Ok(())
+}
+
+/// Room under the usual 255-byte name limit for the " (999)" a taken name gets.
+const MAX_DOWNLOAD_NAME_BYTES: usize = 240;
+const WINDOWS_DEVICE_NAMES: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// A website's file name made safe everywhere: no separators, control or reserved characters, trailing dots/spaces or device names; length capped.
+pub(crate) fn safe_download_name(name: &str) -> String {
+    let mut name: String = name
+        .chars()
+        .map(|c| {
+            // Bidi controls too: `invoice\u{202e}fdp.exe` must not read as `invoiceexe.pdf`.
+            if c.is_control() || is_bidi_control(c) || "/\\:*?\"<>|".contains(c) {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let kept = name.trim_end_matches(['.', ' ']).len();
+    name.truncate(kept);
+    if name.trim_matches(['.', ' ']).is_empty() {
+        return "download".into();
+    }
+    let device = name.split('.').next().unwrap_or("").trim_end();
+    if WINDOWS_DEVICE_NAMES
+        .iter()
+        .any(|reserved| reserved.eq_ignore_ascii_case(device))
+    {
+        name.insert(0, '_');
+    }
+    if name.len() > MAX_DOWNLOAD_NAME_BYTES {
+        let extension = name
+            .rfind('.')
+            .filter(|&at| at > 0 && name.len() - at <= 32)
+            .map_or("", |at| &name[at..]);
+        let mut end = MAX_DOWNLOAD_NAME_BYTES - extension.len();
+        while !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        name = format!("{}{extension}", &name[..end]);
+    }
+    name
+}
+
+pub(crate) fn save_request_in(
+    request: &tauri::ipc::Request<'_>,
+    directory: &Path,
+) -> Result<PathBuf, String> {
+    let (file_name, content) = request_file(request)?;
+    let path = unique_destination(directory, &safe_download_name(&file_name))?;
+    save_selected_file(Some(path), content.as_ref())?
+        .ok_or_else(|| "Failed to save the file.".to_string())
 }
 
 /// Save a backend URL by streaming it to the chosen path.
@@ -391,25 +672,30 @@ pub async fn save_native_file(
 /// the chooser first and writes the response chunk by chunk, leaving nothing resident.
 #[tauri::command]
 pub async fn save_native_file_from_url(
-    window: WebviewWindow,
+    webview: tauri::Webview,
     app: AppHandle,
     url: String,
     file_name: String,
 ) -> Result<Option<String>, String> {
-    crate::native_intents::ensure_main_window(&window)?;
+    crate::native_intents::ensure_main_window(&webview)?;
     require_loopback_url(&url)?;
     let file_name = default_file_name(&file_name);
     let (filter_name, extensions) = save_filter(&file_name);
     let extension_refs = extensions.iter().map(String::as_str).collect::<Vec<_>>();
+    let config_dir = app.path().app_config_dir().ok();
     let (tx, rx) = tokio::sync::oneshot::channel();
-    app.dialog()
+    let mut dialog = app
+        .dialog()
         .file()
         .set_title("Save Unsloth export")
         .set_file_name(file_name)
-        .add_filter(filter_name, &extension_refs)
-        .save_file(move |path| {
-            let _ = tx.send(path);
-        });
+        .add_filter(filter_name, &extension_refs);
+    if let Some(dir) = config_dir.as_deref().and_then(last_save_dir) {
+        dialog = dialog.set_directory(dir);
+    }
+    dialog.save_file(move |path| {
+        let _ = tx.send(path);
+    });
     let selected_path = rx
         .await
         .map_err(|_| "Save dialog closed unexpectedly.".to_string())?
@@ -418,23 +704,36 @@ pub async fn save_native_file_from_url(
     let Some(path) = selected_path else {
         return Ok(None);
     };
-    stream_url_to_path(&url, &path, DOWNLOAD_READ_TIMEOUT).await?;
+    stream_url_to_path(&url, &path, DOWNLOAD_READ_TIMEOUT, None).await?;
+    if let Some(config_dir) = &config_dir {
+        remember_save_dir(config_dir, &path);
+    }
     Ok(Some(saved_file_name(&path)))
 }
 
-/// A local backend that has accepted the request should never go quiet for this long, and a
-/// clip that is still arriving resets it, so a large save is not cut short.
+/// Resets per chunk, so a large save is not cut short.
 const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-async fn stream_url_to_path(url: &str, path: &Path, read_timeout: Duration) -> Result<(), String> {
-    let mut response =
-        crate::loopback_http::streaming_client(Duration::from_secs(10), read_timeout)
-            .map_err(|error| format!("Download failed: {error}"))?
-            .get(url)
-            .send()
-            .await
-            .map_err(|error| format!("Download failed: {error}"))?;
-    // Redirects are refused rather than followed, so a 3xx is a rejection here, not a hop.
+/// `bearer` is always minted by the command, never passed over IPC, so the webview cannot choose
+/// what this client authenticates as; see `download_logs_to_downloads`.
+async fn stream_url_to_path(
+    url: &str,
+    path: &Path,
+    read_timeout: Duration,
+    bearer: Option<&str>,
+) -> Result<(), String> {
+    let request = crate::loopback_http::streaming_client(Duration::from_secs(10), read_timeout)
+        .map_err(|error| format!("Download failed: {error}"))?
+        .get(url);
+    let request = match bearer {
+        Some(token) => request.bearer_auth(token),
+        None => request,
+    };
+    let mut response = request
+        .send()
+        .await
+        .map_err(|error| format!("Download failed: {error}"))?;
+    // Redirects are refused, so a 3xx is a rejection here, not a hop.
     if !response.status().is_success() {
         return Err(format!(
             "Download failed with status {}.",
@@ -461,15 +760,218 @@ async fn stream_url_to_path(url: &str, path: &Path, read_timeout: Duration) -> R
     Ok(())
 }
 
+/// The only route `download_logs_to_downloads` may fetch: its bearer is a full UI session.
+/// Suffix match so a base path still resolves.
+const LOG_EXPORT_ROUTE: &str = "/api/settings/debug/logs/export";
+const LOG_ARCHIVE_FALLBACK_NAME: &str = "unsloth-logs.zip";
+const LOG_ARCHIVE_MAX_COPIES: u32 = 999;
+
+/// No chooser guards this destination, and on Unix `..\..\x` survives `Path::file_name`.
+fn log_archive_file_name(suggested: &str) -> String {
+    let base = suggested
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        // A drive-relative name like `C:evil.zip` would still resolve off this directory.
+        .rsplit(':')
+        .next()
+        .unwrap_or_default();
+    if base.is_empty() || base == "." || base == ".." || base.contains('\0') {
+        return LOG_ARCHIVE_FALLBACK_NAME.to_string();
+    }
+    // The destination may fall back to $HOME and the name comes from the webview: refuse dotfiles
+    // and non-.zip names (the real caller sends `unsloth-logs-<stamp>.zip`).
+    if base.starts_with('.') || !base.ends_with(".zip") {
+        return LOG_ARCHIVE_FALLBACK_NAME.to_string();
+    }
+    base.to_string()
+}
+
+fn log_archive_directory() -> Result<PathBuf, String> {
+    let directory = dirs::download_dir()
+        .or_else(dirs::home_dir)
+        .ok_or_else(|| "Could not determine home directory".to_string())?;
+    // XDG can name a Downloads folder that was never created.
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("Failed to prepare {}: {error}", directory.display()))?;
+    Ok(directory)
+}
+
+/// `name.zip`, then `name (2).zip`, the way a browser download uniquifies.
+///
+/// Exporting twice must not silently replace the archive the user is still attaching to
+/// an issue. Best effort by nature -- another process can take the name between the check
+/// and the rename -- but it removes the case that actually happens, which is the same
+/// user pressing the button again.
+pub(crate) fn unique_destination(directory: &Path, file_name: &str) -> Result<PathBuf, String> {
+    let candidate = directory.join(file_name);
+    if !candidate.exists() {
+        return Ok(candidate);
+    }
+    let name = Path::new(file_name);
+    let stem = name
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(file_name);
+    let extension = name.extension().and_then(|extension| extension.to_str());
+    for copy in 2..=LOG_ARCHIVE_MAX_COPIES {
+        let candidate = directory.join(match extension {
+            Some(extension) => format!("{stem} ({copy}).{extension}"),
+            None => format!("{stem} ({copy})"),
+        });
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(format!(
+        "Could not find a free name for {file_name} in {}.",
+        directory.display()
+    ))
+}
+
+const NOT_THE_LOG_EXPORT: &str = "Only the local log export endpoint can be downloaded.";
+
+/// Matched by `DESKTOP_LOGIN_REQUIRED` in features/settings/api/debug-logs.ts; keep the two in step.
+const LOGIN_REQUIRED: &str = "Log export requires a signed-in Unsloth session.";
+
+/// A minted desktop session where one exists, otherwise the tab's own token: desktop-login
+/// refuses on multi-account installs and can fail under a custom home. A minting error wins
+/// when there is no fallback.
+fn select_export_session(
+    minted: Result<crate::desktop_auth::DesktopAuthResponse, String>,
+    ui_token: Option<String>,
+) -> Result<String, String> {
+    let fallback = ui_token.filter(|token| !token.trim().is_empty());
+    match minted {
+        Ok(crate::desktop_auth::DesktopAuthResponse::Tokens { access_token, .. }) => {
+            Ok(access_token)
+        }
+        Ok(crate::desktop_auth::DesktopAuthResponse::LoginRequired { .. }) => {
+            fallback.ok_or_else(|| LOGIN_REQUIRED.to_string())
+        }
+        Err(error) => fallback.ok_or(error),
+    }
+}
+
+/// `Url::parse` normalises `..` segments, so a path walking out of the route fails here.
+fn require_log_export_route(url: &str) -> Result<reqwest::Url, String> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| NOT_THE_LOG_EXPORT.to_string())?;
+    if !parsed.path().ends_with(LOG_EXPORT_ROUTE) {
+        return Err(NOT_THE_LOG_EXPORT.to_string());
+    }
+    Ok(parsed)
+}
+
+/// Rebase onto the live port so the token cannot be aimed at another loopback listener; this also
+/// fixes a `127.0.0.1:0` placeholder base.
+fn pin_to_backend(mut url: reqwest::Url, port: u16) -> Result<String, String> {
+    url.set_host(Some("127.0.0.1"))
+        .map_err(|_| NOT_THE_LOG_EXPORT.to_string())?;
+    url.set_port(Some(port))
+        .map_err(|_| NOT_THE_LOG_EXPORT.to_string())?;
+    // The whole path: the bearer is a full UI session and the backend has catch-all routes.
+    url.set_path(LOG_EXPORT_ROUTE);
+    // The export takes no parameters, so anything here came from the caller.
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.to_string())
+}
+
+/// Read *after* minting, so any port discovery minting did is reflected.
+fn live_backend_port(state: &State<'_, crate::process::BackendState>) -> Result<u16, String> {
+    let backend = state.lock().map_err(|error| error.to_string())?;
+    if let Some(port) = backend.owned_backend_port() {
+        return Ok(port);
+    }
+    // Starting, not attachable: the cached field could send the token to a stale listener.
+    if backend.has_owned_backend() {
+        return Err("Backend is not ready".to_string());
+    }
+    backend
+        .port
+        .ok_or_else(|| "Backend is not ready".to_string())
+}
+
+/// Compiled on every platform so the UNC branch is tested in ordinary CI. The prefix compare is
+/// case-insensitive so a lowercase `unc` does not come out as a relative-looking path.
+// Off Windows only the test uses it; kept compiled so the UNC case is tested.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn strip_verbatim_prefix_inner(text: String) -> String {
+    const UNC: &str = r"\\?\UNC\";
+    // `get`, not slicing: a non-ASCII first component can put byte 8 inside a character.
+    if text
+        .get(..UNC.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(UNC))
+    {
+        return format!(r"\\{}", &text[UNC.len()..]);
+    }
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) => rest.to_string(),
+        None => text,
+    }
+}
+
+/// Strip the `\\?\` verbatim form for display. Identity elsewhere.
+#[cfg(windows)]
+fn strip_verbatim_prefix(text: String) -> String {
+    strip_verbatim_prefix_inner(text)
+}
+
+#[cfg(not(windows))]
+fn strip_verbatim_prefix(text: String) -> String {
+    text
+}
+
+/// The absolute, symlink-resolved path to show the user.
+pub(crate) fn display_path(path: &Path) -> String {
+    let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    strip_verbatim_prefix(resolved.display().to_string())
+}
+
+/// Save the backend's log archive straight into Downloads, returning the real path. The bearer is
+/// minted here and the port and route are pinned, so the webview cannot aim auth elsewhere.
+/// `filename` is one word on purpose: Tauri camelCases params over IPC (`ui_token` arrives as
+/// `uiToken`) and the Logs tab sends `filename`.
+#[tauri::command]
+pub async fn download_logs_to_downloads(
+    webview: tauri::Webview,
+    state: State<'_, crate::process::BackendState>,
+    diagnostics: State<'_, crate::diagnostics::DiagnosticsState>,
+    url: String,
+    filename: String,
+    ui_token: Option<String>,
+) -> Result<String, String> {
+    crate::native_intents::ensure_main_window(&webview)?;
+    // Both guards run before anything is minted.
+    require_loopback_url(&url)?;
+    let target = require_log_export_route(&url)?;
+
+    // Mint either way: it also resolves and caches the live port. The tab-token fallback grants
+    // nothing new, since host, port and path are pinned.
+    let minted = crate::desktop_auth::desktop_auth(state.clone(), diagnostics).await;
+    let session = select_export_session(minted, ui_token)?;
+    let pinned_url = pin_to_backend(target, live_backend_port(&state)?)?;
+
+    let directory = log_archive_directory()?;
+    let destination = unique_destination(&directory, &log_archive_file_name(&filename))?;
+    // Staged and renamed, so an interrupted download never leaves a truncated archive.
+    stream_url_to_path(
+        &pinned_url,
+        &destination,
+        DOWNLOAD_READ_TIMEOUT,
+        Some(&session),
+    )
+    .await?;
+    Ok(display_path(&destination))
+}
+
 fn read_range(
     handle: &Arc<Mutex<File>>,
     path: &Path,
     offset: u64,
     length: usize,
 ) -> Result<Vec<u8>, String> {
-    // Clamped here rather than only at the call site, so the bound holds for
-    // every caller: `take` was reading past it while only the allocation was
-    // capped, which left the read itself unbounded.
+    // Clamped here so the read itself is bounded for every caller, not just the allocation.
     let length = length.min(MAX_CHAT_IMPORT_CHUNK_BYTES);
     let mut file = handle
         .lock()
@@ -484,7 +986,7 @@ fn read_range(
     Ok(bytes)
 }
 
-/// Read raw bytes so the frontend can decode UTF-8 across range boundaries.
+/// Raw bytes, so the frontend can decode UTF-8 across range boundaries.
 #[tauri::command]
 pub async fn read_native_chat_import_chunk(
     app: AppHandle,
@@ -507,11 +1009,11 @@ pub async fn read_native_chat_import_chunk(
 
 #[tauri::command]
 pub async fn pick_native_chat_import(
-    window: WebviewWindow,
+    webview: tauri::Webview,
     app: AppHandle,
     registry: State<'_, ChatImportRegistry>,
 ) -> Result<Option<NativeChatImport>, String> {
-    crate::native_intents::ensure_main_window(&window)?;
+    crate::native_intents::ensure_main_window(&webview)?;
     let (tx, rx) = tokio::sync::oneshot::channel();
     app.dialog()
         .file()
@@ -530,10 +1032,10 @@ pub async fn pick_native_chat_import(
 
 #[tauri::command]
 pub async fn pick_native_training_config(
-    window: WebviewWindow,
+    webview: tauri::Webview,
     app: AppHandle,
 ) -> Result<Option<NativeImportedFile>, String> {
-    crate::native_intents::ensure_main_window(&window)?;
+    crate::native_intents::ensure_main_window(&webview)?;
     let (tx, rx) = tokio::sync::oneshot::channel();
     app.dialog()
         .file()
@@ -553,15 +1055,44 @@ pub async fn pick_native_training_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn download_names_are_safe_on_every_platform() {
+        assert_eq!(safe_download_name("report:2026.pdf"), "report_2026.pdf");
+        assert_eq!(
+            safe_download_name("a<b>c|d?e*f\"g.txt"),
+            "a_b_c_d_e_f_g.txt"
+        );
+        assert_eq!(safe_download_name("evil\u{7}name.sh"), "evil_name.sh");
+        assert_eq!(
+            safe_download_name("invoice\u{202e}fdp.exe"),
+            "invoice_fdp.exe"
+        );
+        assert_eq!(safe_download_name("a\u{2066}b\u{061c}.txt"), "a_b_.txt");
+        assert_eq!(safe_download_name("CON"), "_CON");
+        assert_eq!(safe_download_name("nul.tar.gz"), "_nul.tar.gz");
+        assert_eq!(safe_download_name("console.log"), "console.log");
+        assert_eq!(safe_download_name("notes. . "), "notes");
+        assert_eq!(safe_download_name(".."), "download");
+        assert_eq!(safe_download_name(" "), "download");
+        let long = format!("{}.pdf", "\u{3042}".repeat(255));
+        let safe = safe_download_name(&long);
+        assert!(safe.len() <= MAX_DOWNLOAD_NAME_BYTES, "{}", safe.len());
+        assert!(safe.ends_with("\u{3042}.pdf"));
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_path(name: &str) -> PathBuf {
+        // Parallel tests plus macOS's microsecond clock can collide on names; the counter keeps
+        // them unique.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!(
-            "unsloth-native-files-{name}-{}-{nanos}",
+            "unsloth-native-files-{name}-{}-{nanos}-{seq}",
             std::process::id()
         ))
     }
@@ -611,7 +1142,6 @@ mod tests {
 
     #[test]
     fn writes_text_and_binary_exactly() {
-        // Overwriting must stage the new content before replacing the destination.
         let text_path = temp_path("text").with_extension("json");
         let binary_path = temp_path("binary").with_extension("zip");
 
@@ -622,6 +1152,64 @@ mod tests {
         assert_eq!(fs::read(&binary_path).unwrap(), [0, 1, 2, 255]);
         let _ = fs::remove_file(text_path);
         let _ = fs::remove_file(binary_path);
+    }
+
+    #[test]
+    fn chunked_save_keeps_the_destination_atomic() {
+        let destination = temp_path("chunked").with_extension("zip");
+        fs::write(&destination, b"previous export").unwrap();
+        let registry = NativeSaveRegistry::default();
+        let token = registry.register(NativeSave {
+            temporary: staged_temp_file(&destination).unwrap(),
+            destination: destination.clone(),
+        });
+        let save = registry.resolve(&token).unwrap();
+
+        append_native_save(&save, b"first ").unwrap();
+        append_native_save(&save, b"second").unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"previous export");
+        drop(save);
+
+        let completed = registry.take(&token).unwrap();
+        assert_eq!(
+            finish_native_save(completed).unwrap(),
+            saved_file_name(&destination)
+        );
+        assert_eq!(fs::read(&destination).unwrap(), b"first second");
+        assert!(registry.resolve(&token).is_none());
+        let _ = fs::remove_file(destination);
+    }
+
+    #[test]
+    fn cancelled_chunked_save_preserves_the_destination() {
+        let destination = temp_path("chunked-cancel").with_extension("zip");
+        fs::write(&destination, b"keep this").unwrap();
+        let registry = NativeSaveRegistry::default();
+        let token = registry.register(NativeSave {
+            temporary: staged_temp_file(&destination).unwrap(),
+            destination: destination.clone(),
+        });
+        append_native_save(&registry.resolve(&token).unwrap(), b"discard this").unwrap();
+
+        registry.cancel(&token);
+        assert_eq!(fs::read(&destination).unwrap(), b"keep this");
+        assert!(registry.resolve(&token).is_none());
+        let _ = fs::remove_file(destination);
+    }
+
+    #[test]
+    fn native_save_chunks_are_bounded() {
+        let accepted = tauri::ipc::InvokeBody::Raw(vec![0; MAX_NATIVE_FILE_SAVE_CHUNK_BYTES]);
+        assert_eq!(
+            native_save_chunk(&accepted).unwrap().len(),
+            MAX_NATIVE_FILE_SAVE_CHUNK_BYTES
+        );
+
+        let refused = tauri::ipc::InvokeBody::Raw(vec![0; MAX_NATIVE_FILE_SAVE_CHUNK_BYTES + 1]);
+        assert_eq!(
+            native_save_chunk(&refused).unwrap_err(),
+            "Native export chunk is too large."
+        );
     }
 
     #[test]
@@ -649,7 +1237,6 @@ mod tests {
 
     #[test]
     fn shell_commands_use_a_shell_save_filter() {
-        // The terminal card downloads command.sh through the same cell.
         assert_save_filter("command.sh", "Shell script", &["sh"]);
         assert_save_filter("command.SH", "Shell script", &["sh"]);
     }
@@ -667,9 +1254,24 @@ mod tests {
     }
 
     #[test]
+    fn the_last_save_folder_is_remembered_until_it_disappears() {
+        let config = tempfile::tempdir().unwrap();
+        let exports = tempfile::tempdir().unwrap();
+        assert_eq!(last_save_dir(config.path()), None);
+
+        remember_save_dir(config.path(), &exports.path().join("chat (2026-10-02).md"));
+        assert_eq!(
+            last_save_dir(config.path()).as_deref(),
+            Some(exports.path())
+        );
+
+        let gone = exports.path().to_path_buf();
+        drop(exports);
+        assert_eq!(last_save_dir(config.path()), None, "{}", gone.display());
+    }
+
+    #[test]
     fn saved_chat_attachments_keep_their_own_extension() {
-        // Settings > Data saves attachments here; a name outside the filter can
-        // be rejected or re-extensioned by the OS dialog.
         assert_save_filter("report.txt", "Text", &["txt", "log"]);
         assert_save_filter("photo.PNG", "PNG image", &["png"]);
         assert_save_filter("shot.jpeg", "JPEG image", &["jpg", "jpeg"]);
@@ -677,7 +1279,6 @@ mod tests {
         assert_save_filter("voice.webm", "WebM video or audio", &["webm"]);
     }
 
-    /// A current-thread runtime: these tests need one task, not a worker per core.
     fn test_runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -685,7 +1286,6 @@ mod tests {
             .unwrap()
     }
 
-    /// A one-shot loopback server, so the streaming save is exercised over real HTTP.
     fn serve_once(body: Vec<u8>, status: &'static str) -> (String, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -711,11 +1311,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("clip.mp4");
         test_runtime()
-            .block_on(stream_url_to_path(&url, &dest, DOWNLOAD_READ_TIMEOUT))
+            .block_on(stream_url_to_path(&url, &dest, DOWNLOAD_READ_TIMEOUT, None))
             .unwrap();
         server.join().unwrap();
         assert_eq!(fs::read(&dest).unwrap(), body);
-        // Nothing partial left beside it.
         let strays: Vec<_> = fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|entry| entry.ok())
@@ -730,7 +1329,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("clip.mp4");
         let error = test_runtime()
-            .block_on(stream_url_to_path(&url, &dest, DOWNLOAD_READ_TIMEOUT))
+            .block_on(stream_url_to_path(&url, &dest, DOWNLOAD_READ_TIMEOUT, None))
             .unwrap_err();
         server.join().unwrap();
         assert!(error.contains("401"), "{error}");
@@ -747,8 +1346,7 @@ mod tests {
         ] {
             assert!(require_loopback_url(url).is_ok(), "should allow {url}");
         }
-        // The userinfo forms are the ones a naive authority split accepts: everything
-        // before the '@' is credentials, so the real host is what follows it.
+        // Everything before the '@' is userinfo, so the real host is what follows it.
         for url in [
             "http://evil.test/x.mp4",
             "https://127.0.0.1:8888/x.mp4",
@@ -769,8 +1367,7 @@ mod tests {
 
     #[test]
     fn a_backend_that_goes_quiet_mid_body_stops_the_save() {
-        // Headers promise more than is sent, then the server holds the socket open. Without a
-        // per-read timeout the invoke never resolves and the staging file stays behind.
+        // Headers promise more than is sent; without a per-read timeout the invoke never resolves.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let (release, stalled) = std::sync::mpsc::channel::<()>();
@@ -790,6 +1387,7 @@ mod tests {
                 &format!("http://127.0.0.1:{port}/clip.mp4"),
                 &dest,
                 Duration::from_millis(250),
+                None,
             ))
             .unwrap_err();
         drop(release);
@@ -823,6 +1421,7 @@ mod tests {
                 &format!("http://127.0.0.1:{port}/clip.mp4"),
                 &dest,
                 DOWNLOAD_READ_TIMEOUT,
+                None,
             ))
             .unwrap_err();
         server.join().unwrap();
@@ -832,8 +1431,6 @@ mod tests {
 
     #[test]
     fn a_gallery_clip_offers_its_own_container() {
-        // The gallery's MP4 is the only export that reaches this dialog; WebM and GIF
-        // save from a blob. Both mp4 arms are named for video since #8173.
         assert_save_filter(
             "Unsloth_video_20260808-120000_1670009728.mp4",
             "MPEG-4 video or audio",
@@ -867,7 +1464,6 @@ mod tests {
         assert_eq!(opened.size, 15);
         assert_eq!(registry.resolve(&opened.token).unwrap().0, jsonl_path);
 
-        // An Open WebUI export is a .json array, so that extension has to be accepted now.
         let json_path = temp_path("openwebui").with_extension("json");
         fs::write(&json_path, "[{\"chat\":{}}]").unwrap();
         assert!(open_selected_import(&registry, Some(json_path.clone()))
@@ -908,8 +1504,6 @@ mod tests {
 
     #[test]
     fn a_large_import_is_opened_rather_than_read_into_memory() {
-        // The 64 MiB read cap is what turned a real Open WebUI export away; a
-        // file past it must now open, because the frontend streams it in ranges.
         let registry = ChatImportRegistry::default();
         let huge = temp_path("huge").with_extension("json");
         let file = File::create(&huge).unwrap();
@@ -943,15 +1537,12 @@ mod tests {
         assert_eq!(resolved, path);
         assert!(registry.resolve("not-a-token").is_none());
 
-        // Ranges are cut on byte boundaries, so a character split across two of
-        // them is the frontend decoder's problem, not a truncated read here.
         assert_eq!(read_range(&handle, &path, 0, 4).unwrap(), b"0123");
         assert_eq!(read_range(&handle, &path, 4, 4).unwrap(), b"4567");
         assert_eq!(read_range(&handle, &path, 8, 4).unwrap(), b"89");
         assert!(read_range(&handle, &path, 10, 4).unwrap().is_empty());
 
-        // Picking again must not invalidate the earlier handle: that import can
-        // still be streaming, and its next range read would fail mid-history.
+        // Picking again must not invalidate an earlier handle that may still be streaming.
         let second = temp_path("ranges-2").with_extension("jsonl");
         fs::write(&second, "abc").unwrap();
         let newer = register_for_test(&registry, &second);
@@ -959,7 +1550,6 @@ mod tests {
         assert_eq!(registry.resolve(&newer).unwrap().0, second);
         assert_ne!(token, newer);
 
-        // A hostile length cannot read past one chunk, whatever the caller passes.
         let big = temp_path("ranges-clamp").with_extension("jsonl");
         fs::write(&big, vec![b'x'; MAX_CHAT_IMPORT_CHUNK_BYTES + 4096]).unwrap();
         let big_token = register_for_test(&registry, &big);
@@ -972,7 +1562,6 @@ mod tests {
         );
         let _ = fs::remove_file(big);
 
-        // The map is bounded, so a long session cannot accumulate handles.
         for index in 0..CHAT_IMPORT_HANDLE_LIMIT {
             let filler = temp_path(&format!("ranges-fill-{index}")).with_extension("jsonl");
             fs::write(&filler, "x").unwrap();
@@ -988,8 +1577,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_file_swapped_under_the_path_mid_import_cannot_reach_the_stream() {
-        // Reopening the path per range would splice a replacement file into the
-        // export, and a same-size swap leaves no short read to catch it.
+        // A same-size swap leaves no short read to catch, so the handle must be reused.
         let registry = ChatImportRegistry::default();
         let path = temp_path("swapped").with_extension("jsonl");
         fs::write(&path, "original--").unwrap();
@@ -1018,10 +1606,7 @@ mod tests {
         let path = std::env::temp_dir().join(OsString::from_vec(vec![
             b'u', b'n', b's', b'l', b'o', b't', b'h', 0xff, b'.', b'c', b's', b'v',
         ]));
-        // Linux happily stores arbitrary bytes in a filename, but macOS enforces
-        // UTF-8 on APFS/HFS+ and rejects this name outright. The name-recovery
-        // path being asserted here is only reachable where such a file can
-        // exist, so skip rather than fail on filesystems that forbid it.
+        // macOS rejects non-UTF-8 filenames, so skip where such a file cannot exist.
         if fs::write(&path, "role,content\nuser,hello\n").is_err() {
             return;
         }
@@ -1031,6 +1616,319 @@ mod tests {
             .unwrap();
         assert_eq!(opened.name, "chat-import.csv");
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_suggested_log_archive_name_cannot_escape_the_download_folder() {
+        let directory = tempfile::tempdir().unwrap();
+        for suggested in [
+            "../../.bashrc",
+            "../unsloth-logs.zip",
+            "/etc/cron.d/unsloth",
+            "..\\..\\Startup\\unsloth.zip",
+            "C:evil.zip",
+            r"C:\Windows\System32\evil.zip",
+            "sub/dir/unsloth-logs.zip",
+            ".",
+            "..",
+            "",
+            "\0",
+        ] {
+            let name = log_archive_file_name(suggested);
+            assert!(
+                !name.contains('/') && !name.contains('\\') && !name.contains(':'),
+                "{suggested} produced {name}"
+            );
+            let resolved = directory.path().join(&name);
+            assert_eq!(
+                resolved.parent(),
+                Some(directory.path()),
+                "{suggested} escaped to {}",
+                resolved.display()
+            );
+        }
+
+        assert_eq!(
+            log_archive_file_name("unsloth-logs-20260910-101500.zip"),
+            "unsloth-logs-20260910-101500.zip"
+        );
+        assert_eq!(log_archive_file_name("../.."), LOG_ARCHIVE_FALLBACK_NAME);
+        assert_eq!(log_archive_file_name(".bashrc"), LOG_ARCHIVE_FALLBACK_NAME);
+        assert_eq!(log_archive_file_name(".ssh"), LOG_ARCHIVE_FALLBACK_NAME);
+        assert_eq!(
+            log_archive_file_name("unsloth-logs.zip.exe"),
+            LOG_ARCHIVE_FALLBACK_NAME
+        );
+        assert_eq!(log_archive_file_name("notes.txt"), LOG_ARCHIVE_FALLBACK_NAME);
+        assert_eq!(
+            log_archive_file_name("unsloth-logs-20260910-101112.zip"),
+            "unsloth-logs-20260910-101112.zip"
+        );
+    }
+
+    #[test]
+    fn a_second_export_gets_its_own_name_instead_of_replacing_the_first() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = unique_destination(directory.path(), "unsloth-logs.zip").unwrap();
+        assert_eq!(first, directory.path().join("unsloth-logs.zip"));
+
+        fs::write(&first, b"first").unwrap();
+        let second = unique_destination(directory.path(), "unsloth-logs.zip").unwrap();
+        assert_eq!(second, directory.path().join("unsloth-logs (2).zip"));
+
+        fs::write(&second, b"second").unwrap();
+        assert_eq!(
+            unique_destination(directory.path(), "unsloth-logs.zip").unwrap(),
+            directory.path().join("unsloth-logs (3).zip")
+        );
+        assert_eq!(fs::read(&first).unwrap(), b"first");
+
+        let plain = directory.path().join("logs");
+        fs::write(&plain, b"x").unwrap();
+        assert_eq!(
+            unique_destination(directory.path(), "logs").unwrap(),
+            directory.path().join("logs (2)")
+        );
+
+        for copy in 2..=LOG_ARCHIVE_MAX_COPIES {
+            fs::write(directory.path().join(format!("full ({copy}).zip")), b"x").unwrap();
+        }
+        fs::write(directory.path().join("full.zip"), b"x").unwrap();
+        assert!(unique_destination(directory.path(), "full.zip")
+            .unwrap_err()
+            .contains("free name"));
+    }
+
+    #[test]
+    fn the_log_export_download_is_pinned_to_the_live_backend_and_its_own_route() {
+        fn resolve(url: &str, port: u16) -> Result<String, String> {
+            pin_to_backend(require_log_export_route(url)?, port)
+        }
+
+        assert_eq!(
+            resolve("http://127.0.0.1:0/api/settings/debug/logs/export", 8890).unwrap(),
+            "http://127.0.0.1:8890/api/settings/debug/logs/export"
+        );
+        assert_eq!(
+            resolve(
+                "http://localhost:9/base/api/settings/debug/logs/export",
+                8890
+            )
+            .unwrap(),
+            "http://127.0.0.1:8890/api/settings/debug/logs/export"
+        );
+
+        assert_eq!(
+            resolve(
+                "http://127.0.0.1:0/api/settings/debug/logs/export?x=1#frag",
+                8890
+            )
+            .unwrap(),
+            "http://127.0.0.1:8890/api/settings/debug/logs/export"
+        );
+        assert_eq!(
+            resolve("http://127.0.0.1:0/api/v1/api/settings/debug/logs/export", 8890).unwrap(),
+            "http://127.0.0.1:8890/api/settings/debug/logs/export"
+        );
+
+        for url in [
+            "http://127.0.0.1:8888/api/settings",
+            "http://127.0.0.1:8888/api/settings/debug/logs",
+            "http://127.0.0.1:8888/api/settings/debug/logs/export/../../secrets",
+            "http://127.0.0.1:8888/api/settings/debug/logs/export%2fmore",
+            "http://127.0.0.1:8888/api/auth/api-keys",
+            "not a url",
+        ] {
+            assert!(resolve(url, 8890).is_err(), "should reject {url}");
+        }
+
+        for url in [
+            "http://evil.test/api/settings/debug/logs/export",
+            "https://127.0.0.1:8888/api/settings/debug/logs/export",
+            "http://127.0.0.1:8888@evil.test/api/settings/debug/logs/export",
+            "http://169.254.169.254/api/settings/debug/logs/export",
+            "file:///etc/passwd",
+        ] {
+            assert!(require_loopback_url(url).is_err(), "should reject {url}");
+        }
+        assert!(
+            require_loopback_url("http://127.0.0.1:8888/api/settings/debug/logs/export").is_ok()
+        );
+    }
+
+    #[test]
+    fn the_tab_token_stands_in_whenever_minting_cannot_produce_a_session() {
+        use crate::desktop_auth::{DesktopAuthResponse, LoginRequired, MultiLoginMode};
+
+        let minted = || {
+            Ok(DesktopAuthResponse::Tokens {
+                access_token: "minted".to_string(),
+                refresh_token: "unused".to_string(),
+            })
+        };
+        let login_required = || {
+            Ok(DesktopAuthResponse::LoginRequired {
+                login_required: LoginRequired,
+                login_mode: MultiLoginMode::Multi,
+            })
+        };
+        let failed = || Err("Desktop auth provisioning failed: no such file".to_string());
+
+        assert_eq!(
+            select_export_session(minted(), Some("ui".to_string())).unwrap(),
+            "minted"
+        );
+        assert_eq!(select_export_session(minted(), None).unwrap(), "minted");
+
+        assert_eq!(
+            select_export_session(login_required(), Some("ui".to_string())).unwrap(),
+            "ui"
+        );
+        assert_eq!(
+            select_export_session(failed(), Some("ui".to_string())).unwrap(),
+            "ui"
+        );
+
+        assert_eq!(
+            select_export_session(login_required(), Some("   ".to_string())).unwrap_err(),
+            LOGIN_REQUIRED
+        );
+        assert_eq!(
+            select_export_session(login_required(), None).unwrap_err(),
+            LOGIN_REQUIRED
+        );
+        assert!(
+            select_export_session(failed(), None)
+                .unwrap_err()
+                .starts_with("Desktop auth provisioning failed")
+        );
+    }
+
+    /// Multi-account installs never mint, so the tab must keep sending `uiToken` or export dies.
+    #[test]
+    fn the_tab_sends_a_ui_token_for_the_multi_account_fallback() {
+        let frontend = include_str!("../../frontend/src/features/settings/api/debug-logs.ts");
+        // Pin only that this command's payload names `uiToken`; how the frontend spells the
+        // value is its own business.
+        let payload = frontend
+            .split_once("\"download_logs_to_downloads\"")
+            .map(|(_, rest)| rest.chars().take(200).collect::<String>());
+        assert!(
+            payload.as_deref().is_some_and(|p| p.contains("uiToken")),
+            "debug-logs.ts no longer sends uiToken ({payload:?}), so a \
+             multi-account desktop install can never export logs"
+        );
+        assert!(
+            frontend.contains("getAuthToken("),
+            "debug-logs.ts no longer reads a token to send"
+        );
+    }
+
+    /// The TypeScript side matches the sentinel's exact text; fail if the two drift.
+    #[test]
+    fn the_login_required_sentinel_matches_what_the_frontend_looks_for() {
+        let frontend = include_str!("../../frontend/src/features/settings/api/debug-logs.ts");
+        assert!(
+            frontend.contains(&format!("\"{LOGIN_REQUIRED}\"")),
+            "debug-logs.ts no longer matches LOGIN_REQUIRED ({LOGIN_REQUIRED:?})"
+        );
+    }
+
+    /// Drives the inner rewrite, compiled everywhere, so the UNC branch is tested off Windows.
+    #[test]
+    fn a_verbatim_windows_path_is_shown_the_way_a_user_writes_it() {
+        assert_eq!(
+            strip_verbatim_prefix_inner(r"\\?\C:\Users\u\Downloads\a.zip".to_string()),
+            r"C:\Users\u\Downloads\a.zip"
+        );
+        // `\\?\UNC\server\share` names `\\server\share`, not `UNC\server\share`.
+        assert_eq!(
+            strip_verbatim_prefix_inner(r"\\?\UNC\server\share\a.zip".to_string()),
+            r"\\server\share\a.zip"
+        );
+        assert_eq!(
+            strip_verbatim_prefix_inner(r"\\?\unc\server\share\a.zip".to_string()),
+            r"\\server\share\a.zip"
+        );
+        // Byte 8 lands inside a multibyte character, so a plain `text[..8]` would panic.
+        assert_eq!(
+            strip_verbatim_prefix_inner(r"\\?\C:\下载\a.zip".to_string()),
+            r"C:\下载\a.zip"
+        );
+        assert_eq!(
+            strip_verbatim_prefix_inner(r"\\?\C:\ダウンロード\a.zip".to_string()),
+            r"C:\ダウンロード\a.zip"
+        );
+        assert_eq!(
+            strip_verbatim_prefix_inner(r"C:\Users\u\a.zip".to_string()),
+            r"C:\Users\u\a.zip"
+        );
+        assert_eq!(strip_verbatim_prefix_inner("/home/u/a.zip".to_string()), "/home/u/a.zip");
+        assert_eq!(strip_verbatim_prefix_inner(r"\\".to_string()), r"\\");
+        assert_eq!(strip_verbatim_prefix_inner(String::new()), "");
+    }
+
+    #[test]
+    fn the_log_export_sends_the_minted_session_and_lands_a_real_path() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 2048];
+            let read = std::io::Read::read(&mut stream, &mut request).unwrap();
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: application/zip\r\n\r\nPK",
+            );
+            String::from_utf8_lossy(&request[..read]).to_string()
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("unsloth-logs.zip");
+        test_runtime()
+            .block_on(stream_url_to_path(
+                &format!("http://127.0.0.1:{port}/api/settings/debug/logs/export"),
+                &destination,
+                DOWNLOAD_READ_TIMEOUT,
+                Some("minted-session-token"),
+            ))
+            .unwrap();
+        let request = server.join().unwrap();
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer minted-session-token"),
+            "{request}"
+        );
+        assert_eq!(fs::read(&destination).unwrap(), b"PK");
+
+        let shown = display_path(&destination);
+        assert!(Path::new(&shown).is_absolute(), "{shown}");
+        assert!(shown.ends_with("unsloth-logs.zip"), "{shown}");
+        assert_eq!(fs::read(&shown).unwrap(), b"PK");
+    }
+
+    #[test]
+    fn an_old_backend_and_a_refused_session_stay_distinguishable_in_the_error() {
+        // The Logs tab parses the status out of this string, so the wording is a contract.
+        for status in ["404 Not Found", "403 Forbidden"] {
+            let (url, server) = serve_once(b"nope".to_vec(), status);
+            let directory = tempfile::tempdir().unwrap();
+            let destination = directory.path().join("unsloth-logs.zip");
+            let error = test_runtime()
+                .block_on(stream_url_to_path(
+                    &url,
+                    &destination,
+                    DOWNLOAD_READ_TIMEOUT,
+                    Some("minted-session-token"),
+                ))
+                .unwrap_err();
+            server.join().unwrap();
+            assert_eq!(
+                error,
+                format!("Download failed with status {}.", &status[..3])
+            );
+            assert!(!destination.exists(), "{status} must not create the file");
+        }
     }
 
     #[test]

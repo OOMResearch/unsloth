@@ -3,31 +3,13 @@
 
 """Speed + accuracy lever benchmark for the IMAGE diffusion backend (per-lever LPIPS).
 
-Drives the SAME production lever functions the image loader calls -- ``apply_step_cache``,
-``apply_attention_backend``, ``apply_speed_optims``, ``quantize_text_encoders``, the
-compile-safe eager patches -- with the loader's own default arguments and order, so each
-measured configuration reflects a real load. For each config it loads the pipeline fresh
-(quant/compile mutate irreversibly), warms up (to pay the one-time compile), renders a
-fixed prompt set at a fixed seed, and reports total latency, median per-step ms, peak
-resident GB, and mean LPIPS(AlexNet) vs the bit-exact reference config (speed off,
-native attention, uncached, dense) rendered at the same seed/settings.
+Drives the SAME production lever functions the image loader calls (``apply_step_cache``, ``apply_attention_backend``, ``apply_speed_optims``, ``quantize_text_encoders``, the compile-safe eager patches) with the loader's own default arguments and order, so each measured configuration reflects a real load. For each config it loads the pipeline fresh (quant/compile mutate irreversibly), warms up to pay the one-time compile, renders a fixed prompt set at a fixed seed, and reports total latency, median per-step ms, peak resident GB, and mean LPIPS(AlexNet) against the bit-exact reference config (speed off, native attention, uncached, dense) rendered at the same seed and settings.
 
-Every generation starts from a clean step cache, exactly like the production backend:
-diffusers keys FBCache residuals on the long-lived transformer and never resets them, so
-without the per-generation reset the measured prompts would compare their first-block
-residual against the PREVIOUS prompt's final one -- a state production never runs.
-FBCache rows produced before this reset existed may overstate both the speedup and the
-quality cost.
+Every generation starts from a clean step cache, exactly like the production backend: diffusers keys FBCache residuals on the long-lived transformer and never resets them, so without the per-generation reset the measured prompts would compare their first-block residual against the PREVIOUS prompt's final one, a state production never runs. FBCache rows produced before this reset existed may overstate both the speedup and the quality cost.
 
-Lever isolation knobs (for before/after measurement of shipped fixes):
-  --no-epc         force torch._inductor.config.emulate_precision_casts back off after
-                   the speed layer enables it (the pre-fix compile numerics).
-  --unarm-cache    restore the cache hooks' eager inner forwards after the speed layer
-                   arms them (the pre-fix cache x compile composition).
+Lever isolation knobs for before/after measurement of shipped fixes: --no-epc forces torch._inductor.config.emulate_precision_casts back off after the speed layer enables it (the pre-fix compile numerics), and --unarm-cache restores the cache hooks' eager inner forwards after the speed layer arms them (the pre-fix cache x compile composition).
 
-Example:
-    CUDA_VISIBLE_DEVICES=3 python scripts/image_speedmem_bench.py --family flux.1-dev \\
-        --config compile --out outputs/image_speedmem
+Example: `CUDA_VISIBLE_DEVICES=3 python scripts/image_speedmem_bench.py --family flux.1-dev --config compile --out outputs/image_speedmem`
 """
 
 from __future__ import annotations
@@ -50,7 +32,6 @@ for _p in (str(_BACKEND_ROOT), str(_REPO_ROOT / "scripts")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-# Fixed prompt set so the LPIPS mean is not hostage to a single composition.
 PROMPTS = [
     "A cozy reading nook by a rain-streaked window, warm lamplight, a cat asleep on a stack of books",
     "A lone lighthouse on a rocky cliff at sunset, dramatic clouds, crashing waves, highly detailed",
@@ -58,7 +39,6 @@ PROMPTS = [
     "A photograph of an astronaut riding a horse on the surface of the moon, detailed, 8k",
 ]
 
-# Production defaults per family (diffusion_families.default_generation_params).
 _FAMILIES: dict[str, dict[str, Any]] = {
     "qwen-image": {"repo": "Qwen/Qwen-Image", "family": "qwen-image"},
     "flux.1-dev": {"repo": "black-forest-labs/FLUX.1-dev", "family": "flux.1"},
@@ -66,21 +46,13 @@ _FAMILIES: dict[str, dict[str, Any]] = {
     "sdxl": {"repo": "stabilityai/stable-diffusion-xl-base-1.0", "family": "sdxl"},
 }
 
-#                       te        speed       attn       cache
 _CONFIGS: dict[str, dict[str, Any]] = {
-    # bit-exact reference: everything off / native / dense
     "reference": dict(te = "none", speed = "off", attn = "native", cache = "off"),
-    # non-compile floor: eager patches + attention auto-upgrade
     "eager": dict(te = "none", speed = "eager", attn = "auto", cache = "off"),
-    # default dense tier (regional compile), uncached
     "compile": dict(te = "none", speed = "default", attn = "auto", cache = "off"),
-    # max tier (max-autotune regional compile + TF32 + fused QKV), uncached
     "speedmax": dict(te = "none", speed = "max", attn = "auto", cache = "off"),
-    # default tier + FBCache (the auto path for 20+ step schedules)
     "fbcache": dict(te = "none", speed = "default", attn = "auto", cache = "fbcache"),
-    # FBCache without compile: isolates the cache's drift from the compile floor
     "fbcache_eager": dict(te = "none", speed = "eager", attn = "auto", cache = "fbcache"),
-    # TE quant isolation on the bit-exact stack: the conditioning perturbation ALONE
     "te_fp8dyn": dict(te = "fp8_dynamic", speed = "off", attn = "native", cache = "off"),
     "te_fp8": dict(te = "fp8", speed = "off", attn = "native", cache = "off"),
 }
@@ -177,8 +149,7 @@ def _apply_levers(
     unarm_cache: bool = False,
     logger = None,
 ) -> dict:
-    """Apply the configured levers with the loader's own argument values, in the loader's
-    order (diffusion.py): TE quant -> attention -> step cache -> eager patches -> speed."""
+    """Apply the configured levers with the loader's own argument values, in the loader's order (diffusion.py): TE quant, attention, step cache, eager patches, speed."""
     from core.inference.diffusion_precision import quantize_text_encoders
     from core.inference.diffusion_attention import (
         apply_attention_backend,
@@ -199,7 +170,6 @@ def _apply_levers(
     engaged: dict[str, Any] = {"te": None, "attn": None, "cache": None, "speed_optims": {}}
 
     if cfg["te"] != "none":
-        # Returns (mode, reason, status) now; this bench only reports the mode that engaged.
         engaged["te"] = quantize_text_encoders(
             pipe, tgt, mode = cfg["te"], family = fam_obj.name, logger = logger
         ).mode
@@ -250,12 +220,7 @@ def _apply_levers(
 
 
 def _reset_step_cache(pipe) -> None:
-    """Clear stale FBCache residuals before a generation, mirroring the production
-    backend's ``_reset_step_cache`` (diffusion.py): diffusers keys the residuals on the
-    long-lived denoiser and never resets them itself, and the transformer-level entry
-    point in diffusers 0.39 is ``_reset_stateful_cache`` (``reset_stateful_hooks`` lives
-    only on the HookRegistry, so the getattr fallback is a silent no-op). Best-effort:
-    an uncached denoiser (or SDXL's unet, which has no FBCache path) is a no-op."""
+    """Clear stale FBCache residuals before a generation, mirroring the production backend's ``_reset_step_cache`` (diffusion.py): diffusers keys the residuals on the long-lived denoiser and never resets them itself, and the transformer-level entry point in diffusers 0.39 is ``_reset_stateful_cache`` (``reset_stateful_hooks`` lives only on the HookRegistry, so the getattr fallback is a silent no-op). Best-effort: an uncached denoiser, or SDXL's unet which has no FBCache path, is a no-op."""
     denoiser = getattr(pipe, "transformer", None) or getattr(pipe, "unet", None)
     reset = getattr(denoiser, "_reset_stateful_cache", None) or getattr(
         denoiser, "reset_stateful_hooks", None
@@ -389,7 +354,6 @@ def main() -> None:
     pipe.to("cuda")
     weights_gb = _alloc_gb()
 
-    # Warmup pays the one-time compile / cuDNN autotune outside the timed runs.
     wt0 = time.perf_counter()
     _generate(
         pipe,
@@ -408,7 +372,6 @@ def main() -> None:
     )
     gen_peak = _peak_gb()
 
-    # Persist / score against the reference.
     lpips_vals: list[float] = []
     if args.config == "reference" and not (args.no_epc or args.unarm_cache):
         np.savez_compressed(ref_npz, *arrs)

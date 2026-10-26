@@ -1,38 +1,40 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+import type { PipelineType } from "@huggingface/hub";
+import { useAppShellReadySignal } from "@/components/app-readiness";
+import { matchesHubAudioTask } from "@/lib/hub-audio-task";
+import { useHfEndpoint, useHubSource } from "@/lib/hf-endpoint";
 import { usePlatformStore } from "@/config/env";
 import {
   applyActiveModelStatusToStore,
   getInferenceStatus,
   isExternalModelId,
   isSpeechOnlyStatus,
-  listGgufVariants,
   resolveInferenceCheckpointId,
-  useChatModelRuntime,
   useChatRuntimeStore,
 } from "@/features/chat";
-import { useOnlineStatus } from "@/features/hub/hooks/use-online-status";
+import { audioPickSearch } from "@/features/audio/route-search";
 import { useHubInfiniteScroll } from "@/features/hub";
+import { useOnlineStatus } from "@/features/hub/hooks/use-online-status";
 import {
-  type ModelPickTarget,
-  type PerModelConfig,
-  adoptLegacyConfigKey,
-  applyModelLoadConfigToRuntime,
-  applyPerModelConfigToRuntime,
-  currentRuntimePerModelConfig,
+  type ModelConfigHandoffRequest,
+  clearModelConfigHandoff,
+  createModelConfigHandoffRequestId,
   hfModelFitsDevice,
   loadScopedGpu,
-  resolveInitialConfig,
-  useActiveModelConfig,
+  requestModelConfigHandoff,
 } from "@/features/model-picker";
-import { loadOpenAIAutoSwitchSettings } from "@/features/settings";
 import { taskForMediaPick } from "@/features/model-picker/components/model-selector/audio-picker-policy";
-import { diffusionRouteSearch } from "@/lib/diffusion-route-search";
+import { type NpuModel, type NpuPickerSource, useNpuStatus } from "@/features/npu";
+import { loadOpenAIAutoSwitchSettings } from "@/features/settings";
+import { GuidedTour, useGuidedTourController } from "@/features/tour";
 import { useDebouncedValue } from "@/hooks/use-debounced-value";
 import { useGpuInfo, useInferenceGpuInfo } from "@/hooks/use-gpu-info";
+import { useIsCompact } from "@/hooks/use-mobile";
 import { useVramBudgetFraction } from "@/hooks/use-vram-budget-fraction";
-import { toast } from "@/lib/toast";
+import { diffusionRouteSearch } from "@/lib/diffusion-route-search";
+import { subscribeModelLifecycle } from "@/lib/model-lifecycle-events";
 import { cn } from "@/lib/utils";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import {
@@ -43,11 +45,18 @@ import {
   useRef,
   useState,
 } from "react";
+import { toast } from "sonner";
 import { ExternalLinkConfirmDialog } from "./catalog/external-link-confirm-dialog";
+import { FreeUpSpaceDialog } from "./catalog/free-up-space-dialog";
 import { HubDetailView } from "./catalog/hub-detail-view";
 import { HubFeed } from "./catalog/hub-feed";
-import { HubModelSettingsView } from "./catalog/hub-model-settings-view";
 import { HubTopBar } from "./catalog/hub-top-bar";
+import {
+  HUB_SPLIT_CUSTOM_WIDTH_CLASS,
+  HubSplitDivider,
+  useHubSplitWidth,
+} from "./components/hub-split-divider";
+import { buildHubTourSteps } from "./tour";
 import {
   ModelsCatalog,
   type ModelsCatalogHandlers,
@@ -59,14 +68,16 @@ import {
   type AllModelsView,
   HubListHeader,
   type InventorySort,
-  InventorySortControl,
-  InventoryTypeFilterControl,
-  ResultListHeader,
 } from "./catalog/models-table";
+import {
+  HUB_UPLOADERS,
+  type HubUploader,
+  hasModelSearchFilters,
+  type ModelSearchFilters,
+} from "./lib/model-search-filters";
 import { ModelsToolbar } from "./catalog/models-toolbar";
-import { FreeUpSpaceDialog } from "./catalog/free-up-space-dialog";
+import { NpuCatalogList } from "./catalog/npu-catalog-list";
 import { OnDeviceFoldersDialog } from "./catalog/on-device-folders-dialog";
-import { OwnerScopeToggle } from "./catalog/owner-scope-toggle";
 import { useDiscoverSearch } from "./hooks/use-discover-search";
 import { useFeedWriteBack } from "./hooks/use-feed-write-back";
 import { useHiddenEmbeddingModelIds } from "./hooks/use-hidden-embedding-models";
@@ -81,15 +92,7 @@ import { useHubModelVram } from "./hooks/use-hub-model-vram";
 import { useModelsSelection } from "./hooks/use-models-selection";
 import { resolveSelectionUrlSync } from "./lib/selection-resolution";
 import { useHubInventory } from "./inventory";
-import { LOCAL_MODEL_SOURCE } from "./inventory/constants";
-import { settingsGgufVariantForRow } from "./inventory/settings-identity";
 import { adoptResidentModelStatus } from "./lib/adopt-inference-status";
-import { subscribeResidentStatusRefresh } from "./lib/resident-status-refresh";
-import {
-  type RefreshSupersession,
-  registerRefresh,
-  supersedingRefresh,
-} from "./lib/superseded-refresh";
 import {
   CHANNEL_TO_SECTION,
   type ChannelId,
@@ -104,85 +107,152 @@ import {
   isHiddenModelId,
 } from "./lib/hidden-models";
 import { inventoryRowMatches, tokenizeQuery } from "./lib/inventory-search";
-import { looksLikeLocalPath, routableToMediaPage } from "./lib/local-path";
+import { routableToMediaPage } from "./lib/local-path";
+import { residentModelIdMatches } from "./lib/model-identity";
 import {
-  ggufVariantsMatch,
-  modelIdsMatch,
-  residentModelIdMatches,
-} from "./lib/model-identity";
-import {
-  type ModelTypeFilter,
-  matchesModelType,
-} from "./lib/model-type-filter";
+  createHubModelConfigHandoff,
+  type HubModelRunSelection,
+  hubAudioRunRefused,
+  hubAudioTask,
+} from "./lib/model-run-selection";
+import { inventoryRowFormat } from "./catalog/inventory-sort";
+import { matchesInventoryCapabilities } from "./lib/model-type-filter";
+import { ownerOf, repoOf } from "./lib/format";
 import { resolveOwnerProviderLogo } from "./lib/provider-logos";
+import { subscribeResidentStatusRefresh } from "./lib/resident-status-refresh";
+import {
+  type RefreshSupersession,
+  registerRefresh,
+  supersedingRefresh,
+} from "./lib/superseded-refresh";
+import {
+  type DatasetModality,
+  matchesDatasetFilters,
+} from "./lib/dataset-filters";
+import {
+  detectCapabilities,
+  type HubCapabilityFilter,
+} from "./lib/model-capabilities";
 import { studioPageForTask } from "./lib/unsloth-support";
-import { fingerprintToken } from "./lib/token-fingerprint";
 import {
   buildDiscoverRows,
   detectResultFormat,
+  discoveryInventorySignature,
+  hasRecommendedCheckpointLikes,
   isUnslothFinetunable,
-  matchesCapability,
+  matchesHubCapability,
   matchesFormat,
+  matchesRecommended,
+  matchesRecommendedDiffusion,
 } from "./lib/view-models";
 import { hfApiToken, useHfTokenStore } from "./stores/hf-token-store";
-import { isChannelEntryFresh, useHubFeedStore } from "./stores/hub-feed-store";
+import {
+  feedIdentity,
+  isChannelEntryFresh,
+  useHubFeedStore,
+} from "./stores/hub-feed-store";
 import type {
   CachedInventoryRow,
-  CapabilityFilter,
   DiscoverRow,
   LocalInventoryRow,
   ModelFormatFilter,
   ModelsTab,
   ResourceTypeFilter,
   SelectedModelView,
-  SelectedResourceRef,
 } from "./types";
 
-// What per-model settings are keyed by, which is not always what the loader is handed: a repo
-// cached outside the active HF cache loads by snapshot path while the picker keys it by repo
-// id. The row decides that, not the view it is shown in; `hub_cache` marks exactly those.
-function modelConfigIdentity(
-  kind: SelectedModelView["kind"],
-  resource: SelectedResourceRef,
-): string {
-  if (kind !== "cache" && resource.source !== "hub_cache") {
-    return resource.runId;
-  }
-  return resource.repoId ?? resource.runId;
-}
+const NO_SEARCH_FILTERS: ModelSearchFilters = {};
+const UNSLOTH_UPLOADER: readonly HubUploader[] = ["unsloth"];
 
-const MODELS_TAB_STORAGE_KEY = "unsloth.hub.modelsTab";
 const ALL_MODELS_VIEW_STORAGE_KEY = "unsloth.hub.allModelsView";
 const INVENTORY_SORT_STORAGE_KEY = "unsloth.hub.inventorySort";
-const OWNER_SCOPE_STORAGE_KEY = "unsloth.hub.ownerScope";
+const RUN_CONFIG_REFRESH_TIMEOUT_MS = 5_000;
 
-// Iconless models (no provider logo, e.g. Ornith, Inkling) show once they clear this many likes.
+// Under Recommended, iconless models (no provider logo, e.g. Ornith, Inkling) show once they clear this many likes.
 const MIN_ICONLESS_MODEL_LIKES = 30;
 
-/** Discover browsing scope: the whole Hub (default) or only the unsloth org. */
-export type OwnerScope = "unsloth" | "all";
+// Image and video models skip Recommended's likes rules: new diffusion uploads rarely clear them.
+function isDiffusionResult(result: HfModelResult): boolean {
+  return detectCapabilities(result.tags, result.pipelineTag, result.id).some(
+    (c) => c.key === "diffusion",
+  );
+}
 
-function readOwnerScopePreference(): OwnerScope {
-  if (typeof window === "undefined") {
-    return "all";
+function isDiffusionRow(row: DiscoverRow): boolean {
+  return row.capabilities.some((c) => c.key === "diffusion");
+}
+
+// Recommended curates browsing to logo'd models plus well-liked iconless ones, and to well-liked
+// checkpoints; a typed search and every other format show all matches.
+function matchesDiscoverFormat(
+  result: HfModelResult,
+  format: ModelFormatFilter,
+  browsing: boolean,
+  diffusion: boolean,
+  quantFormats: readonly string[],
+): boolean {
+  if (format !== "recommended") {
+    return matchesFormat(detectResultFormat(result), format);
   }
+  if (diffusion) return matchesRecommendedDiffusion(result, quantFormats);
+  return (
+    (!browsing ||
+      ((resolveOwnerProviderLogo(ownerOf(result.id), repoOf(result.id)) !==
+        null ||
+        (result.likes ?? 0) >= MIN_ICONLESS_MODEL_LIKES) &&
+        hasRecommendedCheckpointLikes(result))) &&
+    matchesRecommended(result, quantFormats)
+  );
+}
+
+function withoutGgufTag(
+  tags: readonly string[] | undefined,
+): readonly string[] | undefined {
+  const kept = tags?.filter((tag) => tag !== "gguf");
+  return kept?.length ? kept : undefined;
+}
+
+async function waitForRunConfigRefresh(
+  refresh: Promise<void>,
+  signal: AbortSignal,
+): Promise<void> {
+  if (signal.aborted) return;
+  let timeoutId: number | undefined;
+  let onAbort: (() => void) | undefined;
   try {
-    const value = window.localStorage.getItem(OWNER_SCOPE_STORAGE_KEY);
-    // Default to the whole Hub; only honor an explicit "unsloth" preference.
-    return value === "unsloth" ? "unsloth" : "all";
-  } catch {
-    return "all";
+    await Promise.race([
+      refresh,
+      new Promise<void>((resolve) => {
+        timeoutId = window.setTimeout(resolve, RUN_CONFIG_REFRESH_TIMEOUT_MS);
+      }),
+      new Promise<void>((resolve) => {
+        onAbort = resolve;
+        signal.addEventListener("abort", onAbort, { once: true });
+      }),
+    ]);
+  } finally {
+    if (timeoutId !== undefined) window.clearTimeout(timeoutId);
+    if (onAbort) signal.removeEventListener("abort", onAbort);
   }
 }
 
-function writeOwnerScopePreference(scope: OwnerScope): void {
-  if (typeof window === "undefined") {
-    return;
+class RunConfigOpenCoordinator {
+  private active: AbortController | null = null;
+
+  begin(): AbortController {
+    this.cancel();
+    const controller = new AbortController();
+    this.active = controller;
+    return controller;
   }
-  try {
-    window.localStorage.setItem(OWNER_SCOPE_STORAGE_KEY, scope);
-  } catch {
-    return;
+
+  cancel(): void {
+    this.active?.abort();
+    this.active = null;
+  }
+
+  finish(controller: AbortController): void {
+    if (this.active === controller) this.active = null;
   }
 }
 
@@ -191,9 +261,6 @@ const FEED_LIST_CHANNEL_ID: ChannelId = "unsloth-latest";
 
 type DiscoverMode = "feed" | "channel-list" | "search";
 
-type ModelLoadOptions = { ggufVariant?: string; expectedBytes?: number };
-
-// Focused list heading stays "Models"/"Datasets" regardless of filters; only search relabels it.
 function buildFocusedHeading({
   query,
   channel,
@@ -209,57 +276,19 @@ function buildFocusedHeading({
   return isDataset ? "Datasets" : "Models";
 }
 
-function discoveryInventorySignature(
-  cachedRows: readonly CachedInventoryRow[],
-  localRows: readonly LocalInventoryRow[],
-): string {
-  const parts: string[] = [];
-  for (const row of cachedRows) {
-    parts.push(
-      `c:${row.repoId.toLowerCase()}:${row.modelFormat}:${row.partial ? "p" : "c"}`,
-    );
-  }
-  for (const row of localRows) {
-    parts.push(
-      `l:${(row.repoId ?? row.id).toLowerCase()}:${row.modelFormat}:${row.partial ? "p" : "c"}`,
-    );
-  }
-  return parts.sort().join("|");
-}
-
-function readModelsTabPreference(): ModelsTab | null {
-  if (typeof window === "undefined") {
-    return null;
-  }
-  try {
-    const value = window.localStorage.getItem(MODELS_TAB_STORAGE_KEY);
-    return value === "discover" || value === "downloaded" ? value : null;
-  } catch {
-    return null;
-  }
-}
-
-function writeModelsTabPreference(tab: ModelsTab): void {
-  if (typeof window === "undefined") {
-    return;
-  }
-  try {
-    window.localStorage.setItem(MODELS_TAB_STORAGE_KEY, tab);
-  } catch {
-    return;
-  }
-}
-
-// "All models" defaults to list layout; list-vs-grid choice persists across sessions.
+// "All models" defaults to split layout; the choice persists across sessions.
 function readAllModelsViewPreference(): AllModelsView {
   if (typeof window === "undefined") {
     return "split";
   }
   try {
     const value = window.localStorage.getItem(ALL_MODELS_VIEW_STORAGE_KEY);
-    return value === "grid" || value === "two" || value === "split"
-      ? value
-      : "split";
+    // "grid" was the removed compact list; keep those users on a card layout.
+    if (value === "grid") {
+      window.localStorage.setItem(ALL_MODELS_VIEW_STORAGE_KEY, "two");
+      return "two";
+    }
+    return value === "two" || value === "split" ? value : "split";
   } catch {
     return "split";
   }
@@ -271,7 +300,10 @@ function readInventorySortPreference(): InventorySort {
   }
   try {
     const value = window.localStorage.getItem(INVENTORY_SORT_STORAGE_KEY);
-    return value === "name" || value === "size" || value === "recent"
+    return value === "name" ||
+      value === "size" ||
+      value === "format" ||
+      value === "recent"
       ? value
       : "recent";
   } catch {
@@ -308,12 +340,8 @@ function useModelsTabState(): {
   const navigate = useNavigate();
   const search = useSearch({ from: "/hub" });
   const urlTab: ModelsTab | null = search.tab ?? null;
-  const hasModelDeepLink =
-    typeof search.model === "string" && search.model.length > 0;
-  const [fallbackTab, setFallbackTab] = useState<ModelsTab>(
-    () => readModelsTabPreference() ?? "discover",
-  );
-  const tab = urlTab ?? (hasModelDeepLink ? "discover" : fallbackTab);
+  // Opening the Hub without an explicit ?tab= always lands on Discover; the last tab is not remembered.
+  const tab = urlTab ?? "discover";
 
   useEffect(() => {
     if (urlTab !== null) return;
@@ -326,8 +354,6 @@ function useModelsTabState(): {
 
   const setTab = useCallback(
     (next: ModelsTab) => {
-      setFallbackTab(next);
-      writeModelsTabPreference(next);
       void navigate({
         to: "/hub",
         search: (prev) => ({
@@ -363,29 +389,38 @@ function selectedRepoMatchesRuntime(
   selectedModel: SelectedModelView | null,
   runtimeId: string | null,
   ggufVariant: string | null,
+  runtimeIsMlx = false,
 ): boolean {
   if (!selectedModel || !runtimeId) return false;
-  if (!modelIdsMatch(runtimeId, selectedModel.resource.runId)) return false;
+  if (
+    !residentModelIdMatches(
+      runtimeId,
+      selectedModel.id,
+      selectedModel.loadId,
+      selectedModel.hubRepoId,
+      selectedModel.path,
+      selectedModel.displayId,
+    )
+  ) {
+    return false;
+  }
   if (selectedModel.modelFormat === "gguf") {
-    const localPath =
-      selectedModel.resource.localPath ?? selectedModel.path ?? "";
+    const localPath = selectedModel.path ?? "";
     return ggufVariant !== null || localPath.toLowerCase().endsWith(".gguf");
   }
-  return ggufVariant === null;
+  // An MLX load of a precision folder (6-bit/) reports the folder as its variant.
+  return ggufVariant === null || runtimeIsMlx;
 }
 
 export function ModelsPage() {
+  const signalReady = useAppShellReadySignal();
   const navigate = useNavigate();
   const gpu = useGpuInfo();
-  // The saved VRAM Budget the loader admits against. The "Fits on device" filter scored against
-  // the 0.97 default without it, so lowering the setting moved the badges and not the filter.
+  // Use the saved VRAM budget so the fit filter matches the badges.
   const budgetFraction = useVramBudgetFraction() ?? undefined;
   const inferenceGpu = useInferenceGpuInfo();
-  // One fit answer for every Hub row, picked the way the task pickers pick it: by the runtime that
-  // PLACES the row. An image or video repo goes to the diffusion planner, on one torch device,
-  // under the media rule, so judging it by llama.cpp's budget kept a 52 GiB media GGUF that clears
-  // 62.1 GiB on a 64 GiB Mac and blows the planner's 44.8. Everything else keeps the GGUF
-  // backend's own inventory, which is the one thing llama.cpp rows must be judged against.
+  // Judge fit by the runtime that places the row: media repos use the diffusion planner's rule,
+  // everything else the GGUF backend's inventory.
   const rowFitsDevice = useCallback(
     (result: HfModelResult) => {
       const mediaRow = studioPageForTask(result.pipelineTag) !== undefined;
@@ -402,10 +437,7 @@ export function ModelsPage() {
     },
     [budgetFraction, gpu, inferenceGpu],
   );
-  // Browser reachability, which is what every client here asks about: the
-  // selected model's metadata and the cached feed each issue their own request.
-  // On the discovery phase they would stay blocked at "probing" until a
-  // *listing* succeeded, and the Downloaded tab has no Retry to make that happen.
+  // Browser reachability, not listing success, or the Downloaded tab stays stuck at "probing".
   const online = useOnlineStatus();
   const deviceType = usePlatformStore((s) => s.deviceType);
   const hubSearch = useSearch({ from: "/hub" });
@@ -413,41 +445,24 @@ export function ModelsPage() {
   const preferredGgufFile = hubSearch.file ?? null;
 
   const preferredGgufFileIntent = hubSearch.intent ?? 0;
-  const { selectModel, loadingModel, loadProgress, ejectModel } =
-    useChatModelRuntime();
   const checkpoint = useChatRuntimeStore((s) => s.params.checkpoint);
   const residentCheckpoint = useChatRuntimeStore((s) => s.residentCheckpoint);
-  // Resident, not merely picked. An image or video load evicts the chat model
-  // and leaves the pick alone, so the cards kept saying "Loaded" for weights the
-  // backend had already released. `undefined` is "no status read yet", which
-  // stays as it was rather than flashing "On device" on every launch.
   const activeCheckpoint =
     checkpoint && !isExternalModelId(checkpoint) && residentCheckpoint !== null
       ? checkpoint
       : null;
   const activeGgufVariant = useChatRuntimeStore((s) => s.activeGgufVariant);
-  const activeLoadedContextLength = useChatRuntimeStore(
-    (s) => s.loadedContextLength,
-  );
+  const loadedIsMlx = useChatRuntimeStore((s) => s.loadedIsMlx);
+  const loadingModel = useChatRuntimeStore((s) => s.loadingModelPick);
   const [initialResidentStatusSettled, setInitialResidentStatusSettled] =
     useState(false);
-  // Live settings of the loaded model, so its page shows what it is running with.
-  const { config: activeModelConfig } = useActiveModelConfig();
-  // Shared with the chat model selector: list only models sized for this device.
   const fitOnDeviceOnly = useChatRuntimeStore((s) => s.fitOnDeviceOnly);
   const setFitOnDeviceOnly = useChatRuntimeStore((s) => s.setFitOnDeviceOnly);
 
-  // Drops a response that lands after a newer read started, or after unmount.
   const residentStatusSeq = useRef(0);
-  // The newest read started, so a dropped response can resolve with that instead of nothing. The
-  // settings handlers' own guard counts settings opens only: a focus refresh supersedes without bumping.
   const residentStatusSupersession = useRef<RefreshSupersession>({
     latest: null,
   });
-  // /status cannot say whether an empty answer is an idle eviction that will reload or a real
-  // unload, and only this endpoint knows. Read alongside every status read rather than cached,
-  // since the idle timeout is editable while this page stays mounted. Last answer wins on
-  // failure, not the default: "disarmed" clears the checkpoint, so a blip would discard a selection.
   const idleUnloadArmed = useRef(false);
   const readIdleUnloadArmed = useCallback(
     (): Promise<boolean> =>
@@ -459,60 +474,66 @@ export function ModelsPage() {
         .catch(() => idleUnloadArmed.current),
     [],
   );
-  // Returns the read so a caller that needs the answer first can wait for it.
-  const refreshResidentModelStatus = useCallback((): Promise<void> => {
-    const seq = ++residentStatusSeq.current;
-    const read = Promise.all([getInferenceStatus(), readIdleUnloadArmed()])
-      .then(([status, idleUnloadArmed]) => {
-        // A newer read owns the store, so this writes nothing; resolving with the refresh that took
-        // it over keeps an awaiting caller off the pre-switch store the await was there to replace.
-        if (seq !== residentStatusSeq.current)
-          return supersedingRefresh(residentStatusSupersession.current, seq);
-        const store = useChatRuntimeStore.getState();
-        adoptResidentModelStatus(
-          {
-            // The loadable identifier: a GGUF off disk loads by path, and two files sharing a stem collapse.
-            // Null for a speech model: this page is the other writer of params.checkpoint,
-            // so adopting one here made it the chat model just as the mount sync did.
-            checkpointId: isSpeechOnlyStatus(status)
-              ? null
-              : resolveInferenceCheckpointId(status),
-            speechOnly: isSpeechOnlyStatus(status),
-            ggufVariant: status.gguf_variant ?? null,
-          },
-          {
-            checkpoint: store.params.checkpoint,
-            checkpointIsExternal: isExternalModelId(store.params.checkpoint),
-            activeGgufVariant: store.activeGgufVariant,
-            modelLoading: store.modelLoading,
-            idleUnloadArmed,
-          },
-          {
-            setCheckpoint: (checkpointId, ggufVariant) => {
-              store.setCheckpoint(checkpointId, ggufVariant);
+  const refreshResidentModelStatus = useCallback(
+    (
+      { preserveIdleUnloaded = true }: {
+        preserveIdleUnloaded?: boolean;
+      } = {},
+    ): Promise<void> => {
+      const seq = ++residentStatusSeq.current;
+      const selected = useChatRuntimeStore.getState().params.checkpoint;
+      const read = Promise.all([
+        getInferenceStatus(
+          undefined,
+          selected && !isExternalModelId(selected) ? selected : undefined,
+        ),
+        readIdleUnloadArmed(),
+      ])
+        .then(([status, idleUnloadArmed]) => {
+          if (seq !== residentStatusSeq.current)
+            return supersedingRefresh(residentStatusSupersession.current, seq);
+          const store = useChatRuntimeStore.getState();
+          adoptResidentModelStatus(
+            {
+              // Null for speech models: this page also writes params.checkpoint and would make it the chat model.
+              checkpointId: isSpeechOnlyStatus(status)
+                ? null
+                : resolveInferenceCheckpointId(status),
+              speechOnly: isSpeechOnlyStatus(status),
+              ggufVariant: status.gguf_variant ?? null,
             },
-            clearCheckpoint: () => {
-              store.clearCheckpoint();
+            {
+              checkpoint: store.params.checkpoint,
+              checkpointIsExternal: isExternalModelId(store.params.checkpoint),
+              activeGgufVariant: store.activeGgufVariant,
+              modelLoading: store.modelLoading,
+              idleUnloadArmed: preserveIdleUnloaded && idleUnloadArmed,
             },
-            // The one entry point that has applied no status yet, so settings would read defaults.
-            applyStatus: (previous) => {
-              applyActiveModelStatusToStore(status, {
-                previousCheckpoint: previous.checkpoint ?? undefined,
-                previousGgufVariant: previous.ggufVariant,
-                adoptingExistingServerModel:
-                  previous.checkpoint === null || previous.checkpoint === "",
-              });
+            {
+              setCheckpoint: (checkpointId, ggufVariant) => {
+                store.setCheckpoint(checkpointId, ggufVariant);
+              },
+              clearCheckpoint: () => {
+                store.clearCheckpoint();
+              },
+              applyStatus: (previous) => {
+                applyActiveModelStatusToStore(status, {
+                  previousCheckpoint: previous.checkpoint ?? undefined,
+                  previousGgufVariant: previous.ggufVariant,
+                  adoptingExistingServerModel:
+                    previous.checkpoint === null || previous.checkpoint === "",
+                });
+              },
             },
-          },
-        );
-      })
-      .catch(() => undefined);
-    // In start order, synchronously with the sequence number, so a dropped response finds the newest read.
-    registerRefresh(residentStatusSupersession.current, seq, read);
-    return read;
-  }, [readIdleUnloadArmed]);
+          );
+        })
+        .catch(() => undefined);
+      registerRefresh(residentStatusSupersession.current, seq, read);
+      return read;
+    },
+    [readIdleUnloadArmed],
+  );
 
-  // Mount, then whenever this tab could have missed an API-driven switch. Re-reading is safe.
   useEffect(() => {
     let active = true;
     void refreshResidentModelStatus().finally(() => {
@@ -523,11 +544,19 @@ export function ModelsPage() {
     );
     return () => {
       active = false;
-      // A response still in flight adopts nothing once the Hub is gone.
       residentStatusSeq.current += 1;
       unsubscribe();
     };
   }, [refreshResidentModelStatus]);
+
+  useEffect(
+    () =>
+      subscribeModelLifecycle(({ runtime }) => {
+        if (runtime === "chat" || runtime === "stt") return;
+        void refreshResidentModelStatus({ preserveIdleUnloaded: false });
+      }),
+    [refreshResidentModelStatus],
+  );
 
   const { tab, setTab: setModelsTab } = useModelsTabState();
   const [query, setQuery] = useState("");
@@ -535,25 +564,58 @@ export function ModelsPage() {
     () => findChannel(DEFAULT_DISCOVER_CHANNEL)?.sort ?? "trendingScore",
   );
   const [direction, setDirection] = useState<HfSortDirection>("desc");
-  const [ownerScope, setOwnerScopeState] = useState<OwnerScope>(
-    readOwnerScopePreference,
+  // Null until the user picks: then Unsloth's uploads, or every uploader once a search is typed.
+  const [uploaderPick, setUploaderPick] = useState<HubUploader[] | null>(null);
+  // Until the popover's first change from the defaults, a capability pick keeps just that one.
+  const [firstPickArmed, setFirstPickArmed] = useState(true);
+  const [datasetModalities, setDatasetModalities] = useState<
+    DatasetModality[]
+  >([]);
+  const handlePopoverModalitiesChange = useCallback(
+    (next: DatasetModality[]) => {
+      setFirstPickArmed(false);
+      setDatasetModalities(next);
+    },
+    [],
   );
-  const setOwnerScope = useCallback((scope: OwnerScope) => {
-    setOwnerScopeState(scope);
-    writeOwnerScopePreference(scope);
+  const handlePopoverCapabilitiesChange = useCallback(
+    (next: HubCapabilityFilter[]) => {
+      setFirstPickArmed(false);
+      setCapabilityFilters(next);
+    },
+    [],
+  );
+  const handlePopoverSearchFiltersChange = useCallback(
+    (next: ModelSearchFilters) => {
+      setFirstPickArmed(false);
+      setSearchFilters(next);
+    },
+    [],
+  );
+  const handlePopoverUploadersChange = useCallback((next: HubUploader[]) => {
+    setFirstPickArmed(false);
+    setUploaderPick(next);
   }, []);
   const urlResourceType: ResourceTypeFilter =
     hubSearch.kind === "datasets" ? "datasets" : "models";
   const [resourceType, setResourceType] =
     useState<ResourceTypeFilter>(urlResourceType);
   // Resync on URL kind change (back/forward); it is only seeded on mount.
+  const syncedUrlKind = useRef(urlResourceType);
   useEffect(() => {
+    if (syncedUrlKind.current === urlResourceType) {
+      return;
+    }
+    syncedUrlKind.current = urlResourceType;
     setResourceType((current) =>
       current === urlResourceType ? current : urlResourceType,
     );
+    // Back/forward skips handleResourceTypeChange, so the other kind's hidden bounds go here too.
+    setSearchFilters({});
+    setDatasetModalities([]);
   }, [urlResourceType]);
   const [discoverFormat, setDiscoverFormat] = useState<ModelFormatFilter>(
-    () => findChannel(DEFAULT_DISCOVER_CHANNEL)?.format ?? "gguf",
+    () => findChannel(DEFAULT_DISCOVER_CHANNEL)?.format ?? "recommended",
   );
   const [downloadedFormat, setDownloadedFormat] =
     useState<ModelFormatFilter>("all");
@@ -572,7 +634,14 @@ export function ModelsPage() {
     () => findChannel(activeChannelId),
     [activeChannelId],
   );
+  const [npuStatus, setNpuStatus] = useNpuStatus();
+  const npuSource: NpuPickerSource | undefined = npuStatus?.supported
+    ? { status: npuStatus, onStatusChange: setNpuStatus }
+    : undefined;
   const formatFilter = isDiscoverTab ? discoverFormat : downloadedFormat;
+  const npuCatalogSource =
+    formatFilter === "npu" && !isDatasetMode ? npuSource : undefined;
+  const showNpuCatalog = npuCatalogSource !== undefined;
   const setFormatFilter = useCallback(
     (next: ModelFormatFilter) => {
       if (isDiscoverTab) {
@@ -590,19 +659,32 @@ export function ModelsPage() {
     },
     [isDiscoverTab, urlSection, navigate],
   );
-  const [capabilityFilter, setCapabilityFilter] =
-    useState<CapabilityFilter>("all");
+  const hubSource = useHubSource();
+  const [storedSearchFilters, setSearchFilters] = useState<ModelSearchFilters>(
+    {},
+  );
+  // Several capabilities show models with any of them; none shows every model.
+  const [capabilityFilters, setCapabilityFilters] = useState<
+    HubCapabilityFilter[]
+  >([]);
+  // Pipeline tasks from an audio page's Search Hub link; they apply while the Audio filter is on.
+  const [linkedAudioTask, setLinkedAudioTask] = useState<
+    PipelineType[] | null
+  >(null);
   const [allModelsView, setAllModelsViewState] = useState<AllModelsView>(
     readAllModelsViewPreference,
   );
+  const isCompactViewport = useIsCompact();
+  // The split view's auto-picked first row; an explicit selection or leaving split clears it.
+  const autoPreviewIdRef = useRef<string | null>(null);
   // Remembers the last non-split view so "Back to Hub" drops into the prior browsing layout.
   const lastNonSplitViewRef = useRef<AllModelsView>("two");
   const setAllModelsView = useCallback(
     (view: AllModelsView) => {
       setAllModelsViewState(view);
       writeAllModelsViewPreference(view);
-      // Leaving split view drops the inline preview so the user lands on the full hub list.
       if (view !== "split") {
+        autoPreviewIdRef.current = null;
         void navigate({
           to: "/hub",
           search: (prev) => ({ ...prev, model: undefined }),
@@ -618,8 +700,17 @@ export function ModelsPage() {
     setInventorySortState(sort);
     writeInventorySortPreference(sort);
   }, []);
-  const [inventoryTypeFilter, setInventoryTypeFilter] =
-    useState<ModelTypeFilter>("all");
+  const [inventoryCapabilities, setInventoryCapabilities] = useState<
+    HubCapabilityFilter[]
+  >([]);
+  const [inventoryFirstPickArmed, setInventoryFirstPickArmed] = useState(true);
+  const handleInventoryCapabilitiesChange = useCallback(
+    (next: HubCapabilityFilter[]) => {
+      setInventoryFirstPickArmed(false);
+      setInventoryCapabilities(next);
+    },
+    [],
+  );
   const [foldersDialogOpen, setFoldersDialogOpen] = useState(false);
   const [freeUpSpaceOpen, setFreeUpSpaceOpen] = useState(false);
   const [discoverFetchIntent, setDiscoverFetchIntent] = useState(0);
@@ -628,6 +719,11 @@ export function ModelsPage() {
   const handleTabChange = useCallback(
     (next: ModelsTab) => {
       setSortBrowseActive(false);
+      // The filters control is Discover-only, so a hidden filter must not reapply on return.
+      setSearchFilters({});
+      setDatasetModalities([]);
+      setUploaderPick(null);
+      setFirstPickArmed(true);
       setModelsTab(next);
     },
     [setModelsTab],
@@ -638,11 +734,15 @@ export function ModelsPage() {
       if (next === resourceType) return;
       setResourceType(next);
       setDownloadedFormat("all");
-      setCapabilityFilter("all");
+      setCapabilityFilters([]);
+      setDatasetModalities([]);
+      setSearchFilters({});
+      setUploaderPick(null);
+      setFirstPickArmed(true);
       setSortBrowseActive(false);
       if (next === "models") {
         const preset = findChannel(DEFAULT_DISCOVER_CHANNEL);
-        setDiscoverFormat(preset?.format ?? "gguf");
+        setDiscoverFormat(preset?.format ?? "recommended");
         setSortBy(preset?.sort ?? "trendingScore");
         setDirection("desc");
       }
@@ -669,9 +769,13 @@ export function ModelsPage() {
         setSortBy(preset.sort);
         setDirection("desc");
       }
-      setCapabilityFilter("all");
+      setCapabilityFilters([]);
+      setDatasetModalities([]);
+      setSearchFilters({});
+      setUploaderPick(null);
+      setFirstPickArmed(true);
       setSortBrowseActive(false);
-      // Clear search: an active query outranks the section in `mode`, hiding the curated list.
+      // An active query outranks the section in `mode`, hiding the curated list.
       setQuery("");
       void navigate({
         to: "/hub",
@@ -682,10 +786,14 @@ export function ModelsPage() {
   );
   const handleBackToFeed = useCallback(() => {
     const preset = findChannel(DEFAULT_DISCOVER_CHANNEL);
-    setDiscoverFormat(preset?.format ?? "gguf");
+    setDiscoverFormat(preset?.format ?? "recommended");
     setSortBy(preset?.sort ?? "trendingScore");
     setDirection("desc");
-    setCapabilityFilter("all");
+    setCapabilityFilters([]);
+    setDatasetModalities([]);
+    setSearchFilters({});
+    setUploaderPick(null);
+    setFirstPickArmed(true);
     setSortBrowseActive(false);
     void navigate({
       to: "/hub",
@@ -697,15 +805,19 @@ export function ModelsPage() {
     setModelsTab("discover");
     setResourceType("models");
     setQuery("");
-    setCapabilityFilter("all");
+    setCapabilityFilters([]);
+    setDatasetModalities([]);
+    setSearchFilters({});
+    setUploaderPick(null);
+    setFirstPickArmed(true);
     setDownloadedFormat("all");
-    setDiscoverFormat(preset?.format ?? "gguf");
+    setDiscoverFormat(preset?.format ?? "recommended");
     setSortBy(preset?.sort ?? "trendingScore");
     setDirection("desc");
     setSortBrowseActive(false);
     void navigate({
       to: "/hub",
-      // Assert the tab here too: it fires alongside setModelsTab's navigation, and spreading prev would restore the old tab.
+      // Set the tab explicitly: spreading prev would restore the old tab.
       search: (prev) => ({
         ...prev,
         tab: "discover",
@@ -715,6 +827,44 @@ export function ModelsPage() {
       }),
     });
   }, [navigate, setModelsTab]);
+
+  // A capability link opens the sorted Discover list with that filter on (the feed ignores it).
+  // The param is consumed so later filter changes stick and a repeat link re-applies.
+  const urlCapability = hubSearch.capability ?? null;
+  const urlTaskKey = hubSearch.audioTask?.join("|") ?? "";
+  useEffect(() => {
+    if (!urlCapability) return;
+    setResourceType("models");
+    setQuery("");
+    setDiscoverFormat("all");
+    setCapabilityFilters([urlCapability]);
+    setLinkedAudioTask(
+      urlCapability === "audio" && urlTaskKey
+        ? (urlTaskKey.split("|") as PipelineType[])
+        : null,
+    );
+    setSortBrowseActive(true);
+    // The media pages run curated Unsloth uploads, so start there.
+    setUploaderPick([...UNSLOTH_UPLOADER]);
+    setFirstPickArmed(false);
+    void navigate({
+      to: "/hub",
+      search: (prev) => ({
+        ...prev,
+        tab: "discover",
+        kind: undefined,
+        capability: undefined,
+        audioTask: undefined,
+        section: undefined,
+        model: undefined,
+      }),
+      replace: true,
+    });
+  }, [urlCapability, urlTaskKey, navigate]);
+  // Picking another filter drops the link's tasks, so returning to Audio shows every audio model.
+  if (!capabilityFilters.includes("audio") && linkedAudioTask !== null) {
+    setLinkedAudioTask(null);
+  }
 
   const handleSortChange = useCallback(
     (next: HfSortKey) => {
@@ -734,15 +884,31 @@ export function ModelsPage() {
 
   const debouncedQuery = useDebouncedValue(query);
   const deferredDebouncedQuery = useDeferredValue(debouncedQuery);
+  const uploaders =
+    uploaderPick ?? (debouncedQuery.trim() ? HUB_UPLOADERS : UNSLOTH_UPLOADER);
+  const ownerScope =
+    uploaders.length === 1 && uploaders[0] === "unsloth" ? "unsloth" : "all";
+  // The publisher and config.json lookups are Hugging Face endpoints.
+  const searchFilters = useMemo(
+    () =>
+      hubSource === "modelscope"
+        ? NO_SEARCH_FILTERS
+        : ownerScope === "all" && uploaders.length < HUB_UPLOADERS.length
+          ? { ...storedSearchFilters, uploaders: [...uploaders] }
+          : storedSearchFilters,
+    [hubSource, ownerScope, uploaders, storedSearchFilters],
+  );
+  const hasSearchFilters = hasModelSearchFilters(searchFilters);
   const hfToken = useHfTokenStore((s) => s.token);
   const debouncedHfToken = useDebouncedValue(hfToken, 500);
   const apiHfToken = hfApiToken(debouncedHfToken);
+  const hubHfEndpoint = useHfEndpoint();
   const tokenFingerprint = useMemo(
-    () => fingerprintToken(apiHfToken),
-    [apiHfToken],
+    () => feedIdentity(hubHfEndpoint, apiHfToken),
+    [hubHfEndpoint, apiHfToken],
   );
   const deferredFormatFilter = useDeferredValue(formatFilter);
-  const deferredCapabilityFilter = useDeferredValue(capabilityFilter);
+  const deferredCapabilityFilters = useDeferredValue(capabilityFilters);
 
   const hasQuery = deferredDebouncedQuery.trim() !== "";
   const mode: DiscoverMode = isModelDiscover
@@ -750,7 +916,7 @@ export function ModelsPage() {
       ? "search"
       : urlSection != null
         ? "channel-list"
-        : sortBrowseActive
+        : sortBrowseActive || hasSearchFilters || uploaderPick !== null
           ? "search"
           : "feed"
     : "search";
@@ -765,22 +931,61 @@ export function ModelsPage() {
     return null;
   }, [isChannelListMode, isFeedMode, activeChannel]);
 
-  const effectiveSort: HfSortKey =
+  const requestedSort: HfSortKey =
     isFeedMode && liveListChannel ? liveListChannel.sort : sortBy;
+  // ModelScope has neither a creation-date sort nor trending; its closest is last modified.
+  const effectiveSort: HfSortKey =
+    hubSource === "modelscope" &&
+    (requestedSort === "createdAt" || requestedSort === "fresh")
+      ? "lastModified"
+      : isDatasetMode && requestedSort === "fresh"
+        ? "createdAt"
+        : requestedSort;
   const effectiveDirection: HfSortDirection = isFeedMode ? "desc" : direction;
   // The format dropdown always filters the visible list, including the feed's "Latest" list, so
-  // the default (GGUF) hides fp8/safetensors and picking a format actually changes the rows.
+  // the default (Recommended) hides unrunnable checkpoints and picking a format changes the rows.
   const effectiveDiscoverFormat: ModelFormatFilter = deferredFormatFilter;
+  const checkpointQuantFormats = gpu.checkpointQuantFormats;
+  // Image / video NVFP4 also needs the build's NVFP4 switch: the backend refuses *-NVFP4 diffusion repos while it is off.
+  const diffusionQuantFormats = useMemo(
+    () =>
+      gpu.nvfp4Diffusion
+        ? checkpointQuantFormats
+        : checkpointQuantFormats.filter((format) => format !== "nvfp4"),
+    [checkpointQuantFormats, gpu.nvfp4Diffusion],
+  );
 
+  // A GGUF-tagged channel query would never fetch the FP8 / NVFP4 rows Recommended admits here.
+  const widenRecommendedChannel =
+    effectiveDiscoverFormat === "recommended" &&
+    checkpointQuantFormats.length > 0;
   const listChannel = useMemo<HfModelSearchChannel | null>(() => {
     if (!liveListChannel) return null;
     return {
       owner: liveListChannel.owner,
-      tags: liveListChannel.tags,
+      tags: widenRecommendedChannel
+        ? withoutGgufTag(liveListChannel.tags)
+        : liveListChannel.tags,
       query: liveListChannel.query,
       idSuffix: liveListChannel.idSuffix,
     };
-  }, [liveListChannel]);
+  }, [liveListChannel, widenRecommendedChannel]);
+
+  // checkpointQuantFormats is a superset of diffusionQuantFormats, so this never skips a row the list shows.
+  const searchBrowsing = debouncedQuery.trim() === "";
+  // Keyed by contents: a system poll hands out a new array, which would restart the search.
+  const quantFormatsKey = checkpointQuantFormats.join(",");
+  const keepSearchResult = useMemo(() => {
+    const quantFormats = quantFormatsKey ? quantFormatsKey.split(",") : [];
+    return (result: HfModelResult) =>
+      matchesDiscoverFormat(
+        result,
+        effectiveDiscoverFormat,
+        searchBrowsing,
+        isDiffusionResult(result),
+        quantFormats,
+      );
+  }, [effectiveDiscoverFormat, searchBrowsing, quantFormatsKey]);
 
   const {
     results,
@@ -796,18 +1001,26 @@ export function ModelsPage() {
   } = useDiscoverSearch({
     debouncedQuery,
     accessToken: apiHfToken,
-    isDiscoverTab,
+    isDiscoverTab: isDiscoverTab && !showNpuCatalog,
     isDatasetMode,
     sortBy: effectiveSort,
     direction: effectiveDirection,
     channel: listChannel,
     ownerScope,
+    filters: searchFilters,
+    keepResult: keepSearchResult,
+    task:
+      // Asked of the Hub only when Audio is the one filter: with others it would drop their models.
+      capabilityFilters.length === 1 && capabilityFilters[0] === "audio"
+        ? (linkedAudioTask ?? undefined)
+        : undefined,
   });
 
   const cachedListEntry = useHubFeedStore((state) =>
     liveListChannel ? state.channels[liveListChannel.id] : undefined,
   );
   const visibleResults =
+    !hasSearchFilters &&
     results.length === 0 &&
     liveListChannel &&
     isChannelEntryFresh(cachedListEntry, liveListChannel.id, tokenFingerprint)
@@ -815,7 +1028,7 @@ export function ModelsPage() {
       : results;
 
   useFeedWriteBack({
-    channelId: liveListChannel?.id ?? null,
+    channelId: hasSearchFilters ? null : liveListChannel?.id ?? null,
     results,
     isLoading,
     accessToken: apiHfToken,
@@ -826,12 +1039,16 @@ export function ModelsPage() {
     localRows: effectiveLocalRows,
     availableSet,
     partialSet,
+    downloadingSet,
     downloadedReady,
     inventorySettled,
     inventoryError,
     inventoryWarning,
     refreshInventory,
-  } = useHubInventory({ kind: isDatasetMode ? "datasets" : "models" });
+  } = useHubInventory({
+    kind: isDatasetMode ? "datasets" : "models",
+    includeUnslothModels: true,
+  });
 
   const reloadReadySent = useRef(false);
   useEffect(() => {
@@ -843,8 +1060,9 @@ export function ModelsPage() {
       return;
     }
     reloadReadySent.current = true;
-    window.dispatchEvent(new Event("unsloth:app-shell-ready"));
+    signalReady();
   }, [
+    signalReady,
     initialResidentStatusSettled,
     inventorySettled,
     isDiscoverTab,
@@ -865,43 +1083,59 @@ export function ModelsPage() {
     [visibleResults, modelDiscoveryInventorySignature],
   );
 
+  const deferredDatasetModalities = useDeferredValue(datasetModalities);
+  const { minRows, maxRows } = storedSearchFilters;
   const datasetDiscoverRows = useMemo<DiscoverRow[]>(() => {
     if (!isDatasetMode) return [];
-    return datasetResults.map((ds) => {
-      const owner = ds.id.includes("/") ? ds.id.split("/")[0] : "Hub";
-      const repo = ds.id.includes("/")
-        ? ds.id.split("/").slice(1).join("/")
-        : ds.id;
-      const summaryParts: string[] = [];
-      if (ds.taskCategories.length > 0)
-        summaryParts.push(ds.taskCategories.slice(0, 2).join(", "));
-      if (ds.totalExamples)
-        summaryParts.push(`${ds.totalExamples.toLocaleString()} rows`);
-      else if (ds.sizeCategory) summaryParts.push(ds.sizeCategory);
-      const lower = ds.id.toLowerCase();
-      return {
-        id: ds.id,
-        owner,
-        repo,
-        result: {
+    return datasetResults
+      .filter((ds) =>
+        matchesDatasetFilters(ds, deferredDatasetModalities, minRows, maxRows),
+      )
+      .map((ds) => {
+        const owner = ds.id.includes("/") ? ds.id.split("/")[0] : "Hub";
+        const repo = ds.id.includes("/")
+          ? ds.id.split("/").slice(1).join("/")
+          : ds.id;
+        const summaryParts: string[] = [];
+        if (ds.taskCategories.length > 0)
+          summaryParts.push(ds.taskCategories.slice(0, 2).join(", "));
+        if (ds.totalExamples)
+          summaryParts.push(`${ds.totalExamples.toLocaleString()} rows`);
+        else if (ds.sizeCategory) summaryParts.push(ds.sizeCategory);
+        const lower = ds.id.toLowerCase();
+        return {
           id: ds.id,
-          downloads: ds.downloads,
-          likes: ds.likes,
-          private: ds.private,
-          gated: ds.gated,
-          updatedAt: ds.updatedAt,
-          createdAt: ds.createdAt,
-          downloadsAllTime: ds.downloadsAllTime,
-          isGguf: false,
-          tags: ds.plainTags,
-        },
-        isAvailableOnDevice: availableSet.has(lower),
-        isPartialOnDevice: partialSet.has(lower),
-        summary: summaryParts.join(" · ") || ds.prettyName || "Dataset",
-        capabilities: [],
-      };
-    });
-  }, [isDatasetMode, datasetResults, availableSet, partialSet]);
+          owner,
+          repo,
+          result: {
+            id: ds.id,
+            downloads: ds.downloads,
+            likes: ds.likes,
+            private: ds.private,
+            gated: ds.gated,
+            updatedAt: ds.updatedAt,
+            createdAt: ds.createdAt,
+            downloadsAllTime: ds.downloadsAllTime,
+            isGguf: false,
+            tags: ds.plainTags,
+          },
+          isAvailableOnDevice: availableSet.has(lower),
+          isPartialOnDevice: partialSet.has(lower),
+          isDownloadingOnDevice: partialSet.has(lower) && downloadingSet.has(lower),
+          summary: summaryParts.join(" · ") || ds.prettyName || "Dataset",
+          capabilities: [],
+        };
+      });
+  }, [
+    isDatasetMode,
+    datasetResults,
+    deferredDatasetModalities,
+    minRows,
+    maxRows,
+    availableSet,
+    partialSet,
+    downloadingSet,
+  ]);
 
   const discoverRows = isDatasetMode ? datasetDiscoverRows : modelDiscoverRows;
 
@@ -911,17 +1145,22 @@ export function ModelsPage() {
       (row) =>
         !isHiddenModelId(row.id) &&
         !isConfiguredHiddenModelId(hiddenEmbeddingModelIds, row.id) &&
-        // Feed shows logo'd models, plus iconless ones above the likes threshold.
-        (!isFeedMode ||
-          resolveOwnerProviderLogo(row.owner, row.repo) !== null ||
-          (row.result.likes ?? 0) >= MIN_ICONLESS_MODEL_LIKES) &&
-        matchesFormat(
-          detectResultFormat(row.result),
+        matchesDiscoverFormat(
+          row.result,
           effectiveDiscoverFormat,
+          !hasQuery,
+          isDiffusionRow(row),
+          isDiffusionRow(row) ? diffusionQuantFormats : checkpointQuantFormats,
         ) &&
-        matchesCapability(row.capabilities, deferredCapabilityFilter) &&
+        (deferredCapabilityFilters.length === 0 ||
+          deferredCapabilityFilters.some(
+            (key) =>
+              matchesHubCapability(row, key) &&
+              (key !== "audio" ||
+                matchesHubAudioTask(row.result.pipelineTag, linkedAudioTask)),
+          )) &&
         (!activeChannel?.finetunableOnly || isUnslothFinetunable(row.result)) &&
-        // Models already on disk stay visible regardless of device fit, matching the chat selector.
+        // Models on disk stay visible regardless of fit, matching the chat selector.
         (!fitOnDeviceOnly ||
           row.isAvailableOnDevice ||
           rowFitsDevice(row.result)),
@@ -931,9 +1170,12 @@ export function ModelsPage() {
     discoverRows,
     hiddenEmbeddingModelIds,
     isDatasetMode,
-    isFeedMode,
+    hasQuery,
     effectiveDiscoverFormat,
-    deferredCapabilityFilter,
+    checkpointQuantFormats,
+    diffusionQuantFormats,
+    deferredCapabilityFilters,
+    linkedAudioTask,
     activeChannel,
     fitOnDeviceOnly,
   ]);
@@ -960,6 +1202,10 @@ export function ModelsPage() {
             !isConfiguredHiddenModelId(hiddenEmbeddingModelIds, row.id),
         )
         .filter((row) => matchesFormat(row.result.isGguf, "gguf"))
+        // Catches low-like safetensors repos cross-tagged "gguf" for a stray .gguf export.
+        .filter(
+          (row) => isDiffusionRow(row) || hasRecommendedCheckpointLikes(row.result),
+        )
         // Same fit filter as the main Discover list, so the feed carousel honors the toggle too.
         .filter(
           (row) =>
@@ -1003,7 +1249,7 @@ export function ModelsPage() {
     () => (isDiscoverTab ? [] : tokenizeQuery(deferredDebouncedQuery)),
     [isDiscoverTab, deferredDebouncedQuery],
   );
-  // Server cache rows already apply variant-aware infra hiding; optimistic rows are not confirmed.
+  // Server rows already apply variant-aware infra hiding; optimistic rows are not confirmed.
   const isVisibleInventoryRow = useCallback(
     (row: CachedInventoryRow | LocalInventoryRow) => {
       if (row.kind === "cache") {
@@ -1018,7 +1264,6 @@ export function ModelsPage() {
             ))
         );
       }
-      // Local rows may lack a repo id, so also check path and title.
       return (
         !isHiddenModelId(row.id, row.repoId, row.path, row.title) ||
         (inventoryTokens.length > 0 &&
@@ -1027,18 +1272,17 @@ export function ModelsPage() {
     },
     [hiddenEmbeddingModelIds, inventoryTokens],
   );
-  // Format filter is a deliberate scope narrowing, so hard-filter it out. The text query instead
-  // drives dim-not-filter on On Device so selection survives typing; matches sort to the top.
+  // The text query dims rather than filters on On Device so selection survives typing.
   const filteredCachedRows = useMemo(
     () =>
       partitionByMatch(
         effectiveCachedRows.filter(
           (row) =>
-            // Hidden-model filtering is model-only; datasets bypass it (and the format filter) as Discover
-            // does, so a dataset whose id/title/path contains an infra needle is not dropped.
+            // Datasets bypass hidden-model and format filtering, as Discover does.
             isDatasetMode ||
-            (matchesFormat(row.modelFormat, deferredFormatFilter) &&
-              matchesModelType(row, inventoryTypeFilter) &&
+            (deferredFormatFilter !== "unsloth" &&
+              matchesFormat(inventoryRowFormat(row), deferredFormatFilter) &&
+              matchesInventoryCapabilities(row, inventoryCapabilities) &&
               isVisibleInventoryRow(row)),
         ),
         inventoryTokens,
@@ -1047,7 +1291,7 @@ export function ModelsPage() {
       effectiveCachedRows,
       isDatasetMode,
       deferredFormatFilter,
-      inventoryTypeFilter,
+      inventoryCapabilities,
       inventoryTokens,
       isVisibleInventoryRow,
     ],
@@ -1058,11 +1302,11 @@ export function ModelsPage() {
       partitionByMatch(
         effectiveLocalRows.filter(
           (row) =>
-            // Hidden-model filtering is model-only; datasets bypass it (and the format filter) as Discover
-            // does, so a dataset whose id/title/path contains an infra needle is not dropped.
             isDatasetMode ||
-            (matchesFormat(row.modelFormat, deferredFormatFilter) &&
-              matchesModelType(row, inventoryTypeFilter) &&
+            ((deferredFormatFilter === "unsloth"
+              ? row.source === "unsloth"
+              : matchesFormat(inventoryRowFormat(row), deferredFormatFilter)) &&
+              matchesInventoryCapabilities(row, inventoryCapabilities) &&
               isVisibleInventoryRow(row)),
         ),
         inventoryTokens,
@@ -1071,15 +1315,13 @@ export function ModelsPage() {
       effectiveLocalRows,
       isDatasetMode,
       deferredFormatFilter,
-      inventoryTypeFilter,
+      inventoryCapabilities,
       inventoryTokens,
       isVisibleInventoryRow,
     ],
   );
 
-  // Header tallies exclude infra/hidden models so the count matches the On Device list (a fresh
-  // install with only the bge embedder cached reads 0, not 1 over an empty list). Reuse
-  // isVisibleInventoryRow so a search-revealed row is counted, and datasets keep their full count.
+  // Exclude infra/hidden models so the header count matches the On Device list.
   const visibleCachedCount = useMemo(
     () =>
       effectiveCachedRows.filter(
@@ -1101,8 +1343,13 @@ export function ModelsPage() {
         deferredDebouncedQuery,
         resourceType,
         deferredFormatFilter,
-        deferredCapabilityFilter,
-        inventoryTypeFilter,
+        deferredCapabilityFilters,
+        deferredDatasetModalities,
+        searchFilters,
+        // ModelScope drops searchFilters, but the dataset rows are filtered here either way.
+        minRows,
+        maxRows,
+        inventoryCapabilities,
         effectiveSort,
         effectiveDirection,
         activeChannelId,
@@ -1112,8 +1359,12 @@ export function ModelsPage() {
       deferredDebouncedQuery,
       resourceType,
       deferredFormatFilter,
-      deferredCapabilityFilter,
-      inventoryTypeFilter,
+      deferredCapabilityFilters,
+      deferredDatasetModalities,
+      searchFilters,
+      minRows,
+      maxRows,
+      inventoryCapabilities,
       effectiveSort,
       effectiveDirection,
       activeChannelId,
@@ -1132,10 +1383,26 @@ export function ModelsPage() {
       }
     } else {
       setDownloadedFormat("all");
-      setInventoryTypeFilter("all");
+      setInventoryCapabilities([]);
+      setInventoryFirstPickArmed(true);
     }
-    setCapabilityFilter("all");
+    setCapabilityFilters([]);
+    setDatasetModalities([]);
+    setSearchFilters({});
+    setUploaderPick(null);
+    setFirstPickArmed(true);
   }, [isDiscoverTab, urlSection, navigate]);
+  const handleResetInventoryFilters = useCallback(() => {
+    setInventoryCapabilities([]);
+    setInventoryFirstPickArmed(true);
+  }, []);
+  const handleResetPopoverFilters = useCallback(() => {
+    setCapabilityFilters([]);
+    setDatasetModalities([]);
+    setSearchFilters({});
+    setUploaderPick(null);
+    setFirstPickArmed(true);
+  }, []);
   const handleDiscoverFetchIntent = useCallback(() => {
     setDiscoverFetchIntent((value) => value + 1);
   }, []);
@@ -1147,13 +1414,11 @@ export function ModelsPage() {
     fetchMoreManually: fetchMoreDiscoverManually,
   } = useHubInfiniteScroll(
     fetchMore,
-    // Re-evaluate off the raw fetched count, not the filtered one: aggressive filters can reject
-    // every row, stalling filteredDiscoverRows.length while results grow.
+    // Use the raw fetched count: aggressive filters can stall the filtered length while results grow.
     scannedCount,
     {
       enabled: online && isDiscoverTab && hasMore,
-      // No phase gate: the footer renders on hasMore and so outlives the failed
-      // page, and fetchMoreDiscoverManual clears the backoff itself.
+      // No phase gate: the footer outlives the failed page and the manual fetch clears the backoff.
       isFetching: isLoading || isLoadingMore,
       resultCount: filteredDiscoverRows.length,
       maxAutoFillFetches: 5,
@@ -1184,28 +1449,48 @@ export function ModelsPage() {
     accessToken: apiHfToken,
     online,
   });
+  const [runConfigOpenCoordinator] = useState(
+    () => new RunConfigOpenCoordinator(),
+  );
+  const [runConfigOpening, setRunConfigOpening] = useState<{
+    modelId: string;
+    controller: AbortController;
+  } | null>(null);
+  useEffect(() => {
+    return () => runConfigOpenCoordinator.cancel();
+  }, [runConfigOpenCoordinator, selectedId]);
 
   const handleSelect = useCallback(
     (id: string) => {
+      autoPreviewIdRef.current = null;
+      runConfigOpenCoordinator.cancel();
+      setRunConfigOpening(null);
       void navigate({
         to: "/hub",
         search: (prev) => ({ ...prev, model: id, file: undefined }),
       });
     },
-    [navigate],
+    [navigate, runConfigOpenCoordinator],
   );
   const handleCloseDetail = useCallback(() => {
+    runConfigOpenCoordinator.cancel();
+    setRunConfigOpening(null);
+    autoPreviewIdRef.current = null;
     // From split view, "Back to Hub" returns to the main hub feed (not the filtered list): leave
     // split mode, reset discover state, and clear the inline preview and channel.
-    if (allModelsView === "split") {
+    if (allModelsView === "split" && !isCompactViewport) {
       const next = lastNonSplitViewRef.current;
       setAllModelsViewState(next);
       writeAllModelsViewPreference(next);
       const preset = findChannel(DEFAULT_DISCOVER_CHANNEL);
-      setDiscoverFormat(preset?.format ?? "gguf");
+      setDiscoverFormat(preset?.format ?? "recommended");
       setSortBy(preset?.sort ?? "trendingScore");
       setDirection("desc");
-      setCapabilityFilter("all");
+      setCapabilityFilters([]);
+      setDatasetModalities([]);
+      setSearchFilters({});
+      setUploaderPick(null);
+      setFirstPickArmed(true);
       setSortBrowseActive(false);
       setQuery("");
       void navigate({
@@ -1218,20 +1503,29 @@ export function ModelsPage() {
       to: "/hub",
       search: (prev) => ({ ...prev, model: undefined }),
     });
-  }, [navigate, allModelsView]);
+  }, [navigate, allModelsView, isCompactViewport, runConfigOpenCoordinator]);
   const handleQueryChange = useCallback(
     (next: string) => {
       if (next.trim() === "") {
         const preset = findChannel(DEFAULT_DISCOVER_CHANNEL);
-        setCapabilityFilter("all");
+        setCapabilityFilters([]);
+        setDatasetModalities([]);
+        setSearchFilters({});
+        setUploaderPick(null);
+        setFirstPickArmed(true);
         setSortBrowseActive(false);
         if (preset) {
           setDiscoverFormat(preset.format);
           setSortBy(preset.sort);
           setDirection("desc");
         }
+      } else if (query.trim() === "") {
+        // A new search starts on every uploader (Unsloth's still listed first), whatever was picked.
+        setUploaderPick(null);
       }
-      if (urlModel || urlSection) {
+      // Clearing the split view's auto-picked preview only re-picks it: 2 navigations per key (#15221).
+      const openedModel = !!urlModel && urlModel !== autoPreviewIdRef.current;
+      if (openedModel || urlSection) {
         void navigate({
           to: "/hub",
           search: (prev) => ({
@@ -1244,7 +1538,7 @@ export function ModelsPage() {
       }
       setQuery(next);
     },
-    [urlSection, urlModel, navigate],
+    [query, urlSection, urlModel, navigate],
   );
 
   useEffect(() => {
@@ -1278,22 +1572,34 @@ export function ModelsPage() {
     urlModel,
   ]);
 
-  // Track the last non-split layout so leaving split mode restores it.
   useEffect(() => {
     if (allModelsView !== "split") {
       lastNonSplitViewRef.current = allModelsView;
     }
   }, [allModelsView]);
 
+  // Narrowing below lg drops the auto-picked preview so the rows show; a model the user opened stays.
+  useEffect(() => {
+    if (!isCompactViewport || allModelsView !== "split") return;
+    if (!urlModel || urlModel !== autoPreviewIdRef.current) return;
+    autoPreviewIdRef.current = null;
+    void navigate({
+      to: "/hub",
+      search: (prev) => ({ ...prev, model: undefined, file: undefined }),
+      replace: true,
+    });
+  }, [isCompactViewport, allModelsView, urlModel, navigate]);
+
   // Split view previews the first row so the detail pane isn't empty. Feed mode included: split
   // view shows only the master list, so its first row lands on a real README, not a placeholder.
   useEffect(() => {
-    if (allModelsView !== "split" || urlModel) return;
+    if (allModelsView !== "split" || urlModel || isCompactViewport) return;
     // Use the filtered rows the master pane renders so the preview never lands on a filtered-out row.
     const firstId = isDiscoverTab
       ? listRows[0]?.id
       : (filteredCachedRows[0]?.id ?? filteredLocalRows[0]?.id);
     if (!firstId) return;
+    autoPreviewIdRef.current = firstId;
     void navigate({
       to: "/hub",
       search: (prev) => ({ ...prev, model: firstId, file: undefined }),
@@ -1302,6 +1608,7 @@ export function ModelsPage() {
   }, [
     allModelsView,
     urlModel,
+    isCompactViewport,
     isDiscoverTab,
     listRows,
     filteredCachedRows,
@@ -1310,14 +1617,19 @@ export function ModelsPage() {
   ]);
 
   useEffect(() => {
-    if (!isModelDiscover || !sectionChannelId) return;
+    // A capability link clears the section itself; applying the preset would reset its filter.
+    if (!isModelDiscover || !sectionChannelId || urlCapability) return;
     const preset = findChannel(sectionChannelId);
     if (!preset) return;
     setDiscoverFormat(preset.format);
     setSortBy(preset.sort);
     setDirection("desc");
-    setCapabilityFilter("all");
-  }, [isModelDiscover, sectionChannelId]);
+    setCapabilityFilters([]);
+    setDatasetModalities([]);
+    setSearchFilters({});
+    setUploaderPick(null);
+    setFirstPickArmed(true);
+  }, [isModelDiscover, sectionChannelId, urlCapability]);
   const handleManageLocalFolders = useCallback(
     () => setFoldersDialogOpen(true),
     [],
@@ -1334,16 +1646,24 @@ export function ModelsPage() {
         selectedModel,
         activeCheckpoint,
         activeGgufVariant,
+        loadedIsMlx === true,
       ),
-    [activeCheckpoint, activeGgufVariant, selectedModel],
+    [activeCheckpoint, activeGgufVariant, loadedIsMlx, selectedModel],
   );
 
   const isLoadingThisModel = useMemo(() => {
     if (!loadingModel || !selectedModel) return false;
-    return modelIdsMatch(loadingModel.id, selectedModel.resource.runId);
+    return residentModelIdMatches(
+      loadingModel.id,
+      selectedModel.id,
+      selectedModel.loadId,
+      selectedModel.hubRepoId,
+      selectedModel.path,
+      selectedModel.displayId,
+    );
   }, [loadingModel, selectedModel]);
 
-  const { vramInfo, minMemory } = useHubModelVram(selectedModel, gpu);
+  const { vramInfo } = useHubModelVram(selectedModel, gpu);
 
   const gpuLabel = gpu.available
     ? `${Math.round(gpu.dedicatedMemoryTotalGb)} GiB`
@@ -1360,322 +1680,6 @@ export function ModelsPage() {
     gpu.cpuCore > 0 && gpu.cpuThread > 0
       ? `${gpu.cpuCore}/${gpu.cpuThread}`
       : "Unavailable";
-
-  const openNewChat = useCallback(() => {
-    void navigate({ to: "/chat", search: { new: crypto.randomUUID() } });
-  }, [navigate]);
-  const runSelectedModel = useCallback(
-    (opts: ModelLoadOptions, isDownloaded: boolean) => {
-      if (!selectedModel) return;
-      const runId = selectedModel.resource.runId;
-      // An image / video model is run by its own page, not by chat: loading it here evicted
-      // the resident chat model for a llama.cpp load that could only fail. Same resolution
-      // and destination the chat picker uses, so both surfaces route a pick identically.
-      // `task` is not optional here: only CachedModelRepo carries pipelineTag, so every
-      // cached GGUF repo (the reported MiniMax-H3 case) reports its modality on `task`.
-      const mediaPage = studioPageForTask(
-        taskForMediaPick(selectedModel.pipelineTag, selectedModel.task) ?? undefined,
-      );
-      // The target pages read a routed `model` as a Hub id, so a runId that is a PATH would
-      // arrive as a repo that does not exist -- prefer the Hub id, which loads the same copy
-      // since the loader reuses whichever cache root holds it. That covers a filesystem row
-      // (left on today's route, and the backend preflight now refuses it by name) and a
-      // cached repo the inventory pinned to its snapshot directory, whose symlinked entries
-      // the pages' containment check rejects anyway.
-      const routeId = runId && !looksLikeLocalPath(runId) ? runId : selectedModel.hubRepoId;
-      if (
-        mediaPage &&
-        routableToMediaPage(selectedModel.kind, selectedModel.localSource) &&
-        routeId
-      ) {
-        void navigate({
-          to: `/${mediaPage}`,
-          // `quant` is consumed verbatim as a gguf filename, so a label rides `ggufQuant`.
-          search: diffusionRouteSearch(routeId, {
-            ggufVariant: opts.ggufVariant ?? null,
-          }),
-        });
-        return;
-      }
-      const configIdentity = modelConfigIdentity(
-        selectedModel.kind,
-        selectedModel.resource,
-      );
-      // A cached repo used to be keyed by its snapshot path (its runId); move that record over first.
-      adoptLegacyConfigKey(configIdentity, runId, opts.ggufVariant);
-      const resolvedConfig = resolveInitialConfig(
-        configIdentity,
-        opts.ggufVariant,
-      );
-      const rememberedConfig = resolvedConfig.remembered
-        ? resolvedConfig.config
-        : null;
-      const previousConfig = currentRuntimePerModelConfig({
-        includeMaxSeqLength: true,
-      });
-      const hasAppliedConfig = applyModelLoadConfigToRuntime(rememberedConfig);
-      void selectModel({
-        id: runId,
-        ggufVariant: opts.ggufVariant,
-        isDownloaded,
-        expectedBytes: opts.expectedBytes,
-        keepSpeculative: hasAppliedConfig,
-        throwOnError: true,
-        previousConfig,
-        // The runtime store is not enough: applyPerModelConfigToRuntime has no field
-        // for the launch flags, and /load only inherits them from the SAME resident
-        // model, so a cold launch or a switch from another model ran without the
-        // arguments this model was remembered with.
-        ...(rememberedConfig ? { config: rememberedConfig } : {}),
-      })
-        .then(() => {
-          // Read fresh: the load is async, so the checkpoint may have changed.
-          const store = useChatRuntimeStore.getState();
-          if (!modelIdsMatch(store.params.checkpoint, runId)) {
-            store.setCheckpoint(runId, opts.ggufVariant ?? null);
-          }
-        })
-        .catch(() => undefined);
-      openNewChat();
-    },
-    [navigate, openNewChat, selectModel, selectedModel],
-  );
-  const handleLoad = useCallback(
-    (opts: ModelLoadOptions) =>
-      runSelectedModel(opts, selectedModel?.isDownloaded ?? true),
-    [runSelectedModel, selectedModel],
-  );
-
-  // Full-page per-model settings. Local state, not a URL param: a deep link would need the row re-resolved.
-  const [settingsTarget, setSettingsTarget] = useState<ModelPickTarget | null>(
-    null,
-  );
-  // Opening settings is where a stale read costs something: the editor is seeded once and Apply
-  // reloads with what it seeded. Resolving a target is openModelSettings' own read.
-  useEffect(() => {
-    if (settingsTarget) void refreshResidentModelStatus();
-  }, [settingsTarget, refreshResidentModelStatus]);
-  // Bumped per open so a slow lookup for an abandoned row cannot land on the chosen one.
-  const settingsOpenSeq = useRef(0);
-  const openModelSettings = useCallback(
-    async (row: CachedInventoryRow | LocalInventoryRow) => {
-      const openSeq = ++settingsOpenSeq.current;
-      // Before anything reads the store: the status effect watches settingsTarget. Every path out
-      // seeds the editor from the store and Apply reloads with that, so a stale read misconfigures.
-      await refreshResidentModelStatus();
-      if (settingsOpenSeq.current !== openSeq) return;
-      // loadId is what the loader accepts; repoId is only a display/API alias.
-      const id = row.loadId;
-      // Every name this row answers to.
-      const rowAliases =
-        row.kind === "local"
-          ? [id, row.repoId, row.path]
-          : [id, row.repoId, row.cachePath];
-      // Cached repo rows carry no quant, and a null variant keys the config to `repo::` while the loader reads `repo::Q4_K_M`.
-      let ggufVariant = settingsGgufVariantForRow(row);
-      if (!ggufVariant && row.isGguf && row.capabilities.requiresVariant) {
-        // A local row only carries a repo id inside the HF cache, so a plain folder of quants has
-        // none while still needing one; the listing scans a path in the same position.
-        const repoId =
-          row.kind === "cache" ? row.repoId : (row.repoId ?? row.path ?? null);
-        if (repoId) {
-          try {
-            const res = await listGgufVariants(repoId, hfApiToken(hfToken), {
-              preferLocalCache: true,
-              localPath:
-                row.kind === "local" ? row.path : (row.cachePath ?? null),
-            });
-            const downloaded = res.variants.filter((v) => v.downloaded);
-            // Re-read after this await too: the lookup hits the network, and a switch during it would
-            // leave the branch below on the displaced model's quant. Against the server, not the store:
-            // nothing pushes an API switch into this tab.
-            await refreshResidentModelStatus();
-            if (settingsOpenSeq.current !== openSeq) return;
-            const settled = useChatRuntimeStore.getState();
-            const settledCheckpoint =
-              settled.params.checkpoint &&
-              !isExternalModelId(settled.params.checkpoint)
-                ? settled.params.checkpoint
-                : null;
-            const settledIsActive = rowAliases.some((alias) =>
-              modelIdsMatch(alias, settledCheckpoint),
-            );
-            ggufVariant =
-              // Loaded quant, then repo default, then whatever is on disk, mirroring LocalOnDeviceCard.
-              (settledIsActive
-                ? downloaded.find((v) =>
-                    ggufVariantsMatch(v.quant, settled.activeGgufVariant),
-                  )?.quant
-                : undefined) ??
-              downloaded.find((v) =>
-                ggufVariantsMatch(v.quant, res.default_variant),
-              )?.quant ??
-              downloaded[0]?.quant ??
-              null;
-          } catch {
-            ggufVariant = null;
-          }
-        }
-        if (!ggufVariant) {
-          // A model needing a quant cannot be configured without one: the picker matches variants exactly.
-          toast.error("Couldn't determine which quant to configure.", {
-            description:
-              "Settings for this model are per quant. Check the connection or the model's cache, then try again.",
-          });
-          return;
-        }
-      }
-      // The lookup is async: without this, whichever call finished last would win.
-      if (settingsOpenSeq.current !== openSeq) {
-        return;
-      }
-      // A repo in a previous cache loads by snapshot path, so `id` ends in the revision hash.
-      const configId = row.kind === "cache" ? row.repoId : id;
-      const leaf = configId.split(/[\\/]/).filter(Boolean).pop() ?? configId;
-      setSettingsTarget({
-        id,
-        configId,
-        displayName: ggufVariant ? `${leaf} · ${ggufVariant}` : leaf,
-        ggufVariant,
-        isGguf: row.isGguf,
-        apiLoadable:
-          row.isGguf &&
-          (row.kind !== "local" || row.source !== LOCAL_MODEL_SOURCE.OLLAMA),
-        meta: {
-          source: "local",
-          isLora: row.modelFormat === "adapter",
-          ggufVariant: ggufVariant ?? undefined,
-          isGguf: row.isGguf,
-          // A partial opens settings too; claiming complete would skip download progress.
-          isDownloaded: !row.partial,
-          // Not on inventory rows; ModelConfigPage reads the GGUF header itself.
-          contextLength: null,
-        },
-      });
-    },
-    [activeCheckpoint, activeGgufVariant, hfToken, refreshResidentModelStatus],
-  );
-  // Applying loads the model with exactly these settings, already persisted by ModelConfigPage.
-  const runSettingsTarget = useCallback(
-    (config: PerModelConfig) => {
-      const target = settingsTarget;
-      if (!target) return;
-      const previousConfig = currentRuntimePerModelConfig({
-        includeMaxSeqLength: true,
-      });
-      applyPerModelConfigToRuntime(config);
-      setSettingsTarget(null);
-      void selectModel({
-        id: target.id,
-        source: "local",
-        ggufVariant: target.ggufVariant ?? undefined,
-        isGguf: target.isGguf,
-        // A partial row opens settings too; claiming complete would skip download progress.
-        isDownloaded: target.meta.isDownloaded,
-        isLora: target.meta.isLora,
-        keepSpeculative: true,
-        forceReload: true,
-        // The submitted config, not only its echo in the runtime store: the store
-        // does not carry llamaExtraArgs, so without this the load omits the field
-        // and the route keeps the resident server's old list. Applying an edit, or
-        // clearing the box, would then do nothing on this page.
-        config,
-        previousConfig,
-      }).catch(() => undefined);
-    },
-    [selectModel, settingsTarget],
-  );
-  const handleLoadLocal = useCallback(
-    (opts: ModelLoadOptions = {}) => runSelectedModel(opts, true),
-    [runSelectedModel],
-  );
-  const handleTrain = useCallback(() => {
-    // Hub → train integration ships in a later PR.
-  }, []);
-  // Opened from the on-device card, which passes in the quant it already resolved.
-  const openSelectedModelSettings = useCallback(
-    async (ggufVariant: string | null, quantIsUserPicked = false) => {
-      if (!selectedModel) return;
-      // Shared with openModelSettings: another row's pending lookup must not land here.
-      const openSeq = ++settingsOpenSeq.current;
-      // Unconditional, as in openModelSettings: the editor seeds from the store and Apply reloads it.
-      await refreshResidentModelStatus();
-      if (settingsOpenSeq.current !== openSeq) return;
-      let variant = ggufVariant;
-      // The card derived this quant from the store's active variant. A user-picked quant stands.
-      if (!quantIsUserPicked) {
-        const settled = useChatRuntimeStore.getState();
-        const settledCheckpoint =
-          settled.params.checkpoint &&
-          !isExternalModelId(settled.params.checkpoint)
-            ? settled.params.checkpoint
-            : null;
-        // Every name this model answers to, as the row menu path matches them.
-        const aliases = [
-          selectedModel.resource.runId,
-          selectedModel.resource.repoId,
-          selectedModel.resource.localPath,
-        ];
-        if (
-          settled.activeGgufVariant &&
-          aliases.some((alias) => modelIdsMatch(alias, settledCheckpoint))
-        ) {
-          variant = settled.activeGgufVariant;
-        }
-      }
-      // The card passes null while its lookup is pending or failed, so guard as openModelSettings does.
-      if (!variant && selectedModel.isGguf && selectedModel.requiresVariant) {
-        toast.error("Couldn't determine which quant to configure.", {
-          description:
-            "Settings for this model are per quant. Check the connection or the model's cache, then try again.",
-        });
-        return;
-      }
-      const id = selectedModel.resource.runId;
-      const configId = modelConfigIdentity(
-        selectedModel.kind,
-        selectedModel.resource,
-      );
-      // As in runSelectedModel: the editor seeds from this key, so the move must happen first.
-      adoptLegacyConfigKey(configId, id, variant);
-      const leaf = configId.split(/[\\/]/).filter(Boolean).pop() ?? configId;
-      setSettingsTarget({
-        id,
-        configId,
-        displayName: variant ? `${leaf} · ${variant}` : leaf,
-        ggufVariant: variant,
-        isGguf: selectedModel.isGguf,
-        apiLoadable:
-          selectedModel.isGguf &&
-          selectedModel.localSource !== LOCAL_MODEL_SOURCE.OLLAMA,
-        meta: {
-          source: "local",
-          isLora: selectedModel.modelFormat === "adapter",
-          ggufVariant: variant ?? undefined,
-          isGguf: selectedModel.isGguf,
-          isDownloaded: selectedModel.isDownloaded,
-          contextLength: null,
-        },
-      });
-    },
-    [selectedModel, refreshResidentModelStatus],
-  );
-  // Whether the settings page is open on the loaded model, so it can show the live launch config.
-  // A GGUF off disk loads by path but is reported by its public id, so the row's path and its
-  // settings identity are both offered as aliases; a loose .gguf carries no variant.
-  const settingsTargetIsStandaloneFile =
-    settingsTarget !== null &&
-    settingsTarget.ggufVariant == null &&
-    settingsTarget.id.toLowerCase().endsWith(".gguf");
-  const settingsTargetIsResident =
-    settingsTarget !== null &&
-    residentModelIdMatches(
-      activeCheckpoint,
-      settingsTarget.id,
-      settingsTarget.configId,
-    ) &&
-    (settingsTargetIsStandaloneFile ||
-      ggufVariantsMatch(activeGgufVariant, settingsTarget.ggufVariant));
   const handleSearchHub = useCallback(
     (next: string) => {
       const trimmed = next.trim();
@@ -1683,10 +1687,13 @@ export function ModelsPage() {
       setModelsTab("discover");
       setResourceType("models");
       setDiscoverFormat("all");
-      setCapabilityFilter("all");
+      setCapabilityFilters([]);
+      setDatasetModalities([]);
+      setSearchFilters({});
       setSortBrowseActive(false);
       // Base models come from other publishers, so search the whole Hub.
-      setOwnerScope("all");
+      setUploaderPick(null);
+      setFirstPickArmed(true);
       setQuery(trimmed);
       void navigate({
         to: "/hub",
@@ -1699,7 +1706,124 @@ export function ModelsPage() {
         }),
       });
     },
-    [navigate, setModelsTab, setOwnerScope],
+    [navigate, setModelsTab],
+  );
+  const openRunSettingsInChat = useCallback(
+    (request: ModelConfigHandoffRequest) => {
+      const chatRuntime = useChatRuntimeStore.getState();
+      chatRuntime.setActiveThreadId(null);
+      chatRuntime.setActiveProjectId(null);
+      chatRuntime.setIncognito(false);
+      requestModelConfigHandoff(request);
+      const { requestId } = request;
+      void navigate({ to: "/chat", search: { new: requestId } }).catch(() => {
+        clearModelConfigHandoff(requestId);
+      });
+    },
+    [navigate],
+  );
+
+  const handleRunNpu = useCallback(
+    (model: NpuModel) =>
+      openRunSettingsInChat({
+        requestId: createModelConfigHandoffRequestId(),
+        id: model.model_path,
+        displayName: model.id,
+        meta: {
+          source: "local",
+          isLora: false,
+          isDownloaded: true,
+          isVision: model.supports_vision,
+          contextLength: model.max_context_length,
+        },
+      }),
+    [openRunSettingsInChat],
+  );
+
+  const handleRun = useCallback(
+    async (
+      selection: HubModelRunSelection,
+      mediaPage: ReturnType<typeof studioPageForTask> | "audio",
+    ) => {
+      if (!selectedModel) return;
+      if (mediaPage) {
+        runConfigOpenCoordinator.cancel();
+        setRunConfigOpening(null);
+        if (
+          !selectedModel.hubRepoId ||
+          !routableToMediaPage(selectedModel.kind, selectedModel.localSource)
+        ) {
+          return;
+        }
+        void navigate({
+          to: `/${mediaPage}`,
+          search:
+            mediaPage === "audio"
+              ? audioPickSearch(selectedModel.hubRepoId, {
+                  ...selection,
+                  task: hubAudioTask(
+                    selectedModel,
+                    taskForMediaPick(
+                      selectedModel.pipelineTag,
+                      selectedModel.task,
+                    ),
+                  ),
+                  audioType: selectedModel.audioType,
+                  isGguf: selectedModel.isGguf,
+                  loadId: selectedModel.loadId,
+                })
+              : diffusionRouteSearch(selectedModel.hubRepoId, selection),
+        });
+        return;
+      }
+      if (
+        hubAudioRunRefused(
+          selectedModel,
+          taskForMediaPick(selectedModel.pipelineTag, selectedModel.task),
+        )
+      ) {
+        toast.error(
+          `${selectedModel.hubRepoId} is not an audio model Unsloth can run yet. The Audio page lists the families it supports.`,
+          { duration: 7000 },
+        );
+        return;
+      }
+      const controller = runConfigOpenCoordinator.begin();
+      setRunConfigOpening({ modelId: selectedModel.id, controller });
+      try {
+        await waitForRunConfigRefresh(
+          refreshResidentModelStatus(),
+          controller.signal,
+        );
+        if (controller.signal.aborted) return;
+        const requestId = createModelConfigHandoffRequestId();
+        const request = createHubModelConfigHandoff({
+          requestId,
+          model: selectedModel,
+          selection,
+        });
+        if (!request) {
+          toast.error("Couldn't open run settings.", {
+            description:
+              "The model or selected quantization is no longer available to run.",
+          });
+          return;
+        }
+        openRunSettingsInChat(request);
+      } finally {
+        runConfigOpenCoordinator.finish(controller);
+        setRunConfigOpening((current) =>
+          current?.controller === controller ? null : current,
+        );
+      }
+    },
+    [
+      navigate,
+      openRunSettingsInChat,
+      refreshResidentModelStatus,
+      runConfigOpenCoordinator,
+      selectedModel,
+    ],
   );
 
   const inspectorRuntime = useMemo(
@@ -1707,8 +1831,6 @@ export function ModelsPage() {
       isActive,
       activeGgufVariant,
       isLoadingThisModel,
-      loadingPhase: loadProgress?.phase,
-      minMemory,
       vramInfo,
       gpuGb: inferenceGpu.available ? inferenceGpu.memoryTotalGb : undefined,
       gpuCount: inferenceGpu.deviceCount,
@@ -1721,8 +1843,6 @@ export function ModelsPage() {
       isActive,
       activeGgufVariant,
       isLoadingThisModel,
-      loadProgress?.phase,
-      minMemory,
       vramInfo,
       inferenceGpu.available,
       inferenceGpu.memoryTotalGb,
@@ -1733,31 +1853,24 @@ export function ModelsPage() {
 
   const inspectorActions = useMemo(
     () => ({
-      onLoad: handleLoad,
-      onLoadLocal: handleLoadLocal,
-      onUseInChat: openNewChat,
-      onEject: () => void ejectModel(),
-      onTrain: handleTrain,
       onInventoryChange: refreshInventory,
       onSearchHub: handleSearchHub,
-      onOpenSettings: openSelectedModelSettings,
+      onRun: handleRun,
+      runConfigPending: runConfigOpening?.modelId === selectedModel?.id,
     }),
     [
-      handleLoad,
-      handleLoadLocal,
-      openNewChat,
-      ejectModel,
-      handleTrain,
+      handleRun,
       handleSearchHub,
       refreshInventory,
-      openSelectedModelSettings,
+      runConfigOpening,
+      selectedModel?.id,
     ],
   );
 
   const catalogState = useMemo<ModelsCatalogState>(
     () => {
       const typeFilterActive =
-        !isDatasetMode && inventoryTypeFilter !== "all";
+        !isDatasetMode && inventoryCapabilities.length > 0;
       return {
         tab,
         discoverRows: listRows,
@@ -1769,8 +1882,6 @@ export function ModelsPage() {
         inventoryError,
         inventoryWarning,
         query,
-        activeCheckpoint,
-        activeGgufVariant,
         searchError,
         searchFailure,
         online,
@@ -1782,10 +1893,25 @@ export function ModelsPage() {
         manualFetchAvailable: discoverManualFetchAvailable,
         hasActiveFilters:
           !isFeedMode &&
-          (deferredFormatFilter !== "all" ||
-            deferredCapabilityFilter !== "all" ||
+          ((isModelDiscover && hasSearchFilters) ||
+            // A search lists every uploader, so picking Unsloth narrows it.
+            (isModelDiscover &&
+              uploaderPick !== null &&
+              ownerScope === "unsloth" &&
+              debouncedQuery.trim() !== "") ||
+            deferredFormatFilter !== "all" ||
+            deferredCapabilityFilters.length > 0 ||
+            (isDatasetMode &&
+              (deferredDatasetModalities.length > 0 ||
+                minRows !== undefined ||
+                maxRows !== undefined)) ||
             (tab === "downloaded" && typeFilterActive)),
         typeFilterActive,
+        // A single format filter makes every row's format dot the same; Recommended mixes GGUF and checkpoints.
+        showFormatDots:
+          isDatasetMode ||
+          deferredFormatFilter === "all" ||
+          deferredFormatFilter === "recommended",
       };
     },
     [
@@ -1796,8 +1922,6 @@ export function ModelsPage() {
       inventoryError,
       inventoryWarning,
       query,
-      activeCheckpoint,
-      activeGgufVariant,
       searchError,
       searchFailure,
       online,
@@ -1812,8 +1936,15 @@ export function ModelsPage() {
       discoverFetchIntent,
       discoverManualFetchAvailable,
       deferredFormatFilter,
-      deferredCapabilityFilter,
-      inventoryTypeFilter,
+      deferredCapabilityFilters,
+      deferredDatasetModalities,
+      minRows,
+      maxRows,
+      hasSearchFilters,
+      uploaderPick,
+      ownerScope,
+      debouncedQuery,
+      inventoryCapabilities,
     ],
   );
 
@@ -1834,7 +1965,6 @@ export function ModelsPage() {
       onRetry: handleRetrySearch,
       onInventoryChange: refreshInventory,
       onSwitchDevice: handleSwitchDevice,
-      onOpenModelSettings: openModelSettings,
     }),
     [
       handleSelect,
@@ -1843,7 +1973,6 @@ export function ModelsPage() {
       handleRetrySearch,
       refreshInventory,
       handleSwitchDevice,
-      openModelSettings,
     ],
   );
 
@@ -1887,16 +2016,10 @@ export function ModelsPage() {
               onRefresh={handleRetrySearch}
               isRefreshing={isLoading}
             />
-            {allModelsView === "grid" && listCount > 0 && (
-              <ResultListHeader isDataset={isDatasetMode} />
-            )}
           </div>
         </div>
       );
     }
-    const ownerToggle = isDatasetMode ? undefined : (
-      <OwnerScopeToggle value={ownerScope} onChange={setOwnerScope} />
-    );
     // Compact pill so it stays beside the view-mode tabs even in the narrow split pane.
     return (
       <div className="flex flex-col gap-3 pt-6">
@@ -1909,7 +2032,6 @@ export function ModelsPage() {
             view={allModelsView}
             onViewChange={setAllModelsView}
             onBack={handleBackToFeed}
-            actions={ownerToggle}
           />
         ) : (
           <HubListHeader
@@ -1917,11 +2039,7 @@ export function ModelsPage() {
             view={allModelsView}
             onViewChange={setAllModelsView}
             onBack={isSortBrowseMode ? handleBackToFeed : undefined}
-            actions={ownerToggle}
           />
-        )}
-        {allModelsView === "grid" && listCount > 0 && (
-          <ResultListHeader isDataset={isDatasetMode} />
         )}
       </div>
     );
@@ -1936,8 +2054,6 @@ export function ModelsPage() {
     listCount,
     allModelsView,
     setAllModelsView,
-    ownerScope,
-    setOwnerScope,
     isDatasetMode,
     feedTrendingRows,
     hubFeed.trending.isLoading,
@@ -1947,28 +2063,12 @@ export function ModelsPage() {
   ]);
 
   const downloadedHeader = useMemo(() => {
-    // Compact pills so they stay beside the view-mode tabs even in the narrow split pane.
-    const controls = (
-      <div className="flex min-w-0 items-center gap-1.5">
-        {!isDatasetMode && (
-          <InventoryTypeFilterControl
-            value={inventoryTypeFilter}
-            onChange={setInventoryTypeFilter}
-          />
-        )}
-        <InventorySortControl
-          value={inventorySort}
-          onChange={setInventorySort}
-        />
-      </div>
-    );
     return (
       <HubListHeader
         title="On device"
         count={filteredCachedRows.length + filteredLocalRows.length}
         view={allModelsView}
         onViewChange={setAllModelsView}
-        actions={controls}
       />
     );
   }, [
@@ -1976,19 +2076,24 @@ export function ModelsPage() {
     filteredLocalRows,
     allModelsView,
     setAllModelsView,
-    inventorySort,
-    setInventorySort,
-    inventoryTypeFilter,
-    isDatasetMode,
   ]);
 
-  const detailOpen = urlModel !== null;
-  const splitMode = allModelsView === "split";
-  // Unreachable under an opaque overlay: the detail view (full-page only) or settings.
-  const catalogCovered = (detailOpen && !splitMode) || settingsTarget !== null;
+  // NPU rows have no detail view; one left open would cover their list.
+  const detailOpen = urlModel !== null && !showNpuCatalog;
+  const splitMode = allModelsView === "split" && !showNpuCatalog;
+  const catalogCovered = detailOpen && !splitMode;
+
+  const catalogPaneRef = useRef<HTMLDivElement>(null);
+  const splitWidth = useHubSplitWidth();
+
+  const tour = useGuidedTourController({
+    id: "hub",
+    steps: useMemo(() => buildHubTourSteps({ catalogCovered }), [catalogCovered]),
+  });
 
   return (
     <div className="hub-page flex min-h-0 min-w-0 flex-1 basis-0 flex-col overflow-hidden bg-background">
+      <GuidedTour {...tour.tourProps} />
       <HubTopBar>
         <ModelsHeader
           cachedCount={visibleCachedCount}
@@ -1998,10 +2103,7 @@ export function ModelsPage() {
           gpuSharedLabel={gpuSharedLabel}
           ramLabel={ramLabel}
           coreLabel={coreLabel}
-          activeCheckpoint={activeCheckpoint}
-          activeGgufVariant={activeGgufVariant}
           onTitleClick={handleResetToDiscover}
-          onEject={() => void ejectModel()}
         />
         <ModelsToolbar
           tab={tab}
@@ -2015,56 +2117,92 @@ export function ModelsPage() {
           onResourceTypeChange={handleResourceTypeChange}
           formatFilter={formatFilter}
           onFormatFilterChange={setFormatFilter}
-          capabilityFilter={capabilityFilter}
-          onCapabilityFilterChange={setCapabilityFilter}
+          searchFilters={storedSearchFilters}
+          onSearchFiltersChange={handlePopoverSearchFiltersChange}
+          uploaders={uploaders}
+          uploadersChanged={uploaderPick !== null}
+          onUploadersChange={handlePopoverUploadersChange}
+          onResetFilters={handleResetPopoverFilters}
+          capabilityFilters={capabilityFilters}
+          onCapabilityFiltersChange={handlePopoverCapabilitiesChange}
+          isolateFirstCapability={firstPickArmed}
+          datasetModalities={datasetModalities}
+          onDatasetModalitiesChange={handlePopoverModalitiesChange}
           fitOnDeviceOnly={fitOnDeviceOnly}
           onFitOnDeviceOnlyChange={setFitOnDeviceOnly}
           onManageLocalFolders={handleManageLocalFolders}
           onFreeUpSpace={handleFreeUpSpace}
           onOpenFineTune={() => handleOpenList("finetune")}
+          npuAvailable={npuSource !== undefined}
+          inventorySort={inventorySort}
+          onInventorySortChange={setInventorySort}
+          inventoryCapabilities={inventoryCapabilities}
+          onInventoryCapabilitiesChange={handleInventoryCapabilitiesChange}
+          isolateFirstInventoryCapability={inventoryFirstPickArmed}
+          onResetInventoryFilters={handleResetInventoryFilters}
         />
       </HubTopBar>
 
       <div
         className={cn(
           "relative flex min-h-0 min-w-0 flex-1 basis-0",
-          // Split mode shares the top bar's centered --hub-measure column so the list lines up.
           splitMode
             ? "flex-col lg:mx-auto lg:w-full lg:max-w-[var(--hub-measure)] lg:flex-row"
             : "flex-col",
         )}
       >
         <div
+          ref={catalogPaneRef}
+          data-tour="hub-catalog"
           className={cn(
             "flex min-h-0 flex-col",
-            // Split mode keeps the catalog as a master pane that grows off a 460px floor; otherwise it
-            // fills the area and the detail view overlays it.
             splitMode
-              ? "flex-1 lg:w-[clamp(460px,32%,620px)] lg:max-w-[44%] lg:flex-none lg:shrink-0 lg:border-r lg:border-border/60"
+              ? cn(
+                  "flex-1 lg:flex-none lg:shrink-0 lg:border-r lg:border-border/60",
+                  splitWidth.width === null
+                    ? "lg:w-[clamp(460px,32%,620px)] lg:max-w-[44%]"
+                    : HUB_SPLIT_CUSTOM_WIDTH_CLASS,
+                )
               : "flex-1",
-            // A full-bleed opaque overlay, so the catalog leaves the tab order; else tabbing walks behind it.
+            // Opaque overlay: remove the catalog from the tab order.
             catalogCovered && "pointer-events-none",
           )}
+          style={splitMode ? splitWidth.style : undefined}
           aria-hidden={catalogCovered || undefined}
           inert={catalogCovered || undefined}
         >
-          <ModelsCatalog
-            state={catalogState}
-            pagination={catalogPagination}
-            handlers={catalogHandlers}
-            header={catalogHeader}
-            downloadedHeader={downloadedHeader}
-            resetScrollKey={filterResetSignature}
-            discoverView={allModelsView}
-            inventorySort={inventorySort}
-          />
+          {npuCatalogSource ? (
+            <NpuCatalogList
+              source={npuCatalogSource}
+              query={query}
+              onDevice={!isDiscoverTab}
+              onRun={handleRunNpu}
+            />
+          ) : (
+            <ModelsCatalog
+              state={catalogState}
+              pagination={catalogPagination}
+              handlers={catalogHandlers}
+              header={catalogHeader}
+              downloadedHeader={downloadedHeader}
+              resetScrollKey={filterResetSignature}
+              discoverView={allModelsView}
+              inventorySort={inventorySort}
+            />
+          )}
         </div>
 
+        {splitMode && !isCompactViewport && (
+          <HubSplitDivider
+            paneRef={catalogPaneRef}
+            width={splitWidth.width}
+            onWidthChange={splitWidth.setWidth}
+          />
+        )}
         {splitMode ? (
           detailOpen ? (
             <div
               className="hub-canvas z-20 flex min-h-0 flex-col max-lg:absolute max-lg:inset-0 lg:relative lg:min-w-0 lg:flex-1"
-              inert={settingsTarget !== null || undefined}
             >
               <HubDetailView
                 model={selectedModel}
@@ -2088,8 +2226,8 @@ export function ModelsPage() {
         ) : (
           detailOpen && (
             <div
+              data-tour="hub-detail"
               className="hub-canvas absolute inset-0 z-20 flex min-h-0 flex-col"
-              inert={settingsTarget !== null || undefined}
             >
               <HubDetailView
                 model={selectedModel}
@@ -2106,28 +2244,11 @@ export function ModelsPage() {
             </div>
           )
         )}
-
-        {/* Above the detail overlay (z-30), so settings do not stack behind a preview. */}
-        {settingsTarget && (
-          <div className="hub-canvas absolute inset-0 z-30 flex min-h-0 flex-col">
-            <HubModelSettingsView
-              target={settingsTarget}
-              loadedConfig={settingsTargetIsResident ? activeModelConfig : null}
-              loadedContextLength={
-                settingsTargetIsResident ? activeLoadedContextLength : null
-              }
-              onBack={() => setSettingsTarget(null)}
-              onRun={runSettingsTarget}
-              compact={splitMode}
-            />
-          </div>
-        )}
       </div>
 
       <OnDeviceFoldersDialog
         open={foldersDialogOpen}
         onOpenChange={setFoldersDialogOpen}
-        onInventoryChange={refreshInventory}
       />
       <FreeUpSpaceDialog
         open={freeUpSpaceOpen}

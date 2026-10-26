@@ -4,11 +4,18 @@ import ast
 import inspect
 import os
 from contextlib import nullcontext
+from importlib.metadata import version as installed_version
 from pathlib import Path
 from types import SimpleNamespace
 
+from packaging.version import Version
+
 
 VISION_PATH = Path(__file__).parents[1] / "unsloth" / "models" / "vision.py"
+
+# packaging/importlib.metadata instead of unsloth_zoo: importing zoo pulls in bitsandbytes and
+# CUDA, which is why this file rebuilds the function from source.
+TRANSFORMERS_VERSION = installed_version("transformers")
 
 
 def _load_function(name, namespace):
@@ -201,11 +208,15 @@ def test_wrapper_dispatch_preserves_normalization_and_selects_expected_path():
         "FastBaseModel": FakeFastBaseModel,
         "dtype_from_config": lambda config: "bfloat16",
         "_get_dtype": lambda dtype: dtype,
+        "_get_inference_mode_context_manager": lambda model: nullcontext(),
         "_unsloth_generate_accepts_kwarg": lambda model, name: False,
         "NUM_LOGITS_TO_KEEP": {architecture: None},
         "DEVICE_TYPE_TORCH": "cuda",
+        "Version": Version,
+        "transformers_version": TRANSFORMERS_VERSION,
         "_uses_flash_attention_for_generation": uses_flash_attention,
         "_clear_generation_caches": clear_generation_caches,
+        "_is_text_seq2seq_config": lambda config: False,
     }
     fast_generate = _load_function("unsloth_base_fast_generate", namespace)
 
@@ -269,8 +280,7 @@ def test_wrapper_dispatch_preserves_normalization_and_selects_expected_path():
 
 
 def test_flash_attention_fallback_pins_a_dynamic_cache():
-    # Delegating is not enough on its own: a static cache still reaches FlashAttention via
-    # an explicit kwarg, the caller's generation_config, or the model default.
+    # A static cache still reaches FlashAttention via a kwarg, generation_config, or the model default.
     namespace = {
         "torch": SimpleNamespace(
             Tensor = type("FakeTensor", (), {"shape": (1, 3)}),
@@ -284,11 +294,15 @@ def test_flash_attention_fallback_pins_a_dynamic_cache():
         "FastBaseModel": SimpleNamespace(for_inference = lambda model: None),
         "dtype_from_config": lambda config: "bfloat16",
         "_get_dtype": lambda dtype: dtype,
+        "_get_inference_mode_context_manager": lambda model: nullcontext(),
         "_unsloth_generate_accepts_kwarg": lambda model, name: False,
         "NUM_LOGITS_TO_KEEP": {"Qwen3VLForConditionalGeneration": None},
         "DEVICE_TYPE_TORCH": "cuda",
+        "Version": Version,
+        "transformers_version": TRANSFORMERS_VERSION,
         "_uses_flash_attention_for_generation": uses_flash_attention,
         "_clear_generation_caches": clear_generation_caches,
+        "_is_text_seq2seq_config": lambda config: False,
     }
     fast_generate = _load_function("unsloth_base_fast_generate", namespace)
 

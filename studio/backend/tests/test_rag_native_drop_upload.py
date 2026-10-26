@@ -84,9 +84,10 @@ def _doc(
 
 def test_signed_drop_is_copied_into_the_uploads_root(rag_home, tmp_path):
     source = _doc(tmp_path)
-    stored_path, filename = _save_native_path_upload(_sign(source))
+    stored_path, filename, content_hash = _save_native_path_upload(_sign(source))
 
     assert filename == "notes.txt"
+    assert content_hash == hashlib.sha256(source.read_bytes()).hexdigest()
     # Copied, not referenced: ingestion must not read from wherever the user dragged from.
     assert os.path.realpath(stored_path) != os.path.realpath(source)
     with open(stored_path, encoding = "utf-8") as handle:
@@ -103,7 +104,7 @@ def test_forged_signature_is_rejected(rag_home, tmp_path):
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"operation": "load-model"},  # a model grant cannot be spent as an attachment
+        {"operation": "load-model"},
         {"path_kind": "model"},
     ],
 )
@@ -141,7 +142,6 @@ def test_grant_is_single_use(rag_home, tmp_path):
     source = _doc(tmp_path)
     lease = _sign(source)
     _save_native_path_upload(lease)
-    # Replaying the same nonce must not mint a second read of the path.
     with pytest.raises(HTTPException):
         _save_native_path_upload(lease)
 

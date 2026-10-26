@@ -4,16 +4,14 @@
 import { authFetch } from "@/features/auth";
 import { getInventoryVersion } from "../stores/inventory-events";
 
-// Infra models hidden from browse/preview lists (Hub Discover, the chat model
-// selector, and local on-device rows). Mirrors the backend
-// `utils.hidden_models`: the RAG embedding model, STT dictation models, and the
-// llama.cpp validation probe are not usable chat models. Server-confirmed cache
-// rows are trusted because the backend applies variant-aware filtering.
-// Optimistic cache rows still use these needles until the server confirms them.
-// The dynamic matchers fetched from `/api/hub/hidden-models` add the user's
-// configured embedder as exact repo ids and exact resolved paths, never
-// substring needles. Per-repo views are not filtered, so reinstall flows still
-// show downloaded files.
+// Infra models hidden from browse/preview lists (Hub Discover, the chat model selector, and local
+// on-device rows). Mirrors the backend `utils.hidden_models`: the RAG embedding model, STT
+// dictation models, and the llama.cpp validation probe are not usable chat models. Server-confirmed
+// cache rows are trusted because the backend applies variant-aware filtering. Optimistic cache rows
+// still use these needles until the server confirms them. The dynamic matchers fetched from
+// `/api/hub/hidden-models` add the user's configured embedder and the Decision API models as exact
+// repo ids and exact resolved paths, never substring needles. Per-repo views are not filtered, so reinstall flows still show
+// downloaded files.
 const HIDDEN_NEEDLES = [
   "bge-small-en-v1.5", // RAG embedder: unsloth/bge-small-en-v1.5[-GGUF]
   "ggml-org/models", // llama.cpp validation probe repo
@@ -21,9 +19,8 @@ const HIDDEN_NEEDLES = [
 ];
 const HIDDEN_STT_REPOS = new Set([
   // Transformers safetensors repos and their whisper.cpp GGUF companions
-  // (unslothai/whisper-*-GGUF): STT-only, never chat models. The Qwen3-ASR
-  // GGUFs are here for the same reason: llama.cpp will load one as a chat
-  // model, where it only answers with transcripts.
+  // (unslothai/whisper-*-GGUF): STT-only, never chat models. The Qwen3-ASR GGUFs are here for the
+  // same reason: llama.cpp will load one as a chat model, where it only answers with transcripts.
   "unsloth/whisper-tiny",
   "unsloth/whisper-base",
   "unsloth/whisper-small",
@@ -36,6 +33,8 @@ const HIDDEN_STT_REPOS = new Set([
   "unslothai/whisper-large-v3-gguf",
   "unslothai/qwen3-asr-0.6b-gguf",
   "unslothai/qwen3-asr-1.7b-gguf",
+  // audio.cpp's umbrella repo, reached through audio.cpp catalog ids, never as a chat GGUF.
+  "audio-cpp/audio.cpp-gguf",
 ]);
 const HIDDEN_STT_CACHE_NAMES = [...HIDDEN_STT_REPOS].map((repo) =>
   repo.replace("/", "--"),
@@ -94,7 +93,6 @@ export function ensureHiddenModelMatchers(): Promise<void> {
   return matchersFetch;
 }
 
-/** True if any id/path is a hidden infra model. */
 export function isHiddenModelId(
   ...values: (string | null | undefined)[]
 ): boolean {
@@ -118,7 +116,6 @@ export function isHiddenModelId(
   });
 }
 
-/** Exact-match configured infra repos without hiding similarly named models. */
 export function isConfiguredHiddenModelId(
   configuredIds: ReadonlySet<string>,
   ...values: (string | null | undefined)[]

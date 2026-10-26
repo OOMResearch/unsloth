@@ -2,7 +2,6 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
   RUN_CHECKPOINT_INTERVAL_MS,
@@ -10,13 +9,14 @@ import {
   createRunCheckpointScheduler,
 } from "../src/features/chat/utils/run-checkpoint-scheduler.ts";
 
+import { readSrcAsync } from "./helpers/kit.ts";
+
 const INTERVAL = 1000;
 
 test("uses an eight-second production checkpoint interval", () => {
   assert.equal(RUN_CHECKPOINT_INTERVAL_MS, 8_000);
 });
 
-/** The scheduler reschedules from a promise continuation, so let those run. */
 async function flushMicrotasks(): Promise<void> {
   for (let i = 0; i < 8; i += 1) {
     await Promise.resolve();
@@ -105,7 +105,6 @@ test("waits for a slow checkpoint instead of stacking the next one behind it", a
   await clock.advance(INTERVAL);
   assert.equal(saves, 1);
 
-  // No timer is armed while the save is in flight.
   await clock.advance(INTERVAL * 10);
   assert.equal(saves, 1);
   assert.equal(clock.pending(), 0);
@@ -199,10 +198,7 @@ test("starting a thread twice keeps one schedule, and stopAll ends every thread"
 });
 
 test("the chat autosave drives the scheduler from runStart to runEnd", async () => {
-  const src = await readFile(
-    new URL("../src/features/chat/runtime-provider.tsx", import.meta.url),
-    "utf8",
-  );
+  const src = await readSrcAsync("features/chat/runtime-provider.tsx");
   assert.match(
     src,
     /createRunCheckpointScheduler\(/,

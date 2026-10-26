@@ -1,16 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2023-present Daniel Han-Chen & the Unsloth team. All rights reserved.
-#
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
-#
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU Affero General Public License for more details.
-#
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
@@ -28,6 +25,7 @@ __all__ = [
     "neutralize_inherited_custom_dtype",
     "resolve_dtype",
     "DTYPE_ALIASES",
+    "cast_mixed_linear_inputs",
 ]
 
 import os
@@ -123,6 +121,54 @@ def trusted_custom_dtype():
     if value == "":
         return "", False
     return value, value in _REGISTERED
+
+
+def _autocast_enabled(device_type):
+    try:
+        return torch.is_autocast_enabled(device_type)
+    except TypeError:
+        # torch < 2.4 takes no device argument and answers for CUDA only.
+        return torch.is_autocast_enabled()
+
+
+def _cast_input_to_weight_dtype(module, args):
+    if not args:
+        return None
+    x = args[0]
+    weight = module.weight
+    if (
+        not isinstance(x, torch.Tensor)
+        or not x.is_floating_point()
+        or x.dtype == weight.dtype
+        or _autocast_enabled(x.device.type)
+    ):
+        return None
+    return (x.to(weight.dtype),) + tuple(args[1:])
+
+
+_INPUT_CAST_DTYPES = frozenset((torch.float16, torch.bfloat16, torch.float32))
+
+
+def cast_mixed_linear_inputs(model, load_dtype):
+    """Outside autocast, cast inputs of Linears moved off load_dtype (Falcon-H1 / Nemotron-H fp16) to the weight dtype."""
+    hooked = 0
+    for module in model.modules():
+        if not isinstance(module, torch.nn.Linear) or getattr(
+            module, "_unsloth_casts_input_dtype", False
+        ):
+            continue
+        weight = getattr(module, "weight", None)
+        # Not is_floating_point(): FP8Linear / FbgemmFp8Linear keep float8 weights and quantize their own input.
+        if (
+            not isinstance(weight, torch.Tensor)
+            or weight.dtype not in _INPUT_CAST_DTYPES
+            or weight.dtype == load_dtype
+        ):
+            continue
+        module.register_forward_pre_hook(_cast_input_to_weight_dtype)
+        module._unsloth_casts_input_dtype = True
+        hooked += 1
+    return hooked
 
 
 # On import, before either package reads the variable.

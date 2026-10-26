@@ -13,6 +13,16 @@ from pathlib import Path
 
 import pytest
 
+
+def _shared_setup_1(code, no_torch_venv):
+    result = subprocess.run(
+        [no_torch_venv, "-c", code],
+        capture_output = True,
+        timeout = 30,
+    )
+    return result
+
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DATA_COLLATORS = REPO_ROOT / "studio" / "backend" / "utils" / "datasets" / "data_collators.py"
 CHAT_TEMPLATES = REPO_ROOT / "studio" / "backend" / "utils" / "datasets" / "chat_templates.py"
@@ -56,9 +66,6 @@ def no_torch_venv(request, tmp_path_factory):
     assert check.returncode != 0, f"torch should NOT be importable in fresh {py_version} venv"
 
     return str(venv_python)
-
-
-# ── AST structural checks ─────────────────────────────────────────────
 
 
 class TestDataCollatorsAST:
@@ -135,9 +142,6 @@ class TestChatTemplatesAST:
             )
 
 
-# ── data_collators.py: exec + dataclass instantiation in no-torch venv ──
-
-
 class TestDataCollatorsNoTorchVenv:
     """Run data_collators.py in an isolated no-torch venv, verify classes load."""
 
@@ -151,11 +155,7 @@ class TestDataCollatorsNoTorchVenv:
             exec(open({str(DATA_COLLATORS)!r}, encoding = "utf-8").read())
             print("OK: exec succeeded")
         """)
-        result = subprocess.run(
-            [no_torch_venv, "-c", code],
-            capture_output = True,
-            timeout = 30,
-        )
+        result = _shared_setup_1(code, no_torch_venv)
         assert (
             result.returncode == 0
         ), f"data_collators.py failed in no-torch venv:\n{result.stderr.decode()}"
@@ -173,11 +173,7 @@ class TestDataCollatorsNoTorchVenv:
             assert obj.processor is None, "processor should be None"
             print("OK: DataCollatorSpeechSeq2SeqWithPadding instantiated")
         """)
-        result = subprocess.run(
-            [no_torch_venv, "-c", code],
-            capture_output = True,
-            timeout = 30,
-        )
+        result = _shared_setup_1(code, no_torch_venv)
         assert (
             result.returncode == 0
         ), f"DataCollatorSpeechSeq2SeqWithPadding failed:\n{result.stderr.decode()}"
@@ -197,11 +193,7 @@ class TestDataCollatorsNoTorchVenv:
             assert obj.ignore_index == -100, "default ignore_index should be -100"
             print("OK: DeepSeekOCRDataCollator instantiated")
         """)
-        result = subprocess.run(
-            [no_torch_venv, "-c", code],
-            capture_output = True,
-            timeout = 30,
-        )
+        result = _shared_setup_1(code, no_torch_venv)
         assert result.returncode == 0, f"DeepSeekOCRDataCollator failed:\n{result.stderr.decode()}"
         assert b"OK: DeepSeekOCRDataCollator instantiated" in result.stdout
 
@@ -218,16 +210,9 @@ class TestDataCollatorsNoTorchVenv:
             assert obj.mask_input_tokens is True, "default mask_input_tokens should be True"
             print("OK: VLMDataCollator instantiated")
         """)
-        result = subprocess.run(
-            [no_torch_venv, "-c", code],
-            capture_output = True,
-            timeout = 30,
-        )
+        result = _shared_setup_1(code, no_torch_venv)
         assert result.returncode == 0, f"VLMDataCollator failed:\n{result.stderr.decode()}"
         assert b"OK: VLMDataCollator instantiated" in result.stdout
-
-
-# ── chat_templates.py: exec in no-torch venv ─────────────────────────
 
 
 class TestChatTemplatesNoTorchVenv:
@@ -263,6 +248,11 @@ class TestChatTemplatesNoTorchVenv:
             source = source.replace('from .format_detection import', 'from format_detection import')
             source = source.replace('from .model_mappings import', 'from model_mappings import')
             source = source.replace('from .iterable import', 'from iterable import')
+            # cells.py is stdlib-only, so the exec sites import the real module
+            # rather than another stub: the suite checks what actually ships.
+            sys.path.insert(0, {str(CHAT_TEMPLATES.parent)!r})
+            source = source.replace('from .cells import', 'from cells import')
+            source = source.replace('from .remote_images import', 'from remote_images import')
 
             exec(source)
 
@@ -271,11 +261,7 @@ class TestChatTemplatesNoTorchVenv:
             assert 'DEFAULT_ALPACA_TEMPLATE' in ns, "DEFAULT_ALPACA_TEMPLATE not defined after exec"
             print("OK: chat_templates.py exec succeeded")
         """)
-        result = subprocess.run(
-            [no_torch_venv, "-c", code],
-            capture_output = True,
-            timeout = 30,
-        )
+        result = _shared_setup_1(code, no_torch_venv)
         assert (
             result.returncode == 0
         ), f"chat_templates.py failed in no-torch venv:\n{result.stderr.decode()}"
@@ -309,24 +295,20 @@ class TestChatTemplatesNoTorchVenv:
             source = source.replace('from .format_detection import', 'from format_detection import')
             source = source.replace('from .model_mappings import', 'from model_mappings import')
             source = source.replace('from .iterable import', 'from iterable import')
+            sys.path.insert(0, {str(CHAT_TEMPLATES.parent)!r})
+            source = source.replace('from .cells import', 'from cells import')
+            source = source.replace('from .remote_images import', 'from remote_images import')
             exec(source, ns)
 
             assert 'DEFAULT_ALPACA_TEMPLATE' in ns, "DEFAULT_ALPACA_TEMPLATE not defined"
             assert 'Instruction' in ns['DEFAULT_ALPACA_TEMPLATE'], "Template content unexpected"
             print("OK: DEFAULT_ALPACA_TEMPLATE defined and valid")
         """)
-        result = subprocess.run(
-            [no_torch_venv, "-c", code],
-            capture_output = True,
-            timeout = 30,
-        )
+        result = _shared_setup_1(code, no_torch_venv)
         assert (
             result.returncode == 0
         ), f"DEFAULT_ALPACA_TEMPLATE check failed:\n{result.stderr.decode()}"
         assert b"OK: DEFAULT_ALPACA_TEMPLATE defined and valid" in result.stdout
-
-
-# ── format_conversion.py: AST + runtime tests ────────────────────────
 
 
 class TestFormatConversionAST:
@@ -351,7 +333,6 @@ class TestFormatConversionAST:
                         and child.module
                         and child.module.startswith("torch")
                     ):
-                        # This torch import must be inside a Try node.
                         found_in_try = False
                         for try_node in ast.walk(node):
                             if isinstance(try_node, ast.Try):
@@ -405,11 +386,16 @@ class TestFormatConversionNoTorchVenv:
             source = open({str(FORMAT_CONVERSION)!r}, encoding = "utf-8").read()
             source = source.replace('from .format_detection import', 'from format_detection import')
             source = source.replace('from .iterable import', 'from iterable import')
+            sys.path.insert(0, {str(FORMAT_CONVERSION.parent)!r})
+            source = source.replace('from .cells import', 'from cells import')
+            source = source.replace('from .remote_images import', 'from remote_images import')
             ns = {{'__name__': '__test__'}}
             exec(source, ns)
 
             # Test convert_chatml_to_alpaca with a simple dataset
             class FakeDataset:
+                column_names = ['messages']
+
                 def map(self, fn, **kw):
                     result = fn({{
                         'messages': [[
@@ -425,11 +411,7 @@ class TestFormatConversionNoTorchVenv:
             assert result['output'] == ['Hi there']
             print("OK: convert_chatml_to_alpaca works without torch")
         """)
-        result = subprocess.run(
-            [no_torch_venv, "-c", code],
-            capture_output = True,
-            timeout = 30,
-        )
+        result = _shared_setup_1(code, no_torch_venv)
         assert (
             result.returncode == 0
         ), f"convert_chatml_to_alpaca failed without torch:\n{result.stderr.decode()}"
@@ -466,6 +448,9 @@ class TestFormatConversionNoTorchVenv:
             source = open({str(FORMAT_CONVERSION)!r}, encoding = "utf-8").read()
             source = source.replace('from .format_detection import', 'from format_detection import')
             source = source.replace('from .iterable import', 'from iterable import')
+            sys.path.insert(0, {str(FORMAT_CONVERSION.parent)!r})
+            source = source.replace('from .cells import', 'from cells import')
+            source = source.replace('from .remote_images import', 'from remote_images import')
             ns = {{'__name__': '__test__'}}
             exec(source, ns)
 
@@ -485,18 +470,11 @@ class TestFormatConversionNoTorchVenv:
             assert convo[1]['role'] == 'assistant'
             print("OK: convert_alpaca_to_chatml works without torch")
         """)
-        result = subprocess.run(
-            [no_torch_venv, "-c", code],
-            capture_output = True,
-            timeout = 30,
-        )
+        result = _shared_setup_1(code, no_torch_venv)
         assert (
             result.returncode == 0
         ), f"convert_alpaca_to_chatml failed without torch:\n{result.stderr.decode()}"
         assert b"OK: convert_alpaca_to_chatml works without torch" in result.stdout
-
-
-# ── Negative controls ─────────────────────────────────────────────────
 
 
 class TestNegativeControls:
@@ -546,10 +524,8 @@ class TestNegativeControls:
             timeout = 60,
         )
         if result.returncode != 0:
-            # torchao install/resolution failed as expected.
             pass
         else:
-            # dry-run may miss dep issues; verify torch is absent instead.
             check = subprocess.run(
                 [no_torch_venv, "-c", "import torch"],
                 capture_output = True,

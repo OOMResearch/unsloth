@@ -4,26 +4,26 @@
 "use client";
 
 import { Spinner } from "@/components/ui/spinner";
-import { authFetch } from "@/features/auth";
 
 import { SandboxFiles } from "./sandbox-files-view";
 import { isSandboxFileList, type SandboxFile } from "./sandbox-files";
 import {
   preferSanitizedFullToolOutput,
+  toolResultText,
   useChatRuntimeStore,
   useChatPreferencesStore,
   useToolAwaitingApproval,
   useToolOutputFor,
   useToolPaneScope,
 } from "@/features/chat";
-import { stringifyToolResult } from "@/lib/strip-ansi";
 import type { ToolCallMessagePartComponent } from "@assistant-ui/react";
 import { useToolArgsStatus } from "@assistant-ui/react";
 import { CodeIcon } from "lucide-react";
-import { memo, useEffect, useRef, useState } from "react";
+import { memo } from "react";
 import { pythonToolImagePath } from "./python-tool-image-path";
+import { useSandboxImage } from "./use-sandbox-image";
 import { CopyBtn, ToolCodeCell } from "./tool-code-cell";
-import { toolArgText } from "./tool-arg-text";
+import { isToolCallRunning, toolArgText } from "./tool-arg-text";
 import {
   ToolFallbackContent,
   ToolFallbackRoot,
@@ -46,8 +46,7 @@ function isStructuredResult(val: unknown): val is StructuredResult {
     "text" in val &&
     "images" in val &&
     "sessionId" in val &&
-    // Persisted content can carry anything, and the card maps over this and
-    // reads name off each entry.
+    // Persisted content can carry anything, and the card reads name off each entry.
     isSandboxFileList(v.files)
   );
 }
@@ -59,80 +58,16 @@ function PythonToolImage({
   sessionId: string;
   filename: string;
 }) {
-  const imageKey = `${sessionId}\0${filename}`;
-  const [image, setImage] = useState<{ key: string; url: string } | null>(null);
-  const imageRef = useRef<HTMLImageElement>(null);
-  const [nearViewport, setNearViewport] = useState(
-    () => typeof IntersectionObserver === "undefined",
-  );
-
-  useEffect(() => {
-    if (nearViewport) {
-      return;
-    }
-    const element = imageRef.current;
-    if (!element) {
-      return;
-    }
-
-    const observer = new IntersectionObserver(
-      (entries) => {
-        if (entries.some((entry) => entry.isIntersecting)) {
-          setNearViewport(true);
-          observer.disconnect();
-        }
-      },
-      { rootMargin: "200px" },
-    );
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, [nearViewport]);
-
-  useEffect(() => {
-    if (!nearViewport) {
-      return;
-    }
-    const controller = new AbortController();
-    let objectUrl: string | null = null;
-
-    const load = async () => {
-      const response = await authFetch(
-        pythonToolImagePath(sessionId, filename),
-        {
-          signal: controller.signal,
-        },
-      );
-      if (!response.ok) {
-        return;
-      }
-
-      const blob = await response.blob();
-      if (controller.signal.aborted) {
-        return;
-      }
-
-      objectUrl = URL.createObjectURL(blob);
-      setImage({ key: imageKey, url: objectUrl });
-    };
-    load().catch(() => {
-      // A failed or cancelled image stays as its accessible alt text.
-    });
-
-    return () => {
-      controller.abort();
-      if (objectUrl) {
-        URL.revokeObjectURL(objectUrl);
-      }
-    };
-  }, [filename, imageKey, nearViewport, sessionId]);
+  // Shared hook: authed fetch, object URL lifetime, keyed by url so stale responses cannot land.
+  const { ref, state } = useSandboxImage(pythonToolImagePath(sessionId, filename));
 
   return (
     <img
-      ref={imageRef}
-      src={image?.key === imageKey ? image.url : undefined}
+      ref={ref}
+      src={state.status === "loaded" ? state.url : undefined}
       alt={filename}
       loading="lazy"
-      className="max-w-full rounded border border-border"
+      className="max-w-full rounded-lg border border-border"
     />
   );
 }
@@ -145,7 +80,7 @@ const PythonToolUIImpl: ToolCallMessagePartComponent = ({
 }) => {
   const code = toolArgText((args as { code?: unknown })?.code);
   const firstLine = code.split("\n")[0]?.slice(0, 60) ?? "";
-  const isRunning = status?.type === "running";
+  const isRunning = isToolCallRunning(status);
   // Args still streaming = the model is WRITING the code, not running it yet.
   const { propStatus } = useToolArgsStatus();
   const isWritingCode = isRunning && propStatus.code === "streaming";
@@ -161,13 +96,12 @@ const PythonToolUIImpl: ToolCallMessagePartComponent = ({
     files = result.files ?? [];
     sessionId = result.sessionId;
   } else if (result != null) {
-    output = stringifyToolResult(result);
+    output = toolResultText(result);
   } else {
     output = "";
   }
 
-  // Show the fuller live stream over a truncated result, keeping its exit
-  // status. Session-transient: after a reload only the result remains.
+  // Prefer the fuller live stream over a truncated result; after a reload only the result remains.
   const paneScope = useToolPaneScope();
   const fullOutput = useToolOutputFor(
     useChatRuntimeStore((s) => s.toolFullOutput),
@@ -176,12 +110,11 @@ const PythonToolUIImpl: ToolCallMessagePartComponent = ({
   );
   const displayOutput = preferSanitizedFullToolOutput(fullOutput, output);
 
-  // The gate only opens once the call parsed, so a pending approval means the script is
-  // written even while the args status still reads as streaming.
+  // The gate opens only once the call parsed, so pending approval means the script is written.
   const awaitingApproval = useToolAwaitingApproval(toolCallId);
   const isWriting = isWritingCode && !awaitingApproval;
   const collapseByDefault = useChatPreferencesStore(
-    (state) => state.collapseToolActivityByDefault,
+    (state) => state.toolVisibility === "collapsed",
   );
   const scriptCell = code ? (
     <div className="mt-1 pl-5">
@@ -196,12 +129,8 @@ const PythonToolUIImpl: ToolCallMessagePartComponent = ({
   ) : null;
 
   return (
-    // Status, output and images collapse from history; the executed script
-    // renders outside ToolFallbackContent so it stays visible on reopen
-    // (#7165) -- a script is an artifact, a one-line command is not.
-    // That holds only while collapseToolActivity is off; with it on the script
-    // moves inside the collapsible, behind one click. awaitingApproval is the
-    // exception: a decision about a script needs the script on screen.
+    // The script renders outside ToolFallbackContent so it stays visible on reopen, except with
+    // tool calls set to collapsed; awaiting approval always shows it. Created files stay outside.
     <ToolFallbackRoot
       defaultOpen={isRunning}
       awaitingApproval={awaitingApproval}
@@ -215,7 +144,6 @@ const PythonToolUIImpl: ToolCallMessagePartComponent = ({
       <ToolFallbackContent>
         {collapseByDefault && scriptCell}
         <div className="border-l-2 border-muted-foreground/20 pl-2">
-          {/* Output */}
           {isRunning ? (
             <>
               <div className="mt-2 flex items-center gap-2 text-sm text-muted-foreground">
@@ -243,10 +171,6 @@ const PythonToolUIImpl: ToolCallMessagePartComponent = ({
             </div>
           ) : null}
 
-          {/* Anything the script wrote, as a real download */}
-          <SandboxFiles sessionId={sessionId} files={files} />
-
-          {/* Images from Python tool execution */}
           {images.length > 0 && sessionId && (
             <div className="mt-2 flex flex-col gap-2">
               {images.map((filename) => (
@@ -260,6 +184,7 @@ const PythonToolUIImpl: ToolCallMessagePartComponent = ({
           )}
         </div>
       </ToolFallbackContent>
+      <SandboxFiles className="ml-5" sessionId={sessionId} files={files} />
     </ToolFallbackRoot>
   );
 };

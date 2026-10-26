@@ -3,13 +3,14 @@
 
 """Structured logging configuration via structlog.
 
-Environment-specific formats (JSON for prod, console for dev), ISO timestamps,
-context-var integration, log-level filtering, and logger caching.
+Environment-specific formats (JSON for prod, console for dev), ISO timestamps, context-var
+integration, log-level filtering, and logger caching.
 """
 
 import logging
 import os
 import sys
+import threading
 from typing import Optional
 
 import structlog
@@ -34,8 +35,7 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-# An exception whose message embeds a request body is not a few KB: a rejected binary upload
-# produced one 2.2 MB line.
+# Exception messages can embed whole request bodies, so their length is capped.
 _MAX_EXC_CHARS = _env_int("UNSLOTH_STUDIO_MAX_EXCEPTION_CHARS", 16384)
 _EXC_TAIL_CHARS = 2048
 # The middleware logs the same exception twice, rendered as a traceback and as str(exc), so bound both.
@@ -43,12 +43,9 @@ _MAX_ERROR_CHARS = 2048
 
 
 def _truncate_middle(text: str, limit: int, tail: int) -> str:
-    """Keep the head and the tail of `text`, saying how much was dropped.
-
-    The head holds the raising frame and the tail the exception type and message, so
-    both ends are worth keeping. `tail` is clamped so a cap smaller than the tail
-    cannot make the head negative and hand back nearly the whole string.
-    """
+    """Keep the head and the tail of `text`, saying how much was dropped. The head holds the raising
+    frame and the tail the exception type and message. `tail` is clamped so a cap smaller than the
+    tail cannot make the head negative and hand back the whole string."""
     if limit <= 0 or len(text) <= limit:
         return text
     tail = max(1, min(tail, limit // 4))
@@ -71,14 +68,11 @@ def truncate_exception(event_dict: dict) -> dict:
     error = event_dict.get("error")
     if isinstance(error, str):
         event_dict["error"] = _truncate_middle(error, message_cap, _EXC_TAIL_CHARS)
-    # f-string call sites interpolate the exception straight into the message
-    # (routes/inference.py: logger.error(f"...: {e}", exc_info = True)), so the event itself is a
-    # third copy that can carry the whole payload.
+    # f-string log calls put the exception into the event, a third copy that can carry the payload.
     event = event_dict.get("event")
     if isinstance(event, str):
         event_dict["event"] = _truncate_middle(event, message_cap, _EXC_TAIL_CHARS)
-    # logger.error("...: %s", exc) keeps the exception under positional_args and the chain has no
-    # PositionalArgumentsFormatter, so render and cap it here instead.
+    # No PositionalArgumentsFormatter in the chain, so render and cap "%s" args here.
     args = event_dict.get("positional_args")
     if isinstance(args, (list, tuple)) and args:
         event_dict["positional_args"] = [
@@ -104,32 +98,26 @@ def _plain_tracebacks_enabled() -> bool:
     )
 
 
-# NOT whitespace: RFC 8259 lets a parser skip leading space/tab, so json.loads(' {"event": ...}')
-# SUCCEEDS and a request-derived exception message could forge a record (CWE-117); "| " cannot
-# begin a JSON value.
+# '| ' cannot begin a JSON value; leading whitespace would let a message forge a record (CWE-117).
 _TRACEBACK_ECHO_PREFIX = "| "
 
 
-# Unicode's Bidi_Control set (PropList.txt), exactly what UAX #9 acts on and what UTR #36 /
-# Trojan Source (CVE-2021-42574) name; json.dumps already escapes these (ensure_ascii), so only
-# the echo would emit them raw. Deliberately NOT all of category Cf: U+200B-200D, U+00AD and
-# U+FEFF occur in ordinary text (ZWNJ in Persian/Arabic, ZWJ in emoji) and reorder nothing.
+# Bidi_Control set (CVE-2021-42574); not all of Cf since ZWSP, SHY, BOM occur in normal text.
 _BIDI_CONTROLS = frozenset("؜‎‏‪‫‬‭‮⁦⁧⁨⁩")
 
 
 def _escape_unprintable(text: str) -> str:
-    """Spell as ``\\uXXXX`` what a terminal would ACT on or stdout cannot encode, leaving
-    ordinary non-ASCII text readable. The JSON renderer used to cover all three for free:
+    """Spell as ``\\uXXXX`` what a terminal would ACT on or stdout cannot encode, leaving ordinary
+    non-ASCII text readable. The JSON renderer used to cover all three for free:
 
-    * **Lone surrogates** (reachable via ``json.loads('"\\ud800"')`` in a request body)
-      raise ``UnicodeEncodeError`` on a UTF-8 stdout, which inside an exception handler
-      loses the traceback AND replaces the original exception with the encoding error.
-    * **Terminal controls**: raw ESC lets request-derived text rewrite what the reader
-      sees, and a backspace run can rub out the prefix record forgery depends on.
-    * **Bidi controls** need no terminal -- any UAX #9 viewer reorders the line. Measured:
-      ``"| ValueError: rejected upload \\u202egnp.eliforp/sdaolpu/"`` DISPLAYS as
-      ``| ValueError: rejected upload /uploads/profile.png``. Escaped, not stripped, so
-      the record still says one was there.
+    * **Lone surrogates**, reachable through a request body, raise ``UnicodeEncodeError`` on a UTF-8
+      stdout, which inside an exception handler loses the traceback AND replaces the original
+      exception with the encoding error.
+    * **Terminal controls**: raw ESC lets request-derived text rewrite what the reader sees, and a
+      backspace run can rub out the prefix record forgery depends on.
+    * **Bidi controls** need no terminal, since any UAX #9 viewer reorders the line: a measured
+      "rejected upload" message DISPLAYS with its path reversed. Escaped, not stripped, so the
+      record still says one was there.
 
     Tab is kept: it shifts alignment but cannot move the cursor back or erase.
     """
@@ -152,15 +140,7 @@ def _escape_unprintable(text: str) -> str:
 
 
 def _echoable(exception: str) -> str:
-    """The traceback as lines that can never read as a log record, nor act on a terminal.
-
-    ``splitlines`` also splits on \\r, \\x0b, \\x0c, \\x85 and U+2028/9, so rejoining on
-    \\n normalises every separator a message could smuggle in, including the \\r the export
-    worker's log reader treats as a line break.
-
-    Capped AFTER escaping: the field arrives bounded by ``truncate_exception`` at
-    ``_MAX_EXC_CHARS``, but escaping costs six characters each, so an all-C0 payload turns
-    16 KiB of bounded field into 98 KiB of echo. Capping the input keeps that multiplier."""
+    """Cap after escaping, since each escaped control character grows to six characters."""
     lines = [
         f"{_TRACEBACK_ECHO_PREFIX}{_escape_unprintable(part)}"
         for part in exception.rstrip().splitlines()
@@ -169,12 +149,7 @@ def _echoable(exception: str) -> str:
 
 
 def _cap_echoed_lines(lines: list[str], limit: int) -> str:
-    """Join the echoed lines within `limit` characters, keeping the head and the tail.
-
-    Whole lines where they fit, and the omission notice is prefixed too, so no emitted line
-    can begin a JSON value. A line too long for its budget is cut, not dropped: the cut can
-    land inside a ``\\uXXXX`` escape, but the tail holds the exception type and message and
-    a control-heavy message is exactly what makes that last line oversized."""
+    """Cut an over-long line rather than drop it, so the tail with the exception type survives."""
     if limit <= 0:
         return "\n".join(lines)
     total = sum(len(line) + 1 for line in lines)
@@ -193,8 +168,7 @@ def _cap_echoed_lines(lines: list[str], limit: int) -> str:
     used = 0
     for line in reversed(lines[len(head) :]):
         if used + len(line) + 1 > tail_budget:
-            # Cut the boundary line rather than drop it: losing a traceback's last line leaves the reader every
-            # frame and no reason.
+            # Truncate the boundary line rather than drop it; a traceback's last line holds the reason.
             room = tail_budget - used - 1
             if room > 0:
                 tail.append(line[:room])
@@ -215,26 +189,7 @@ def _cap_echoed_lines(lines: list[str], limit: int) -> str:
 
 
 def with_readable_traceback(renderer):
-    """Wrap the JSON renderer so an exception is ALSO echoed as a real multi-line traceback
-    on the lines after the record.
-
-    ~/.unsloth/studio/logs is a tee of stdout and stdout is JSON, so every traceback
-    reached its reader as one enormous line with newlines escaped to ``\\n`` -- correct
-    JSON, unreadable prose. The reported Image Transform failure ("RuntimeError: Input type
-    (float) and bias type (c10::BFloat16)...") arrived that way, and so does every crash
-    anyone is asked to send in.
-
-    The JSON record is emitted UNCHANGED, so record-by-record readers see what they always
-    saw, and every echoed line is prefixed so it cannot parse as a record. Non-JSON lines
-    in that file are already expected -- faulthandler dumps native stacks to the same
-    handle.
-
-    Returned as part of the SAME string rather than written to another stream, so one
-    ``print`` under ``PrintLogger``'s lock keeps record and traceback adjacent and ordered:
-    a processor runs BEFORE that print, and the export worker reads stdout and stderr on
-    separate pipes.
-
-    JSON only. ConsoleRenderer (development) already prints tracebacks as tracebacks."""
+    """Echo tracebacks as readable lines after the JSON record, prefixed so they never parse as records."""
 
     def _render(logger, method_name, event_dict):
         exception = event_dict.get("exception")
@@ -251,16 +206,13 @@ def with_readable_traceback(renderer):
     return _render
 
 
-# Set alongside HF_HUB_DISABLE_PROGRESS_BARS when the value is Unsloth's default rather than the
-# operator's, so allow_progress_bars() can tell them apart.
+# Set with HF_HUB_DISABLE_PROGRESS_BARS only if Unsloth chose it, to tell it from the operator's.
 _PROGRESS_BARS_DEFAULTED = "UNSLOTH_STUDIO_PROGRESS_BARS_DEFAULTED"
 
-# huggingface_hub's own spelling of truth (utils/_runtime.py ENV_VARS_TRUE_VALUES), so "off" and
-# "no" mean "keep the bars" here exactly as they do there.
+# huggingface_hub's ENV_VARS_TRUE_VALUES, so 'off'/'no' mean keep the bars.
 _ENV_TRUE = frozenset({"1", "on", "yes", "true"})
 
-# Set once this process has deliberately taken its bars back, so quiet_third_party_progress_bars()
-# stops being a switch a later call can flip the other way.
+# Latched once bars are restored, so quiet_third_party_progress_bars() cannot flip back.
 _BARS_RESTORED = False
 
 
@@ -284,6 +236,11 @@ def _verbose_logging_requested() -> bool:
     )
 
 
+def verbose_logging_requested() -> bool:
+    """Return whether Studio verbose logging is enabled."""
+    return _verbose_logging_requested()
+
+
 class _NullStream:
     """Somewhere for a progress bar to write that is not the log."""
 
@@ -298,15 +255,7 @@ class _NullStream:
 
 
 def _silence_datasets_bar_output() -> None:
-    """Keep the datasets bar object, drop only what it writes.
-
-    datasets exposes no env var, and its disable_progress_bar() works by forcing
-    tqdm(disable = True), which never registers the bar in tqdm._instances.
-    utils/datasets/chat_templates.py polls that set to publish
-    "Applying chat template ... 42%" to the UI, so disabling the bar outright would
-    freeze that status for the whole of a long format job. Pointing the bar at a null
-    stream keeps the counter (and the status) alive while the log stays clean.
-    """
+    """Drop only the datasets bar output; the bar stays in tqdm._instances for the chat template poller."""
     if "datasets" not in sys.modules:
         # Operator asked to keep them; leave every library alone.
         return
@@ -328,11 +277,9 @@ def _silence_datasets_bar_output() -> None:
 
 
 def _redirect_every_bar_output() -> None:
-    """Point every tqdm bar at a null stream, disabling none of them.
-
-    tqdm.std.tqdm.__init__ is the one funnel: huggingface_hub's, datasets' and
-    transformers' bar classes all subclass it and reach it through super().
-    """
+    """Point every tqdm bar at a null stream, disabling none of them. tqdm.std.tqdm.__init__ is the one
+    funnel: huggingface_hub's, datasets' and transformers' bar classes all subclass it and reach it
+    through super()."""
     try:
         from tqdm.std import tqdm as bar_cls
 
@@ -351,25 +298,7 @@ def _redirect_every_bar_output() -> None:
 
 
 def keep_progress_bars_countable() -> None:
-    """Keep the bar objects alive in a process that READS them, output dropped.
-
-    core/training/worker.py runs a poller over tqdm._instances to turn the Hub
-    download bar and "Loading checkpoint shards" into the UI's status line, which is
-    the only progress a user sees between "Loading model..." and the first step. A
-    disabled bar is never registered in _instances (tqdm/std.py drops it), so the
-    inherited HF_HUB_DISABLE_PROGRESS_BARS default would leave that status frozen for
-    the whole of a multi-GB download. Same trade as datasets: keep the counter, drop
-    the writes, so nothing reaches the log either way.
-
-    Only Unsloth's own default is undone; an operator who set the variable themselves
-    asked for no bars and keeps getting none. Afterwards
-    quiet_third_party_progress_bars() is a no-op in this process, so a later call
-    cannot re-disable what the poller reads.
-
-    Call it BEFORE huggingface_hub is imported: hub reads the variable once, into a
-    module constant, and enable_progress_bars() then refuses to override it. The
-    training worker does, ahead of its setup_logging call.
-    """
+    """Undo Unsloth's own HF_HUB_DISABLE_PROGRESS_BARS default before huggingface_hub is imported."""
     value = os.environ.get("HF_HUB_DISABLE_PROGRESS_BARS")
     if value is None or not _env_is_true(value):
         return
@@ -381,11 +310,9 @@ def keep_progress_bars_countable() -> None:
 
 
 def quiet_bar_kwargs() -> dict:
-    """tqdm kwargs that keep a bar counting but stop it writing to the log.
-
-    For Unsloth's own explicit bars (the dataset conversion loops), which no library
-    switch reaches. Empty when the operator asked to keep bars, so nothing changes.
-    """
+    """tqdm kwargs that keep a bar counting but stop it writing to the log. For Unsloth's own explicit
+    bars (the dataset conversion loops), which no library switch reaches. Empty when the operator
+    asked to keep bars, so nothing changes."""
     value = os.environ.get("HF_HUB_DISABLE_PROGRESS_BARS")
     if value is None or not _env_is_true(value):
         return {}
@@ -393,12 +320,7 @@ def quiet_bar_kwargs() -> dict:
 
 
 def allow_progress_bars() -> None:
-    """Undo an inherited Unsloth default so this process can draw progress bars.
-
-    Called by the export worker, whose stdout is forwarded to the export dialog and
-    whose Hub upload bar is the only live byte progress a long push_to_hub has. An
-    operator-set HF_HUB_DISABLE_PROGRESS_BARS is left alone.
-    """
+    """Export worker needs its Hub upload bar, so undo Unsloth's HF_HUB_DISABLE_PROGRESS_BARS default."""
     global _BARS_RESTORED
     _BARS_RESTORED = True
     if os.environ.pop(_PROGRESS_BARS_DEFAULTED, None):
@@ -406,55 +328,22 @@ def allow_progress_bars() -> None:
 
 
 def quiet_third_party_progress_bars() -> None:
-    """Turn off the tqdm bars transformers / diffusers / huggingface_hub draw
-    during an in-process model load.
-
-    A bar is written with carriage returns to a terminal, so in Unsloth's log it
-    lands as a burst of lines like
-
-        Loading weights:   8%|>         | 30/398 [00:00<00:01, 277.16it/s][A
-
-    and, because tqdm writes to a different stream than the structlog JSON
-    writer with no line discipline between them, a bar can land mid-record:
-    ``Loading pipeline components...:  20%|...|{"timestamp": ...}``. That line
-    is no longer parseable JSON, so anything reading the log record-by-record
-    loses the record.
-
-    Nothing is lost by dropping them: download and load progress already reach
-    the UI as real events (``hub_download_progress``, ``inference_load_progress``)
-    and via /api/inference/{images,video}/load-progress. Only the bars go; the
-    libraries' warnings and errors are untouched.
-
-    The subprocess workers already do this by exporting
-    HF_HUB_DISABLE_PROGRESS_BARS (hub/services/download_lifecycle.py,
-    core/inference/stt_download_worker.py); the server process, which loads the
-    RAG embedder at boot and every diffusers pipeline in-process, did not.
-
-    Respects an explicit operator override: if HF_HUB_DISABLE_PROGRESS_BARS is
-    already set, its value wins, parsed the way huggingface_hub parses it. Only
-    modules that are ALREADY imported get the API call, so this never forces a heavy
-    import at logging-setup time, and never caches a Hub copy that a subprocess is
-    about to replace with its transformers sidecar. `--verbose` skips it entirely.
-    """
+    """Silence the transformers, diffusers and Hub tqdm bars that break JSON log lines; --verbose skips."""
     if _BARS_RESTORED:
-        # This process took its bars back on purpose: the training worker reads them out of tqdm._instances,
-        # where a disabled bar is never registered, and has already redirected their output.
+        # The training worker reads bars from tqdm._instances, where a disabled bar never registers.
         return
     if _verbose_logging_requested() and os.environ.get("HF_HUB_DISABLE_PROGRESS_BARS") is None:
-        # --verbose promises everything back, so it must not install this default either; the flag is
-        # inherited by the workers.
+        # --verbose must not install this default either; the flag is inherited by the workers.
         return
     if os.environ.get("HF_HUB_DISABLE_PROGRESS_BARS") is None:
         os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-        # Marks the value as ours rather than the operator's, so a process that needs bars back can tell the
-        # difference. Inherited by every child process.
+        # Marks the value as ours rather than the operator's; inherited by child processes.
         os.environ[_PROGRESS_BARS_DEFAULTED] = "1"
     elif not _env_is_true(os.environ["HF_HUB_DISABLE_PROGRESS_BARS"]):
         # Operator asked to keep them; leave every library alone.
         return
 
-    # Only touch Hub if something already imported it: importing it here would cache the base
-    # environment's copy before a subprocess prepends its transformers sidecar to sys.path.
+    # Only touch Hub if already imported, else it caches the base env copy before sidecar sys.path.
     if "huggingface_hub" in sys.modules:
         try:
             from huggingface_hub.utils import disable_progress_bars
@@ -462,10 +351,7 @@ def quiet_third_party_progress_bars() -> None:
         except Exception:  # noqa: BLE001 - quieting logs must never break startup
             pass
 
-    # transformers derives its own _tqdm_active from the hub flag at import time, so a module imported
-    # BEFORE this ran still needs the explicit call.
-    # datasets is handled separately: the UI reads its bar counters, so only the output goes, and it is
-    # imported long after logging setup, which is why this function is safe to call again.
+    # transformers reads the hub flag at import, so already-imported modules need the explicit call.
     for _mod in ("transformers", "diffusers"):
         module = sys.modules.get(_mod)
         if module is None:
@@ -475,6 +361,33 @@ def quiet_third_party_progress_bars() -> None:
         except Exception:  # noqa: BLE001
             pass
     _silence_datasets_bar_output()
+    # Direct tqdm users bypass diffusers' toggle; preserve counters but discard redraws.
+    _redirect_every_bar_output()
+
+
+_STDOUT_LOCK = threading.Lock()
+
+
+class _CurrentStdoutLogger:
+    """A structlog logger that resolves ``sys.stdout`` per record, since ``PrintLogger`` binds the stream at build time and loses records once a tee or capture replaces stdout."""
+
+    def msg(self, message: str) -> None:
+        stream = sys.stdout
+        if stream is None:
+            return
+        with _STDOUT_LOCK:
+            stream.write(message + "\n")
+            stream.flush()
+
+    log = debug = info = warn = warning = msg
+    fatal = failure = err = error = critical = exception = msg
+
+    def __repr__(self) -> str:
+        return "<CurrentStdoutLogger>"
+
+
+def _current_stdout_logger_factory(*args) -> _CurrentStdoutLogger:
+    return _CurrentStdoutLogger()
 
 
 class LogConfig:
@@ -486,19 +399,12 @@ class LogConfig:
         env: Optional[str] = None,
         quiet_progress_bars: bool = True,
     ) -> structlog.BoundLogger:
-        """Configure structured logging for the application.
-        Args:
-            service_name: Name of the service for logging identification
-            env: Environment (development/production), affects logging format
-            quiet_progress_bars: Turn third-party tqdm bars off. False for a process
-                whose stdout is a user-facing progress stream (the export worker).
-        """
-        # Log level from environment; fall back to INFO if invalid.
+        """Configure structured logging; pass quiet_progress_bars=False for a process that streams
+        progress."""
         log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
         log_level = getattr(logging, log_level_name, logging.INFO)
 
-        # Non-ASCII on a non-UTF-8 stream raises UnicodeEncodeError (Windows, LANG=C), so key off the
-        # stream, not the platform.
+        # Key off the stream encoding, not the platform (Windows, LANG=C).
         for stream in (sys.stdout, sys.stderr):
             if getattr(stream, "encoding", "") and not str(stream.encoding).lower().replace(
                 "-", ""
@@ -517,8 +423,7 @@ class LogConfig:
                 structlog.contextvars.merge_contextvars,
                 structlog.processors.format_exc_info,
                 filter_sensitive_data,
-                # After redaction, not before: redact_native_paths replaces exact strings, so cutting the middle out
-                # of a traceback first could leave half a path behind for it to miss.
+                # After redaction: truncating first could leave half a path the redactor misses.
                 _truncate_exception_processor,
                 # Flatten the extra field into the main dict.
                 lambda logger, method_name, event_dict: {
@@ -540,7 +445,7 @@ class LogConfig:
                 ),
             ],
             wrapper_class = structlog.make_filtering_bound_logger(log_level),
-            logger_factory = structlog.PrintLoggerFactory(file = sys.stdout),
+            logger_factory = _current_stdout_logger_factory,
             cache_logger_on_first_use = True,
         )
 

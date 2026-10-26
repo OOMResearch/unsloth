@@ -21,12 +21,10 @@ export type WorkflowId =
   | "reference"
   | "edit";
 
-/** The Images workflows, shared by the page and the sidebar submenu. `requires` is the backend
- *  workflow id (status.workflows) the loaded model must support; null = always available. */
+/** `requires` is the backend workflow id the loaded model must support; null = always. */
 export const WORKFLOW_TABS: Array<{
   id: WorkflowId;
   label: string;
-  /** Page heading, when the sidebar's short label would read oddly on its own. Falls back to `label`. */
   heading?: string;
   requires: string | null;
   icon: IconSvgElement;
@@ -35,12 +33,18 @@ export const WORKFLOW_TABS: Array<{
   {
     id: "create",
     label: "Create",
-    // The sidebar nests this under Images, so "Create" alone is clear there.
     heading: "Create images",
     requires: null,
     // Not the pencil: that is the sidebar's New chat icon.
     icon: SparklesIcon,
     hint: "Generate a new image from a prompt",
+  },
+  {
+    id: "edit",
+    label: "Edit",
+    icon: Edit03Icon,
+    requires: "edit",
+    hint: "Change an image with an instruction",
   },
   {
     id: "transform",
@@ -77,11 +81,36 @@ export const WORKFLOW_TABS: Array<{
     requires: "reference",
     hint: "Generate guided by a reference image",
   },
-  {
-    id: "edit",
-    label: "Edit",
-    icon: Edit03Icon,
-    requires: "edit",
-    hint: "Change an image with an instruction",
-  },
 ];
+
+export const BACKEND_WORKFLOW_RECIPE_LABELS: Record<string, string> = {
+  txt2img: "Create",
+  img2img: "Transform",
+  edit: "Edit",
+  inpaint: "Inpaint",
+  outpaint: "Extend",
+  upscale: "Upscale",
+  reference: "Reference",
+  controlnet: "ControlNet",
+};
+
+export function recipeWorkflowLabel(workflow: string | null | undefined): string {
+  if (!workflow || workflow === "txt2img") return "Create";
+  return BACKEND_WORKFLOW_RECIPE_LABELS[workflow] ?? workflow;
+}
+
+export const WORKFLOW_EXAMPLE_PROMPTS: Record<WorkflowId, string> = {
+  create:
+    "A cozy wooden cabin on a snowy mountain at dusk, warm light glowing from the windows, pine trees and gently falling snow. Cinematic photo, soft golden light.",
+  edit: "Make the sky a bright sunset orange and add a red kite flying above the trees.",
+  transform:
+    "Turn this into a watercolor painting with soft pastel colors and loose, visible brush strokes.",
+  inpaint:
+    "A fluffy orange cat curled up asleep in the painted area, soft window light, realistic fur.",
+  extend:
+    "Continue the scene outward with more sandy beach, gentle waves and palm trees under a clear blue sky.",
+  upscale: "Sharp, highly detailed photo with crisp textures, clean edges and natural colors.",
+  reference:
+    "The character from the reference exploring a neon lit city street at night, cinematic lighting.",
+};
+

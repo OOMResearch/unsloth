@@ -2,9 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 # setup.sh's final llama.cpp verdict: report in Tauri mode, still fail elsewhere.
-#
-# The trailing block is top-level code, not a function, so it is extracted and run with
-# setup_fail stubbed. That keeps the contract pinned without executing an install.
+# The trailing block is top-level code, so it is extracted and run with setup_fail stubbed.
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -43,19 +41,18 @@ run_case() {
 }
 
 echo "=== llama.cpp degraded verdict ==="
-# The fix: a transient prebuilt failure must not abort the desktop first-launch install.
 run_case "tauri mode reports instead of aborting" true 1 1 0 "[TAURI:PROGRESS]"
 run_case "tauri mode names the recovery command" true 1 true 0 "unsloth studio update"
-# The half that must not regress: install.sh still needs the non-zero exit.
+# Progress detail is discarded when the install screen closes, so the verdict must also
+# reach the support report.
+run_case "tauri mode records the verdict"        true 1 1 0 "[TAURI:DIAG] llama_cpp=unavailable"
 run_case "shell install still fails"             true 1 0 1 "SETUP_FAIL"
 run_case "unset tauri mode still fails"          true 1 "" 1 "SETUP_FAIL"
-# Untouched paths.
 run_case "direct 'studio update' stays silent"   true 0 1 0 ""
 run_case "a healthy llama.cpp says nothing"      false 1 1 0 ""
 
-# [TAURI:STEP] would be counted by use-tauri-backend.ts against the seven-entry
-# INSTALL_STEPS list install.sh already fills, rendering "Step 8 of 7" and throwing
-# the text away. The notice has to ride the progress-detail channel instead.
+# [TAURI:STEP] would be counted against the seven-entry INSTALL_STEPS list ("Step 8 of 7"),
+# so the notice rides the progress-detail channel.
 _step_out=$(
     _LLAMA_CPP_DEGRADED=true SKIP_STUDIO_BASE=1 UNSLOTH_TAURI_MODE=1 \
     bash -c 'setup_fail() { exit "$1"; }; . "$1"' _ "$_BLOCK" 2>&1
@@ -67,11 +64,50 @@ case "$_step_out" in
         echo "  PASS: notice does not consume an install step"; PASS=$((PASS + 1)) ;;
 esac
 
-# ── Windows parity: setup.ps1 must degrade the same way (static check) ──
-# install.ps1 turns any non-zero setup.ps1 status into Exit-InstallFailure, which
-# install.rs reports as "Installation failed", so an unconditional
-# Exit-SetupFailure here aborts the Windows first-launch install for the same
-# transient download failure this test pins as survivable on Unix.
+# update.rs sets UNSLOTH_TAURI_UPDATE alone on a repair, so the block above never runs there.
+# Marker only: the update path stays silent and successful for everyone else.
+_REPAIR=$(mktemp)
+sed -n '/^# A desktop repair runs update\.rs/,/^fi$/p' "$SETUP_SH" > "$_REPAIR"
+if [ ! -s "$_REPAIR" ]; then
+    echo "  FAIL: could not find the repair block in setup.sh"; FAIL=$((FAIL + 1))
+fi
+
+# degraded, skip_base, tauri_update -> expected rc, expected substring ("" = none)
+run_repair() {
+    _label="$1"; _degraded="$2"; _skip="$3"; _upd="$4"; _rc_want="$5"; _want="$6"
+    set +e
+    _out=$(
+        _LLAMA_CPP_DEGRADED="$_degraded" \
+        SKIP_STUDIO_BASE="$_skip" \
+        UNSLOTH_TAURI_UPDATE="$_upd" \
+        bash -c 'setup_fail() { printf "SETUP_FAIL: %s\n" "$*"; exit "$1"; }; . "$1"' _ "$_REPAIR" 2>&1
+    )
+    _rc=$?
+    set -e
+    if [ "$_rc" != "$_rc_want" ]; then
+        echo "  FAIL: $_label (expected rc $_rc_want, got $_rc; output: $_out)"; FAIL=$((FAIL + 1)); return
+    fi
+    case "$_want" in
+        "") [ -z "$_out" ] || { echo "  FAIL: $_label (expected no output, got: $_out)"; FAIL=$((FAIL + 1)); return; } ;;
+        *)  case "$_out" in *"$_want"*) ;; *) echo "  FAIL: $_label (expected '$_want' in: $_out)"; FAIL=$((FAIL + 1)); return ;; esac ;;
+    esac
+    echo "  PASS: $_label"; PASS=$((PASS + 1))
+}
+
+echo "=== desktop repair verdict ==="
+run_repair "tauri repair records the verdict"    true  0 1    0 "[TAURI:DIAG] llama_cpp=unavailable"
+run_repair "true spelling also records"          true  0 true 0 "[TAURI:DIAG] llama_cpp=unavailable"
+run_repair "plain 'studio update' stays silent"  true  0 0    0 ""
+run_repair "a healthy repair says nothing"       false 0 1    0 ""
+run_repair "the install path is left to the block above" true 1 1 0 ""
+if grep -qE 'setup_fail|exit ' "$_REPAIR"; then
+    echo "  FAIL: the repair block must not change the exit contract"; FAIL=$((FAIL + 1))
+else
+    echo "  PASS: the repair block is marker-only"; PASS=$((PASS + 1))
+fi
+
+# install.ps1 turns any non-zero setup.ps1 status into a failed install, so setup.ps1 must
+# degrade the same way.
 SETUP_PS1="$SCRIPT_DIR/../../studio/setup.ps1"
 _PS_BLOCK=$(sed -n '/^if (\$script:LlamaCppDegraded -and \$env:SKIP_STUDIO_BASE -eq "1") {/,/^}$/p' "$SETUP_PS1")
 if [ -z "$_PS_BLOCK" ]; then
@@ -83,9 +119,23 @@ else
         *)
             echo "  FAIL: setup.ps1 does not mirror the Tauri degraded handling"; FAIL=$((FAIL + 1)) ;;
     esac
+    case "$_PS_BLOCK" in
+        *'[TAURI:DIAG] llama_cpp=unavailable'*)
+            echo "  PASS: setup.ps1 records the verdict too"; PASS=$((PASS + 1)) ;;
+        *)
+            echo "  FAIL: setup.ps1 does not record the degraded verdict"; FAIL=$((FAIL + 1)) ;;
+    esac
 fi
 
-rm -f "$_BLOCK"
+_PS_REPAIR=$(sed -n '/^# A desktop repair runs update\.rs/,/^}$/p' "$SETUP_PS1")
+case "$_PS_REPAIR" in
+    *'UNSLOTH_TAURI_UPDATE'*'[TAURI:DIAG] llama_cpp=unavailable'*)
+        echo "  PASS: setup.ps1 mirrors the repair marker"; PASS=$((PASS + 1)) ;;
+    *)
+        echo "  FAIL: setup.ps1 does not record a degraded desktop repair"; FAIL=$((FAIL + 1)) ;;
+esac
+
+rm -f "$_BLOCK" "$_REPAIR"
 echo ""
 echo "Passed: $PASS  Failed: $FAIL"
 [ "$FAIL" -eq 0 ]

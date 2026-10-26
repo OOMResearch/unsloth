@@ -19,13 +19,27 @@ export interface ResearchInferenceRequest {
   temperature?: number;
   topP?: number;
   maxTokens?: number;
+  maxOutputTokens?: number;
+  maxOutputTokensFromSavedCap?: boolean;
+  maxOutputTokensPublished?: number;
   enableThinking?: boolean;
   reasoningEffort?: string;
+  supportsReasoning?: boolean;
+  supportsReasoningOff?: boolean;
 }
 
 export function buildResearchInferenceRequest(input: {
   checkpoint: string;
-  external?: { providerId: string; providerType: string; modelId: string };
+  external?: {
+    providerId: string;
+    providerType: string;
+    modelId: string;
+    maxOutputTokens: number | null;
+    maxOutputTokensFromSavedCap: boolean;
+    maxOutputTokensPublished: number | null;
+    supportsReasoning?: boolean;
+    supportsReasoningOff?: boolean;
+  };
   temperature: number;
   topP: number;
   maxTokens: number;
@@ -46,13 +60,42 @@ export function buildResearchInferenceRequest(input: {
           providerId: input.external.providerId,
           providerType: input.external.providerType,
           externalModel: input.external.modelId,
+          ...(typeof input.external.supportsReasoning === "boolean"
+            ? { supportsReasoning: input.external.supportsReasoning }
+            : {}),
+          ...(typeof input.external.supportsReasoningOff === "boolean"
+            ? { supportsReasoningOff: input.external.supportsReasoningOff }
+            : {}),
+          ...(input.external.maxOutputTokens != null &&
+          Number.isFinite(input.external.maxOutputTokens) &&
+          input.external.maxOutputTokens > 0
+            ? {
+                maxOutputTokens: Math.floor(input.external.maxOutputTokens),
+                maxOutputTokensFromSavedCap: input.external.maxOutputTokensFromSavedCap,
+                // The ceiling includes the override, so it cannot say whether the model stops there.
+                ...(input.external.maxOutputTokensPublished != null &&
+                Number.isFinite(input.external.maxOutputTokensPublished) &&
+                input.external.maxOutputTokensPublished > 0
+                  ? {
+                      maxOutputTokensPublished: Math.floor(
+                        input.external.maxOutputTokensPublished,
+                      ),
+                    }
+                  : {}),
+              }
+            : {}),
         }
       : {}),
   };
   if (Number.isFinite(input.temperature) && input.temperature >= 0 && input.temperature <= 2) {
     request.temperature = input.temperature;
   }
-  if (Number.isFinite(input.topP) && input.topP > 0 && input.topP <= 1) {
+  // Connections omit Off (1), as chat requests do.
+  if (
+    Number.isFinite(input.topP) &&
+    input.topP > 0 &&
+    (input.external ? input.topP < 1 : input.topP <= 1)
+  ) {
     request.topP = input.topP;
   }
   if (Number.isFinite(input.maxTokens) && input.maxTokens > 0) {
@@ -73,6 +116,12 @@ export function buildResearchInferenceRequest(input: {
       input.reasoningEffort,
       input.reasoningEffortLevels,
     );
+  } else if (
+    input.reasoningStyle === "reasoning_effort" &&
+    input.external?.supportsReasoningOff
+  ) {
+    // Ollama thinks when no control arrives.
+    request.reasoningEffort = "none";
   }
   return request;
 }

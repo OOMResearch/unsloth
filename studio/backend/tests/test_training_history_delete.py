@@ -9,6 +9,52 @@ from pathlib import Path
 
 import pytest
 
+
+def _shared_setup_1(HTTPException):
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            training_history.delete_training_run(
+                "run-1",
+                delete_artifacts = True,
+                current_subject = "test-user",
+            )
+        )
+
+    assert exc_info.value.status_code == 409
+    return exc_info
+
+
+def _shared_setup_2(monkeypatch, tmp_path):
+    outputs = tmp_path / "outputs"
+    run_dir = outputs / "run-1"
+    run_dir.mkdir(parents = True)
+
+    monkeypatch.setattr(training_history, "outputs_root", lambda: outputs)
+    monkeypatch.setattr(training_history, "resolve_output_dir", lambda value: Path(value))
+    return outputs, run_dir
+
+
+def _shared_setup_3(monkeypatch):
+    from core.training import provenance
+
+    calls: list[dict] = []
+    monkeypatch.setattr(resume, "has_resume_state", lambda output_dir: True)
+    monkeypatch.setattr(
+        provenance,
+        "resource_provenance_allows_resume",
+        lambda config: calls.append(config) or True,
+    )
+    return calls
+
+
+def _shared_setup_4(tmp_path):
+    outputs = tmp_path / "outputs"
+    run_dir = outputs / "run-1"
+    run_dir.mkdir(parents = True)
+    (run_dir / "adapter_model.safetensors").write_bytes(b"x")
+    return outputs, run_dir
+
+
 _BACKEND = Path(__file__).resolve().parents[1]
 
 
@@ -106,15 +152,7 @@ def test_summary_reports_artifacts_available(monkeypatch):
 
 
 def test_resource_resume_validation_is_cached_per_request(monkeypatch):
-    from core.training import provenance
-
-    calls: list[dict] = []
-    monkeypatch.setattr(resume, "has_resume_state", lambda output_dir: True)
-    monkeypatch.setattr(
-        provenance,
-        "resource_provenance_allows_resume",
-        lambda config: calls.append(config) or True,
-    )
+    calls = _shared_setup_3(monkeypatch)
     cache: dict[str, bool] = {}
     first = _run_row(output_dir = "/tmp/first")
     second = _run_row(output_dir = "/tmp/second")
@@ -127,15 +165,7 @@ def test_resource_resume_validation_is_cached_per_request(monkeypatch):
 
 
 def test_resource_resume_cache_key_tracks_snapshot_paths(monkeypatch):
-    from core.training import provenance
-
-    calls: list[dict] = []
-    monkeypatch.setattr(resume, "has_resume_state", lambda output_dir: True)
-    monkeypatch.setattr(
-        provenance,
-        "resource_provenance_allows_resume",
-        lambda config: calls.append(config) or True,
-    )
+    calls = _shared_setup_3(monkeypatch)
     cache: dict[str, bool] = {}
     first = _run_row(
         config_json = {
@@ -156,15 +186,7 @@ def test_resource_resume_cache_key_tracks_snapshot_paths(monkeypatch):
 
 
 def test_nonserializable_resume_key_bypasses_cache(monkeypatch):
-    from core.training import provenance
-
-    calls: list[dict] = []
-    monkeypatch.setattr(resume, "has_resume_state", lambda output_dir: True)
-    monkeypatch.setattr(
-        provenance,
-        "resource_provenance_allows_resume",
-        lambda config: calls.append(config) or True,
-    )
+    calls = _shared_setup_3(monkeypatch)
     row = _run_row(config_json = {"hf_dataset": object()})
     cache: dict[str, bool] = {}
 
@@ -232,7 +254,8 @@ def test_list_training_runs_offloads_summary_batch(monkeypatch):
     )
 
     assert [summary.id for summary in response.runs] == ["b", "a", "c"]
-    assert offloads == [(training_history._summaries_from_rows, (rows, False))]
+    assert offloads[-1] == (training_history._summaries_from_rows, (rows, False))
+    assert len(offloads) == 3
 
 
 def _delete(
@@ -264,10 +287,7 @@ def _delete(
 
 
 def test_delete_with_artifacts_removes_dir_under_outputs_root(monkeypatch, tmp_path):
-    outputs = tmp_path / "outputs"
-    run_dir = outputs / "run-1"
-    run_dir.mkdir(parents = True)
-    (run_dir / "adapter_model.safetensors").write_bytes(b"x")
+    outputs, run_dir = _shared_setup_4(tmp_path)
 
     monkeypatch.setattr(training_history, "outputs_root", lambda: outputs)
     monkeypatch.setattr(training_history, "resolve_output_dir", lambda value: Path(value))
@@ -305,16 +325,7 @@ def test_delete_refuses_dirs_outside_outputs_root(monkeypatch, tmp_path):
     monkeypatch.setattr(training_history, "_active_training_output_dir", lambda: None)
     monkeypatch.setattr(training_history, "list_other_run_output_dirs", lambda run_id: [])
 
-    with pytest.raises(HTTPException) as exc_info:
-        asyncio.run(
-            training_history.delete_training_run(
-                "run-1",
-                delete_artifacts = True,
-                current_subject = "test-user",
-            )
-        )
-
-    assert exc_info.value.status_code == 409
+    exc_info = _shared_setup_1(HTTPException)
     assert exc_info.value.detail["code"] == "training_artifact_deletion_failed"
     assert deleted_runs == []
     assert foreign_dir.exists()
@@ -376,16 +387,8 @@ def test_delete_with_missing_shared_dir_still_deletes_row(monkeypatch, tmp_path)
 
 
 def test_a_failed_purge_is_reported_and_puts_the_directory_back(monkeypatch, tmp_path):
-    """A purge that fails must not report the artifacts as deleted.
-
-    The staged name is hidden and randomized, so claiming success would leave every byte on
-    disk under a name the UI never shows and no retry can rediscover -- the run row is gone by
-    then, so nothing points at it any more.
-    """
-    outputs = tmp_path / "outputs"
-    run_dir = outputs / "run-1"
-    run_dir.mkdir(parents = True)
-    (run_dir / "adapter_model.safetensors").write_bytes(b"x")
+    """A failed purge must be reported and the directory restored, since its staged name is hidden."""
+    outputs, run_dir = _shared_setup_4(tmp_path)
 
     monkeypatch.setattr(training_history, "outputs_root", lambda: outputs)
     monkeypatch.setattr(training_history, "resolve_output_dir", lambda value: Path(value))
@@ -411,12 +414,7 @@ def test_rollback_failure_reports_where_the_artifacts_are(monkeypatch, tmp_path)
     """If the row delete and the restoring rename both fail, say where the bytes ended up."""
     from fastapi import HTTPException
 
-    outputs = tmp_path / "outputs"
-    run_dir = outputs / "run-1"
-    run_dir.mkdir(parents = True)
-
-    monkeypatch.setattr(training_history, "outputs_root", lambda: outputs)
-    monkeypatch.setattr(training_history, "resolve_output_dir", lambda value: Path(value))
+    outputs, run_dir = _shared_setup_2(monkeypatch, tmp_path)
     monkeypatch.setattr(
         training_history, "get_run", lambda run_id: _run_row(output_dir = str(run_dir))
     )
@@ -449,12 +447,7 @@ def test_restore_reports_a_rename_it_could_not_perform(tmp_path):
 
 
 def test_delete_without_flag_leaves_artifacts(monkeypatch, tmp_path):
-    outputs = tmp_path / "outputs"
-    run_dir = outputs / "run-1"
-    run_dir.mkdir(parents = True)
-
-    monkeypatch.setattr(training_history, "outputs_root", lambda: outputs)
-    monkeypatch.setattr(training_history, "resolve_output_dir", lambda value: Path(value))
+    outputs, run_dir = _shared_setup_2(monkeypatch, tmp_path)
 
     response, deleted_runs = _delete(
         monkeypatch, _run_row(output_dir = str(run_dir)), delete_artifacts = False
@@ -468,30 +461,15 @@ def test_delete_without_flag_leaves_artifacts(monkeypatch, tmp_path):
 
 def test_delete_rejects_running_run(monkeypatch):
     from fastapi import HTTPException
-
     monkeypatch.setattr(training_history, "get_run", lambda run_id: _run_row(status = "running"))
 
-    with pytest.raises(HTTPException) as exc_info:
-        asyncio.run(
-            training_history.delete_training_run(
-                "run-1",
-                delete_artifacts = True,
-                current_subject = "test-user",
-            )
-        )
-
-    assert exc_info.value.status_code == 409
+    exc_info = _shared_setup_1(HTTPException)
 
 
 def test_delete_artifacts_refused_while_dir_in_use_by_active_run(monkeypatch, tmp_path):
     from fastapi import HTTPException
 
-    outputs = tmp_path / "outputs"
-    run_dir = outputs / "run-1"
-    run_dir.mkdir(parents = True)
-
-    monkeypatch.setattr(training_history, "outputs_root", lambda: outputs)
-    monkeypatch.setattr(training_history, "resolve_output_dir", lambda value: Path(value))
+    outputs, run_dir = _shared_setup_2(monkeypatch, tmp_path)
 
     deleted_runs: list[str] = []
     monkeypatch.setattr(
@@ -500,28 +478,14 @@ def test_delete_artifacts_refused_while_dir_in_use_by_active_run(monkeypatch, tm
     monkeypatch.setattr(training_history, "delete_run", deleted_runs.append)
     monkeypatch.setattr(training_history, "_active_training_output_dir", lambda: str(run_dir))
 
-    with pytest.raises(HTTPException) as exc_info:
-        asyncio.run(
-            training_history.delete_training_run(
-                "run-1",
-                delete_artifacts = True,
-                current_subject = "test-user",
-            )
-        )
-
-    assert exc_info.value.status_code == 409
+    exc_info = _shared_setup_1(HTTPException)
     assert exc_info.value.detail["code"] == "training_artifacts_in_use"
     assert deleted_runs == []
     assert run_dir.exists()
 
 
 def test_delete_row_without_artifacts_allowed_while_dir_in_use(monkeypatch, tmp_path):
-    outputs = tmp_path / "outputs"
-    run_dir = outputs / "run-1"
-    run_dir.mkdir(parents = True)
-
-    monkeypatch.setattr(training_history, "outputs_root", lambda: outputs)
-    monkeypatch.setattr(training_history, "resolve_output_dir", lambda value: Path(value))
+    outputs, run_dir = _shared_setup_2(monkeypatch, tmp_path)
 
     response, deleted_runs = _delete(
         monkeypatch,
@@ -538,12 +502,7 @@ def test_delete_row_without_artifacts_allowed_while_dir_in_use(monkeypatch, tmp_
 def test_active_dir_guard_compares_resolved_paths(monkeypatch, tmp_path):
     from fastapi import HTTPException
 
-    outputs = tmp_path / "outputs"
-    run_dir = outputs / "run-1"
-    run_dir.mkdir(parents = True)
-
-    monkeypatch.setattr(training_history, "outputs_root", lambda: outputs)
-    monkeypatch.setattr(training_history, "resolve_output_dir", lambda value: Path(value))
+    outputs, run_dir = _shared_setup_2(monkeypatch, tmp_path)
 
     unnormalized = str(outputs / "x" / ".." / "run-1")
     monkeypatch.setattr(
@@ -552,16 +511,7 @@ def test_active_dir_guard_compares_resolved_paths(monkeypatch, tmp_path):
     monkeypatch.setattr(training_history, "delete_run", lambda run_id: None)
     monkeypatch.setattr(training_history, "_active_training_output_dir", lambda: unnormalized)
 
-    with pytest.raises(HTTPException) as exc_info:
-        asyncio.run(
-            training_history.delete_training_run(
-                "run-1",
-                delete_artifacts = True,
-                current_subject = "test-user",
-            )
-        )
-
-    assert exc_info.value.status_code == 409
+    exc_info = _shared_setup_1(HTTPException)
     assert run_dir.exists()
 
 
@@ -599,10 +549,7 @@ def test_output_dir_overlap_detects_ancestors(monkeypatch, tmp_path):
 def test_delete_artifacts_refused_when_finished_sibling_shares_dir(monkeypatch, tmp_path):
     from fastapi import HTTPException
 
-    outputs = tmp_path / "outputs"
-    run_dir = outputs / "run-1"
-    run_dir.mkdir(parents = True)
-    (run_dir / "adapter_model.safetensors").write_bytes(b"x")
+    outputs, run_dir = _shared_setup_4(tmp_path)
 
     monkeypatch.setattr(training_history, "outputs_root", lambda: outputs)
     monkeypatch.setattr(training_history, "resolve_output_dir", lambda value: Path(value))
@@ -621,16 +568,7 @@ def test_delete_artifacts_refused_when_finished_sibling_shares_dir(monkeypatch, 
         lambda run_id: [str(run_dir)],
     )
 
-    with pytest.raises(HTTPException) as exc_info:
-        asyncio.run(
-            training_history.delete_training_run(
-                "run-1",
-                delete_artifacts = True,
-                current_subject = "test-user",
-            )
-        )
-
-    assert exc_info.value.status_code == 409
+    exc_info = _shared_setup_1(HTTPException)
     assert exc_info.value.detail["code"] == "training_artifacts_shared"
     assert deleted_runs == []
     assert run_dir.exists()
@@ -640,7 +578,7 @@ def test_list_other_run_output_dirs_ignores_unstamped_running_rows(monkeypatch, 
     from storage import studio_db
 
     monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(tmp_path))
-    monkeypatch.setattr(studio_db, "_schema_ready", False)
+    monkeypatch.setattr(studio_db, "_schema_ready", set())
 
     shared = "/tmp/outputs/shared-run"
     studio_db.create_run(
@@ -703,16 +641,7 @@ def test_delete_failure_retains_history_row(monkeypatch, tmp_path):
     monkeypatch.setattr(training_history, "list_other_run_output_dirs", lambda run_id: [])
     monkeypatch.setattr(training_history, "_delete_run_output_dir", lambda *args: False)
 
-    with pytest.raises(HTTPException) as exc_info:
-        asyncio.run(
-            training_history.delete_training_run(
-                "run-1",
-                delete_artifacts = True,
-                current_subject = "test-user",
-            )
-        )
-
-    assert exc_info.value.status_code == 409
+    exc_info = _shared_setup_1(HTTPException)
     assert exc_info.value.detail["code"] == "training_artifact_deletion_failed"
     assert deleted_runs == []
     assert run_dir.exists()
@@ -740,7 +669,6 @@ def test_delete_artifacts_uses_thread_offload(monkeypatch, tmp_path):
 
     assert response.artifacts_deleted is True
     assert deleted_runs == ["run-1"]
-    # One offload, not two: nothing was staged here, so there is no purge phase.
     assert len(calls) == 1
 
 
@@ -749,10 +677,7 @@ def test_guarded_delete_prevents_resume_from_spawning_after_artifacts_are_remove
 ):
     from core.training.training import TrainingBackend
 
-    outputs = tmp_path / "outputs"
-    run_dir = outputs / "run-1"
-    run_dir.mkdir(parents = True)
-    (run_dir / "adapter_model.safetensors").write_bytes(b"x")
+    outputs, run_dir = _shared_setup_4(tmp_path)
     monkeypatch.setattr(training_history, "outputs_root", lambda: outputs)
     monkeypatch.setattr(training_history, "resolve_output_dir", lambda value: Path(value))
     monkeypatch.setattr(training_history, "_active_training_output_dir", lambda: None)
@@ -818,10 +743,7 @@ def test_guarded_delete_prevents_resume_from_spawning_after_artifacts_are_remove
 def test_guarded_delete_rechecks_shared_output_after_waiting_for_lifecycle(monkeypatch, tmp_path):
     from core.training.lifecycle import training_lifecycle_guard
 
-    outputs = tmp_path / "outputs"
-    run_dir = outputs / "run-1"
-    run_dir.mkdir(parents = True)
-    (run_dir / "adapter_model.safetensors").write_bytes(b"x")
+    outputs, run_dir = _shared_setup_4(tmp_path)
     monkeypatch.setattr(training_history, "outputs_root", lambda: outputs)
     monkeypatch.setattr(training_history, "resolve_output_dir", lambda value: Path(value))
     monkeypatch.setattr(training_history, "_active_training_output_dir", lambda: None)
@@ -867,3 +789,37 @@ def test_shared_guard_compares_canonical_paths(monkeypatch, tmp_path):
     )
 
     assert training_history._output_dir_shared(str(run_dir), "run-1") is True
+
+
+def test_training_run_detail_reads_the_db_off_the_event_loop(monkeypatch):
+    offloaded: list[object] = []
+    row = _run_row(id = "a", output_dir = "/tmp/a")
+
+    async def record_offload(function, *args):
+        offloaded.append(function)
+        return function(*args)
+
+    def get_run(run_id):
+        return dict(row)
+
+    def get_run_metrics(run_id):
+        return {}
+
+    def sharing():
+        return False
+
+    monkeypatch.setattr(training_history.asyncio, "to_thread", record_offload)
+    monkeypatch.setattr(training_history, "get_run", get_run)
+    monkeypatch.setattr(training_history, "get_run_metrics", get_run_metrics)
+    monkeypatch.setattr(training_history, "get_preview_sharing_enabled", sharing)
+    monkeypatch.setattr(
+        training_history, "can_resume_run", lambda run, *, resource_cache = None: False
+    )
+    monkeypatch.setattr(training_history, "artifacts_present", lambda path: False)
+
+    response = asyncio.run(
+        training_history.get_training_run_detail("a", current_subject = "test-user")
+    )
+
+    assert response.run.id == "a"
+    assert {get_run, get_run_metrics, sharing} <= set(offloaded)

@@ -2,20 +2,12 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import test from "node:test";
 
-const voiceTab = readFileSync(
-  new URL("../src/features/settings/tabs/voice-tab.tsx", import.meta.url),
-  "utf8",
-);
-const adapter = readFileSync(
-  new URL(
-    "../src/features/chat/adapters/studio-model-dictation-adapter.ts",
-    import.meta.url,
-  ),
-  "utf8",
-);
+import { readSrc } from "./helpers/kit.ts";
+
+const voiceTab = readSrc("features/settings/tabs/voice-tab.tsx");
+const adapter = readSrc("features/chat/adapters/studio-model-dictation-adapter.ts");
 
 test("changing the dictation device releases only this tab's model", () => {
   // Unscoped, the unload can tear down a model this tab never owned.
@@ -26,7 +18,7 @@ test("changing the dictation device releases only this tab's model", () => {
 });
 
 test("switching device never kills a transcription being decoded", () => {
-  // The default drains for 30s and releases anyway, throwing the recording away.
+  // The default drains for 30s and then releases, discarding the recording.
   assert.match(voiceTab, /wait: false/);
   assert.match(adapter, /if \(options\?\.wait === false\) params\.set\("wait", "false"\)/);
 });
@@ -40,7 +32,10 @@ test("the unload API still takes the engine and model that scoping needs", () =>
 });
 
 test("the device preference travels with every load and transcribe", () => {
-  // A load that omits it reads as "no opinion", so the setting never applies.
+  // An omitted device reads as "no opinion", so the setting never applies.
   assert.match(adapter, /device: resolvedDevice/);
-  assert.match(adapter, /params\.set\("device", settings\.sttDevice\)/);
+  assert.match(
+    adapter,
+    /params\.set\("device", options\.device \?\? settings\.sttDevice\)/,
+  );
 });

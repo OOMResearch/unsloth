@@ -1,21 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""The Windows signing binary is executed with the release signing secrets.
-
-test_release_desktop_signing.py asserts on the workflow text; this file runs the
-two step bodies, so a change that reads fine but stops failing closed is caught.
-The bodies are extracted, never retyped, then wrapped and invoked the way the
-runner does (ScriptHandlerHelpers.cs prepends `$ErrorActionPreference = 'stop'`
-and appends the $LASTEXITCODE propagation, then runs `pwsh -command ". '<f>'"`).
-That wrapper is what makes `exit 1` mean "the release stops" here too.
-
-A local HTTP server stands in for the release asset, so tampered, truncated and
-unreachable downloads are deterministic and offline.
-
-Needs pwsh. Checks that need a bare name to resolve to a `.exe` need Windows
-PATHEXT; UNSLOTH_NETWORK_TESTS=1 also pulls the real pinned asset.
-"""
+"""Runs extracted signing steps under pwsh; a change that stops failing closed is caught"""
 
 import functools
 import hashlib
@@ -30,18 +16,17 @@ import pytest
 import yaml
 
 from unsloth_pwsh_runner import run_pwsh
+from windows_console_stub import console_stub_bytes
 
 
-# Only PATHEXT maps a bare name onto the `.exe` the verify step insists on, so
-# checks needing a *passing* resolution are skipped off Windows rather than
-# faked. The rejecting direction is platform neutral and runs everywhere.
+# Only PATHEXT maps a bare name onto the `.exe` the verify step insists on, so checks needing a *passing* resolution are
+# skipped off Windows rather than faked. The rejecting direction is platform neutral and runs everywhere.
 needs_pathext = pytest.mark.skipif(
     sys.platform != "win32",
     reason = "needs Windows PATHEXT resolution to map a bare name onto the .exe",
 )
 
-# Opt in, so an offline or rate limited run does not fail on what the digest
-# already pins.
+# Opt in, so an offline or rate limited run does not fail on what the digest already pins.
 needs_network = pytest.mark.skipif(
     not os.environ.get("UNSLOTH_NETWORK_TESTS"),
     reason = "set UNSLOTH_NETWORK_TESTS=1 to fetch the pinned release asset",
@@ -60,9 +45,6 @@ RUNNER_PREPEND = "$ErrorActionPreference = 'stop'"
 RUNNER_APPEND = r"if ((Test-Path -LiteralPath variable:\LASTEXITCODE)) { exit $LASTEXITCODE }"
 
 WINDOWS_GUARD = "matrix.platform == 'windows-latest'"
-
-
-# ── the PR under test ────────────────────────────────────────────────────────
 
 
 @functools.lru_cache(maxsize = 1)
@@ -90,9 +72,7 @@ def write_step_script(directory, name, filename):
 def run_step(script, env):
     """Invoke a step script the way the runner does and return (code, output)."""
     full = {**os.environ, **env}
-    # Every signing check in this file reads the exit code of this one call, so an
-    # interpreter that aborts at startup would look exactly like a step body that
-    # failed closed -- the opposite of what the test claims to have proven.
+    # An interpreter aborting at startup would look like a step failing closed.
     result = run_pwsh(
         ["pwsh", "-NoProfile", "-Command", f". '{script}'"],
         capture_output = True,
@@ -101,9 +81,6 @@ def run_step(script, env):
         timeout = 300,
     )
     return result.returncode, result.stdout + result.stderr
-
-
-# ── a local stand-in for the GitHub release asset ────────────────────────────
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
@@ -173,9 +150,6 @@ def installed_binary(sandbox):
     return sandbox["runner_temp"] / "trusted-signing-cli" / "trusted-signing-cli.exe"
 
 
-# ── static contracts on the PR ───────────────────────────────────────────────
-
-
 def test_pin_is_a_full_sha256_and_a_versioned_url():
     url, digest = pinned()
     assert len(digest) == 64 and all(c in "0123456789abcdef" for c in digest)
@@ -208,13 +182,9 @@ def test_other_platform_integrity_paths_are_untouched():
 
 
 def test_the_install_step_never_interpolates_workflow_expressions():
-    # `${{ }}` in a run body is a shell-injection surface; the pinned values go
-    # through `env:`.
+    # `${{ }}` in a run body is a shell-injection surface; the pinned values go through `env:`.
     body = step("Install trusted-signing-cli")["run"]
     assert "${{" not in body
-
-
-# ── the happy path ───────────────────────────────────────────────────────────
 
 
 def test_a_matching_digest_installs_and_publishes_the_path(sandbox, asset_server):
@@ -270,9 +240,6 @@ def test_a_path_containing_spaces_still_works(tmp_path, asset_server):
     assert (spaced / "trusted-signing-cli" / "trusted-signing-cli.exe").is_file()
 
 
-# ── every way it must fail closed ────────────────────────────────────────────
-
-
 def test_a_tampered_asset_fails_the_release(sandbox, asset_server):
     url, _ = asset_server
     code, out = run_step(sandbox["install"], install_env(sandbox, url, "0" * 64))
@@ -325,9 +292,6 @@ def test_an_empty_digest_pin_cannot_pass(sandbox, asset_server):
     assert not installed_binary(sandbox).exists()
 
 
-# ── the verify step ──────────────────────────────────────────────────────────
-
-
 def _fake_on_path(directory, name, script):
     directory.mkdir(parents = True, exist_ok = True)
     target = directory / name
@@ -337,12 +301,7 @@ def _fake_on_path(directory, name, script):
 
 
 def _real_exe_on_path(directory, source):
-    """Put a genuinely runnable executable at the verified name.
-
-    A shebang script cannot stand in: PATHEXT resolves a bare name only to a real
-    `.exe`, which is also what the verify step compares against. The branch under
-    test decides which real binary is borrowed.
-    """
+    """A shebang script cannot stand in, since PATHEXT resolves a bare name only to a real .exe."""
     directory.mkdir(parents = True, exist_ok = True)
     target = directory / "trusted-signing-cli.exe"
     shutil.copy2(source, target)
@@ -354,9 +313,7 @@ def _path_with(*directories):
 
 
 def test_verify_rejects_a_binary_that_was_never_digest_checked(sandbox, tmp_path):
-    # The rust-cache scenario: an identically named copy earlier on PATH that no
-    # digest gate saw. It spoofs the version string, which is what the old
-    # `--version` probe accepted.
+    # The rust-cache scenario: an identically named copy earlier on PATH that no digest gate saw.
     decoy_dir = tmp_path / "cargo_bin"
     _fake_on_path(
         decoy_dir, "trusted-signing-cli", '#!/bin/sh\necho "trusted-signing-cli 0.10.0"\n'
@@ -382,9 +339,6 @@ def test_verify_fails_when_nothing_is_on_path(sandbox):
 
 @needs_pathext
 def test_verify_fails_when_the_binary_cannot_start(sandbox):
-    # A truncated download: right name and place, not a loadable image. It must
-    # sit at the verified path, or the identity check rejects it first and the
-    # catch block is never reached.
     directory = sandbox["runner_temp"] / "trusted-signing-cli"
     directory.mkdir(parents = True)
     (directory / "trusted-signing-cli.exe").write_bytes(b"\x00\x01not an executable")
@@ -397,9 +351,14 @@ def test_verify_fails_when_the_binary_cannot_start(sandbox):
 
 @needs_pathext
 def test_verify_fails_when_the_binary_exits_non_zero(sandbox):
-    # Starts fine, exits non-zero: where.exe given an option it does not take.
+    # A pip-style launcher that starts and exits 3, not a renamed System32 tool: a Microsoft
+    # binary at trusted-signing-cli.exe is an AV heuristic.
+    stub = console_stub_bytes(3)
+    if stub is None:
+        pytest.skip("no distlib console launcher to build a runnable stub from")
     directory = sandbox["runner_temp"] / "trusted-signing-cli"
-    _real_exe_on_path(directory, pathlib.Path(os.environ["SystemRoot"], "System32", "where.exe"))
+    directory.mkdir(parents = True)
+    (directory / "trusted-signing-cli.exe").write_bytes(stub)
 
     code, out = run_step(sandbox["verify"], {**sandbox["env"], "PATH": _path_with(directory)})
 
@@ -409,8 +368,6 @@ def test_verify_fails_when_the_binary_exits_non_zero(sandbox):
 
 @needs_pathext
 def test_verify_accepts_the_binary_it_installed(sandbox):
-    # The running interpreter answers --version and exits 0, which is all the
-    # verify step asks of the tool.
     directory = sandbox["runner_temp"] / "trusted-signing-cli"
     verified = _real_exe_on_path(directory, sys.executable)
 
@@ -421,8 +378,6 @@ def test_verify_accepts_the_binary_it_installed(sandbox):
 
 
 def test_an_unverified_copy_ahead_on_path_is_rejected(sandbox, tmp_path):
-    # Rejecting direction of the ordering proof: a copy resolving ahead of the
-    # verified one must not be accepted. Prepending is what prevents it.
     verified_dir = sandbox["runner_temp"] / "trusted-signing-cli"
     _fake_on_path(
         verified_dir, "trusted-signing-cli.exe", '#!/bin/sh\necho "trusted-signing-cli 0.10.0"\n'
@@ -445,15 +400,11 @@ def test_an_unverified_copy_ahead_on_path_is_rejected(sandbox, tmp_path):
 
 
 def test_the_install_step_publishes_its_directory_for_path_prepending(sandbox, asset_server):
-    # $GITHUB_PATH prepends, so publishing the install dir is what puts the
-    # verified copy ahead of ~/.cargo/bin.
+    # $GITHUB_PATH prepends, so publishing the install dir is what puts the verified copy ahead of ~/.cargo/bin.
     url, handler = asset_server
     assert run_step(sandbox["install"], install_env(sandbox, url, good_digest(handler)))[0] == 0
     published = sandbox["github_path"].read_text().strip()
     assert published == str(sandbox["runner_temp"] / "trusted-signing-cli")
-
-
-# ── the real pinned asset, fetched over the network ──────────────────────────
 
 
 @needs_network
@@ -479,8 +430,6 @@ def test_the_real_asset_is_a_64_bit_windows_console_binary(sandbox):
 
 @needs_network
 def test_the_real_asset_declares_the_arguments_the_signing_script_passes(sandbox):
-    # sign-with-trusted-signing.ps1 passes -e and -d; account and certificate
-    # profile come from the environment the release job sets.
     url, digest = pinned()
     assert run_step(sandbox["install"], install_env(sandbox, url, digest))[0] == 0
     blob = installed_binary(sandbox).read_bytes()
@@ -496,8 +445,6 @@ def test_the_real_asset_declares_the_arguments_the_signing_script_passes(sandbox
 
 
 def test_the_signing_script_still_calls_the_tool_by_bare_name():
-    # Only reads a file in the tree. This is the contract that makes the PATH
-    # resolution above matter, so it runs in the default job.
     script = REPO / "studio" / "src-tauri" / "windows" / "sign-with-trusted-signing.ps1"
     text = script.read_text(encoding = "utf-8")
     assert "& trusted-signing-cli @trustedSigningArgs" in text

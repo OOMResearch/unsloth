@@ -104,6 +104,26 @@ def test_ingestion_lifecycle_pending_to_completed(rag_home, stub_embeddings, tmp
         conn.close()
 
 
+def test_ingested_chunks_fit_the_embedding_model_input_limit(
+    rag_home, stub_embeddings, tmp_path, monkeypatch
+):
+    from core.rag import embeddings
+
+    monkeypatch.setattr(embeddings, "max_tokens", lambda model_name = None: 8)
+    path = _write(tmp_path, "doc.txt", " ".join(f"word{i}" for i in range(60)))
+    scope = store.kb_scope("K1")
+    doc_id, job_id = ingestion.start_ingestion(scope, "K1", None, "doc.txt", path)
+    assert _wait_completed(job_id)["status"] == "completed"
+
+    conn = rag_db.get_connection()
+    try:
+        rows = conn.execute("SELECT text FROM chunks WHERE document_id=?", (doc_id,)).fetchall()
+    finally:
+        conn.close()
+    assert len(rows) > 1
+    assert max(len(row["text"].split()) for row in rows) <= 8
+
+
 def test_ingestion_skips_chunk_write_when_the_document_was_deleted(
     rag_home, stub_embeddings, tmp_path, monkeypatch
 ):
@@ -114,8 +134,12 @@ def test_ingestion_skips_chunk_write_when_the_document_was_deleted(
     deleted = {}
     doc_id_known = threading.Event()
 
-    def delete_document_then_embed(texts, model_name):
-        vectors = real_embed_all(texts, model_name)
+    def delete_document_then_embed(
+        texts,
+        model_name,
+        on_progress = None,
+    ):
+        vectors = real_embed_all(texts, model_name, on_progress)
         doc_id_known.wait(30)
         conn = rag_db.get_connection()
         try:
@@ -181,7 +205,6 @@ def test_ingestion_dedupe_by_hash(rag_home, stub_embeddings, tmp_path):
     _drain(job_id)
     _wait_completed(job_id)
 
-    # Identical content -> same doc id, no re-ingest.
     path2 = _write(tmp_path, "copy.txt", "alpha bravo charlie")
     doc_id2, job_id2 = ingestion.start_ingestion(scope, "K1", None, "copy.txt", path2)
     events = _drain(job_id2)
@@ -218,12 +241,78 @@ def test_start_ingestion_accepts_precomputed_content_hash(
     _drain(job_id)
     _wait_completed(job_id)
 
-    assert calls == []  # start_ingestion never re-hashed the file
+    assert calls == []
     conn = rag_db.get_connection()
     try:
         assert store.get_document(conn, doc_id)["sha256"] == precomputed
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize("owner", ["knowledge_base", "thread", "project"])
+def test_upload_routes_hand_ingestion_the_digest_from_the_copy(
+    rag_home, stub_embeddings, monkeypatch, owner
+):
+    """Every upload route already reads the whole file to copy it into the uploads root,
+    so it hashes as it writes and start_ingestion is spared a second full read."""
+    import hashlib
+    import io
+
+    from routes import rag as rag_routes
+    from storage import studio_db
+
+    # Over one 1 MiB read block, so a digest built from a single block would not match.
+    payload = b"alpha bravo charlie delta\n" * 44_000
+
+    class _Up:
+        filename = "notes.txt"
+        file = io.BytesIO(payload)
+
+    rehashed = []
+    original = ingestion._sha256_file
+
+    def counting(path):
+        rehashed.append(path)
+        return original(path)
+
+    opened = []
+    builtin_open = open
+
+    def recording_open(path, *args, **kwargs):
+        opened.append((str(path), args[0] if args else kwargs.get("mode", "r")))
+        return builtin_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(ingestion, "_sha256_file", counting)
+    # A module global shadows the builtin, so only routes/rag.py's own opens are recorded.
+    monkeypatch.setattr(rag_routes, "open", recording_open, raising = False)
+
+    # Called directly, unpassed Form/File params keep truthy FastAPI sentinels; pass every one.
+    call = dict(file = _Up(), native_path_lease = None, ocr = None, caption = None, subject = "test")
+    if owner == "knowledge_base":
+        conn = rag_db.get_connection()
+        try:
+            kb_id = store.create_kb(conn, name = "Digest")
+        finally:
+            conn.close()
+        result = rag_routes.upload_kb_document(kb_id, **call)
+    elif owner == "thread":
+        result = rag_routes.upload_thread_document("T1", **call)
+    else:
+        monkeypatch.setattr(studio_db, "get_chat_project", lambda value: {"id": value})
+        result = rag_routes.upload_project_document("P1", **call)
+
+    _drain(result["jobId"])
+    _wait_completed(result["jobId"])
+
+    conn = rag_db.get_connection()
+    try:
+        assert store.get_document(conn, result["documentId"])["sha256"] == (
+            hashlib.sha256(payload).hexdigest()
+        )
+    finally:
+        conn.close()
+    assert rehashed == []
+    assert [mode for path, mode in opened if path.endswith(".txt")] == ["wb"]
 
 
 def test_start_ingestion_rejects_malformed_content_hash(rag_home, stub_embeddings, tmp_path):
@@ -270,8 +359,7 @@ def test_manual_upload_does_not_dedupe_to_linked_folder_document(
 
 
 def test_ingestion_reingests_when_existing_has_zero_chunks(rag_home, stub_embeddings, tmp_path):
-    # A prior ingest of identical bytes that yielded no chunks (e.g. a scanned PDF
-    # before a vision model loaded) must re-ingest, not dedupe to the empty record.
+    # An empty prior ingest (e.g. scanned PDF before a vision model) must re-ingest, not dedupe.
     path = _write(tmp_path, "doc.txt", "alpha bravo charlie " * 50)
     sha = ingestion._sha256_file(path)
     scope = store.kb_scope("K1")
@@ -286,12 +374,12 @@ def test_ingestion_reingests_when_existing_has_zero_chunks(rag_home, stub_embedd
     events = _drain(job_id)
     _wait_completed(job_id)
 
-    assert not any(e.get("deduped") for e in events)  # not a dedupe -> real ingest
+    assert not any(e.get("deduped") for e in events)
     assert doc_id != empty_id
     conn = rag_db.get_connection()
     try:
         docs = store.list_documents(conn, scope)
-        assert len(docs) == 1  # the empty record was removed, replaced by the new one
+        assert len(docs) == 1
         assert docs[0]["num_chunks"] > 0
     finally:
         conn.close()
@@ -425,8 +513,6 @@ def test_delete_document_route_removes_stored_upload(rag_home):
 
 
 def test_get_job_status_includes_num_chunks(rag_home, stub_embeddings, tmp_path):
-    # The poll/reconcile path reads num_chunks from get_job_status (the SSE complete
-    # frame carries it, but a client that falls back to polling needs it here too).
     path = _write(tmp_path, "doc.txt", "alpha bravo charlie " * 50)
     scope = store.kb_scope("K1")
     _doc_id, job_id = ingestion.start_ingestion(scope, "K1", None, "doc.txt", path)
@@ -438,7 +524,6 @@ def test_get_job_status_includes_num_chunks(rag_home, stub_embeddings, tmp_path)
 
 
 def test_save_upload_rejects_oversize_file(rag_home, monkeypatch):
-    # A file over the cap is rejected (413) and its partial bytes are cleaned up.
     import io
 
     from fastapi import HTTPException
@@ -456,7 +541,7 @@ def test_save_upload_rejects_oversize_file(rag_home, monkeypatch):
     with pytest.raises(HTTPException) as ei:
         rag_routes._save_upload(_Up())
     assert ei.value.status_code == 413
-    assert list(rag_uploads_root().glob("*.txt")) == []  # partial upload removed
+    assert list(rag_uploads_root().glob("*.txt")) == []
 
 
 def test_ingestion_delete_removes_all_rows(rag_home, stub_embeddings, tmp_path):
@@ -482,15 +567,15 @@ def test_ingestion_rejects_unsupported_ext(rag_home, stub_embeddings, tmp_path):
         ingestion.start_ingestion(store.kb_scope("K1"), "K1", None, "doc.xyz", path)
 
 
-def test_ingestion_empty_doc_completes_with_zero_chunks(rag_home, stub_embeddings, tmp_path):
+def test_ingestion_empty_doc_reports_failure(rag_home, stub_embeddings, tmp_path):
     path = _write(tmp_path, "empty.txt", "   \n  ")
     scope = store.kb_scope("K1")
     doc_id, job_id = ingestion.start_ingestion(scope, "K1", None, "empty.txt", path)
     events = _drain(job_id)
-    assert events[-1]["type"] == "complete"
-    assert events[-1]["num_chunks"] == 0
+    assert events[-1]["type"] == "error"
+    assert "No extractable text" in events[-1]["error"]
     status = _wait_completed(job_id)
-    assert status["status"] == "completed"
+    assert status["status"] == "failed"
 
 
 @pytest.mark.skipif(

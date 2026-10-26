@@ -1,15 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""GGUF export must find its output, or fail honestly (#7897).
-
-save_pretrained_gguf already returns the files it wrote, but export_gguf discarded
-that and guessed: cwd, new subdirs of the save dir, and a `<checkpoint>_gguf` dir.
-A GGUF written anywhere else, as a Windows local base-model path caused, was
-invisible, and the export still reported success over an empty directory.
-
-Reuses the harness in test_export_absolute_paths.py.
-"""
+"""export_gguf uses the paths save_pretrained_gguf returns and fails when none exist."""
 
 from __future__ import annotations
 
@@ -57,13 +49,79 @@ def _backend(
     return export_mod, backend, save_dir, cwd
 
 
+def _hub_doubles(export_mod, monkeypatch, calls: dict):
+    class _RepoUrl(str):
+        repo_id = "org/model"
+
+    class _HfApi:
+        def __init__(self, token = None):
+            calls["token"] = token
+
+        def create_repo(
+            self,
+            repo_id,
+            private = False,
+            exist_ok = False,
+        ):
+            calls["repo"] = {"repo_id": repo_id, "private": private}
+            return _RepoUrl("https://huggingface.co/org/model")
+
+        def update_repo_settings(
+            self,
+            repo_id,
+            private = None,
+            repo_type = None,
+        ):
+            calls["visibility"] = {"repo_id": repo_id, "private": private}
+
+        def repo_info(
+            self,
+            repo_id,
+            repo_type = None,
+        ):
+            return None
+
+        def upload_file(
+            self,
+            path_or_fileobj,
+            path_in_repo,
+            repo_id,
+            repo_type = None,
+            commit_message = None,
+        ):
+            calls[path_in_repo] = path_or_fileobj
+
+        def upload_folder(
+            self,
+            folder_path,
+            repo_id,
+            repo_type,
+            allow_patterns = None,
+            ignore_patterns = None,
+            delete_patterns = None,
+        ):
+            calls["upload"] = folder_path
+
+    class _ModelCard:
+        def __init__(self, content):
+            calls["card"] = content
+
+        def push_to_hub(
+            self,
+            repo_id,
+            token = None,
+            commit_message = None,
+        ):
+            calls["card_repo"] = repo_id
+
+    monkeypatch.setattr(export_mod, "HfApi", _HfApi)
+    monkeypatch.setattr(export_mod, "ModelCard", _ModelCard)
+
+
 def _gguf(path: Path, payload: bytes = b"GGUF") -> Path:
     path.parent.mkdir(parents = True, exist_ok = True)
     path.write_bytes(payload)
     return path
-
-
-# _reported_gguf_files: the "is this build telling us anything?" contract.
 
 
 @pytest.mark.parametrize(
@@ -71,11 +129,11 @@ def _gguf(path: Path, payload: bytes = b"GGUF") -> Path:
     [
         None,  # pre-2025.10 unsloth / non-main process
         "some/path",  # save_method="lora" returns a str
-        ("path", True, False),  # hypothetical legacy tuple
-        {},  # dict without the key
+        ("path", True, False),
+        {},
         {"gguf_files": None},
         {"gguf_files": "not-a-list"},
-        {"gguf_files": []},  # empty == "nothing to say"
+        {"gguf_files": []},
         {"gguf_files": [123]},  # malformed entry -> distrust all
     ],
     ids = [
@@ -101,9 +159,9 @@ def test_reported_files_filters_missing_and_non_gguf(monkeypatch, tmp_path):
         {
             "gguf_files": [
                 str(real),
-                str(tmp_path / "a" / "deleted.gguf"),  # unlinked by cleanup
-                str(tmp_path / "a" / "notes.txt"),  # not a gguf
-                str(tmp_path / "a"),  # a directory
+                str(tmp_path / "a" / "deleted.gguf"),
+                str(tmp_path / "a" / "notes.txt"),
+                str(tmp_path / "a"),
             ]
         }
     )
@@ -117,9 +175,6 @@ def test_reported_files_accepts_future_keys(monkeypatch, tmp_path):
         {"gguf_files": [str(real)], "some_future_field": 1, "is_vlm": True}
     )
     assert out == [str(real)]
-
-
-# Table B: where the fake exporter puts its output.
 
 
 def test_gguf_beside_base_model_is_relocated(monkeypatch, tmp_path):
@@ -148,7 +203,7 @@ def test_zero_files_is_a_failure_not_a_silent_success(monkeypatch, tmp_path):
         def save_pretrained_gguf(self, model_save_path, tokenizer, quantization_method):
             Path(model_save_path).mkdir(parents = True)
             _gguf(tmp_path / "elsewhere" / "MyModel.Q5_K_M.gguf")
-            return None  # legacy build
+            return None
 
     _m, backend, save_dir, _cwd = _backend(monkeypatch, tmp_path, _Model())
     success, message, output_path = backend.export_gguf(str(save_dir), "q5_k_m")
@@ -170,7 +225,7 @@ def test_nested_gguf_is_rescued_before_rmtree(monkeypatch, tmp_path):
             gguf_dir = Path(str(tmp) + "_gguf") / "shards"
             for i in (1, 2, 3):
                 _gguf(gguf_dir / f"MyModel-{i:05d}-of-00003.gguf")
-            return None  # exercise the fallback path
+            return None
 
     _m, backend, save_dir, _cwd = _backend(monkeypatch, tmp_path, _Model())
     success, message, _p = backend.export_gguf(str(save_dir), "q5_k_m")
@@ -185,13 +240,7 @@ def test_nested_gguf_is_rescued_before_rmtree(monkeypatch, tmp_path):
 
 
 def test_hidden_gguf_is_reported_not_none(monkeypatch, tmp_path):
-    """An empty model stem produced '.Q5_K_M.gguf'; glob.glob could not see it.
-
-    A reporting defect, not file loss: the flatten pass uses Path.glob, which does
-    match dot-leading names, so the file was in place while the log said "(none)".
-    Still bites, because zero-files is now a failure: reverting the listing to
-    glob.glob would fail this export outright.
-    """
+    """Dot-leading GGUF names need Path.glob, since glob.glob misses them and zero files now fails."""
 
     class _Model:
         def save_pretrained_gguf(self, model_save_path, tokenizer, quantization_method):
@@ -334,7 +383,7 @@ def test_materialized_imatrix_is_not_exported_as_a_model(monkeypatch, tmp_path):
             quantization_method,
             imatrix_file = None,
         ):
-            # _materialize_imatrix copies into the model dir, renaming .gguf_file -> .gguf.
+            # _materialize_imatrix renames .gguf_file -> .gguf in the model dir
             _gguf(Path(model_save_path) / "imatrix_unsloth.gguf", b"IMATRIX")
             quant = _gguf(Path(f"{model_save_path}_gguf") / "MyModel.Q5_K_M.gguf")
             return {"gguf_files": [str(quant)]}
@@ -428,8 +477,7 @@ def test_modelfile_relocation_failure_does_not_fail_the_export(monkeypatch, tmp_
     assert not (save_dir / "Modelfile").exists()
 
 
-# The upstream imatrix lives in a Hub repo, so the local export needs the token too -- without
-# disturbing the push path, which already passes it explicitly.
+# the upstream imatrix lives in a Hub repo, so the local export needs the token too
 
 
 def _imatrix_model(accepts_token: bool, calls: dict):
@@ -487,12 +535,15 @@ def test_local_gguf_export_forwards_the_token_for_the_upstream_imatrix(monkeypat
     assert calls["save"] == {"imatrix_file": True, "token": "hf_secret"}
 
 
-def test_hub_push_with_an_imatrix_passes_the_token_exactly_once(monkeypatch, tmp_path):
-    """push_to_hub_gguf already names token=, so the local extra must not reach it as well."""
+def test_hub_push_uploads_the_local_export_instead_of_converting_again(monkeypatch, tmp_path):
+    """push_to_hub_gguf would re-run the whole conversion into the system temp dir."""
     calls: dict = {}
-    _m, backend, save_dir, _cwd = _backend(monkeypatch, tmp_path, _imatrix_model(True, calls))
+    export_mod, backend, save_dir, _cwd = _backend(
+        monkeypatch, tmp_path, _imatrix_model(True, calls)
+    )
+    _hub_doubles(export_mod, monkeypatch, calls)
 
-    success, message, _p = backend.export_gguf(
+    success, message, output_path = backend.export_gguf(
         str(save_dir),
         "iq2_xxs",
         push_to_hub = True,
@@ -502,20 +553,20 @@ def test_hub_push_with_an_imatrix_passes_the_token_exactly_once(monkeypatch, tmp
     )
 
     assert success is True, message
-    assert calls["push"] == {
-        "repo_id": "org/model",
-        "token": "hf_secret",
-        "imatrix_file": True,
-        "private": False,
-    }
+    assert "push" not in calls
+    assert calls["token"] == "hf_secret"
+    assert calls["upload"] == output_path == str(save_dir.resolve())
 
 
 @pytest.mark.parametrize("imatrix_file", [None, False, True])
 @pytest.mark.parametrize("private", [True, False])
 def test_hub_push_gguf_forwards_private_flag(monkeypatch, tmp_path, imatrix_file, private):
-    """push_to_hub_gguf receives the requested private flag for both standard and imatrix exports."""
+    """The created repo receives the requested private flag for standard and imatrix exports."""
     calls: dict = {}
-    _m, backend, save_dir, _cwd = _backend(monkeypatch, tmp_path, _imatrix_model(True, calls))
+    export_mod, backend, save_dir, _cwd = _backend(
+        monkeypatch, tmp_path, _imatrix_model(True, calls)
+    )
+    _hub_doubles(export_mod, monkeypatch, calls)
 
     success, message, _p = backend.export_gguf(
         str(save_dir),
@@ -528,7 +579,7 @@ def test_hub_push_gguf_forwards_private_flag(monkeypatch, tmp_path, imatrix_file
     )
 
     assert success is True, message
-    assert calls["push"]["private"] is private
+    assert calls["repo"] == {"repo_id": "org/model", "private": private}
 
 
 def test_gguf_export_without_an_imatrix_does_not_forward_the_token(monkeypatch, tmp_path):
@@ -597,7 +648,6 @@ def test_imatrix_export_supported_probes_unsloth_zoo_for_kwargs_only_bindings(
     def positional_only(save_directory, tokenizer, quantization_method):
         pass
 
-    # A build that names the argument needs no zoo probe at all.
     assert module._imatrix_export_supported(named) is True
     assert module._imatrix_export_supported(positional_only) is False
 
@@ -619,7 +669,6 @@ def test_imatrix_disabled_explicitly_does_not_forward_the_token(monkeypatch, tmp
     )
 
     assert success is True, message
-    # Neither the credential nor the disabled flag itself is forwarded.
     assert calls["save"] == {"imatrix_file": None, "token": None}
 
 
@@ -677,10 +726,6 @@ def test_disabled_imatrix_does_not_reach_an_older_exporter(monkeypatch, tmp_path
     assert calls["save"] == "q4_k_m"
 
 
-# A probe that says "supported" must be right about the call it authorises, and the
-# materialized imatrix must stay an input under whichever name the filesystem gave it.
-
-
 def test_a_positional_only_imatrix_parameter_is_not_support(monkeypatch, tmp_path):
     """Named is not passable by keyword, and every call site passes one."""
     module, _b, _s, _cwd = _backend(monkeypatch, tmp_path, object())
@@ -725,7 +770,7 @@ _NFD = unicodedata.normalize("NFD", "im\u00e4trix")
     [
         ("imatrix_unsloth.gguf", "/x/imatrix_unsloth.gguf_file"),
         (f"{_NFD}.gguf", f"/x/{_NFC}.gguf_file"),  # APFS stores NFD, the request carried NFC
-        (f"{_NFC}.gguf", f"/x/{_NFD}.gguf_file"),  # and the other way round
+        (f"{_NFC}.gguf", f"/x/{_NFD}.gguf_file"),
     ],
 )
 def test_the_materialized_imatrix_is_never_exported_as_a_model(

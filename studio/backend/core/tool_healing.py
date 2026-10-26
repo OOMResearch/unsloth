@@ -1,32 +1,47 @@
-# SPDX-License-Identifier: AGPL-3.0-only
-# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
-# Bracket-tag, rehearsal, and thinking-block-strip logic adapted from forge
-# (https://github.com/antoinezambelli/forge), Copyright (c) 2025-2026
-# Antoine Zambelli, used under the MIT License.
+"""PEP 604 annotations must stay import-safe on Python 3.9 (requires-python >=3.9)."""
 
-"""Lightweight tool-call parsing and stripping helpers.
-
-External inference servers import this module without pulling in the inference
-orchestrator, structlog, httpx, or the rest of the studio backend. Kept in
-lockstep with ``core/inference/tool_call_parser.py`` so those servers
-(llama-server wrappers, llama-swap, custom shims) reuse the same logic. Any
-change here must also land there.
-
-Handles these serializations (see ``parse_tool_calls_from_text``):
-
-* ``<tool_call>{json}</tool_call>``
-* ``<|tool_call>call:name{...}<tool_call|>`` (Gemma)
-* ``<function=name><parameter=k>v</parameter></function>``
-* ``[TOOL_CALLS]name{json}`` (Mistral / Devstral fallback)
-* ``name[ARGS]{json}`` (reasoning-model rehearsal)
-"""
-
-# PEP 604 annotations must stay import-safe on Python 3.9 (requires-python >=3.9).
 from __future__ import annotations
 
 import bisect
 import json
 import re
+
+# Markerless forms are indistinguishable from quoted prose, so execution-class tools need a
+# wrapper. Same rule for mcp__*. Must match the route's _LOCAL_CODE_TOOLS (drift test).
+EXECUTION_CLASS_TOOL_NAMES = frozenset({"python", "terminal", "edit_file"})
+_MCP_TOOL_PREFIX = "mcp__"
+
+
+def _normalized_tool_name(name) -> str:
+    """Strips the name as the controller's executor does, so the guard checks the name that will run."""
+    return str(name).strip() if isinstance(name, str) else ""
+
+
+def _markerless_promotable(name, enabled_tool_names) -> bool:
+    """True when a bare call named ``name`` may be promoted. ``None`` is name-agnostic;
+    execution-class and MCP names are refused under either gate."""
+    name = _normalized_tool_name(name)
+    if not name:
+        return False
+    if name in EXECUTION_CLASS_TOOL_NAMES or name.startswith(_MCP_TOOL_PREFIX):
+        return False
+    return enabled_tool_names is None or name in enabled_tool_names
+
+
+def _markerless_execution_class(name) -> bool:
+    """Execution-class or MCP name, ignoring enablement: what a body may contain must not vary."""
+    name = _normalized_tool_name(name)
+    return bool(name) and (name in EXECUTION_CLASS_TOOL_NAMES or name.startswith(_MCP_TOOL_PREFIX))
+
+
+def _markerless_blocked_execution(name, enabled_tool_names) -> bool:
+    """True when ``name`` is enabled but the guard declines its bare span. Unlike a disabled
+    name it keeps its place in a chain; only promotion is lost. For whether the BODY stays
+    opaque, use ``_markerless_execution_class``."""
+    return _markerless_execution_class(name) and (
+        enabled_tool_names is None or name in enabled_tool_names
+    )
+
 
 # One nesting level in the strip regexes; deeper may leak markup (still parsed).
 _BRACKETED_JSON_ONE_LEVEL = r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}"
@@ -37,12 +52,11 @@ _REHEARSAL_CLOSED_STRIP_RE = re.compile(
 )
 _REHEARSAL_TAIL_STRIP_RE = re.compile(r"(?<!\[CALL_ID\])\b([\w-]+)\[ARGS\]\s*(?:\{.*)?$", re.DOTALL)
 
-# Hyphen in the name class covers dashed MCP names.
-# Closed-pair patterns are named so _PAT_REQUIRED_TOKEN can skip a doomed lazy rescan: an unguarded
-# <tag>.*?</tag> rescans to EOF from every opener (quadratic).
+# Named so _PAT_REQUIRED_TOKEN can skip a lazy rescan to EOF (quadratic).
 _TC_JSON_CLOSED_PAT = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
 _TC_GEMMA_CLOSED_PAT = re.compile(r"<\|tool_call>.*?<tool_call\|>", re.DOTALL)
-_TC_FUNC_CLOSED_PAT = re.compile(r"<function=[\w-]+>.*?</function>", re.DOTALL)
+# Dotted names too, matching the main parser, else TRUSTED spans miss <function=foo.bar>.
+_TC_FUNC_CLOSED_PAT = re.compile(r"<function=[\w.-]+>.*?</function>", re.DOTALL)
 _TOOL_CLOSED_PATS = [
     _TC_JSON_CLOSED_PAT,
     _TC_GEMMA_CLOSED_PAT,
@@ -58,8 +72,7 @@ _TOOL_CLOSED_PATS = [
     # Drop the bare v11 [/TOOL_CALLS] closer the balanced scan leaves behind.
     re.compile(r"\[/TOOL_CALLS\]"),
 ]
-# The rehearsal tail needs "{" or EOF so prose foo[ARGS] survives; the XML open-tail forms reach EOF
-# and are reused by _tool_call_markup_spans.
+# The rehearsal tail needs "{" or EOF so prose foo[ARGS] survives.
 _TOOL_OPEN_XML_TAIL_PATS = [
     re.compile(r"<tool_call>.*$", re.DOTALL),
     re.compile(r"<\|tool_call>.*$", re.DOTALL),
@@ -77,19 +90,15 @@ _TOOL_ALL_PATS = (
 # Rehearsal strips (name in group 1); name-gated via ``enabled_tool_names``, strip-all when None.
 _REHEARSAL_STRIP_PATS = frozenset({_REHEARSAL_CLOSED_STRIP_RE, _REHEARSAL_TAIL_STRIP_RE})
 
-# Stripped before the quote-aware Gemma helper so a Gemma opener quoted in argument data cannot
-# truncate the block and its tail.
+# Stripped before the Gemma helper so a quoted Gemma opener cannot truncate the block.
 _TOOL_CLOSED_BLOCK_PATS = [_TC_JSON_CLOSED_PAT, _TC_FUNC_CLOSED_PAT]
-# A lazy closed-pair pattern whose close token is absent would rescan to EOF from every opener; skip
-# that quadratic pass.
+# Skip the closed-pair pass if the close token is absent; a lazy match rescans to EOF per opener.
 _PAT_REQUIRED_TOKEN = {
-    # A tuple marks a required CLOSER, and callers bound the regex at the LAST one unconditionally: any
-    # gap test for openers past it is itself the quadratic case.
+    # Callers bound at the LAST required CLOSER unconditionally; a gap test for openers is quadratic.
     _TC_JSON_CLOSED_PAT: ("</tool_call>", "<tool_call>"),
     _TC_GEMMA_CLOSED_PAT: ("<tool_call|>", "<|tool_call>"),
     _TC_FUNC_CLOSED_PAT: ("</function>", "<function="),
-    # Literal in both rehearsal patterns: skips the sub AND its _code_spans scan on the common answer that has
-    # no rehearsal at all.
+    # Literal replacements skip the sub and its _code_spans scan when there is no rehearsal.
     _REHEARSAL_CLOSED_STRIP_RE: "[ARGS]",
     _REHEARSAL_TAIL_STRIP_RE: "[ARGS]",
 }
@@ -120,22 +129,29 @@ def strip_tool_patterns(text: str, patterns) -> str:
 
 
 def _rehearsal_strip(m, pat, text, spans, enabled_tool_names) -> str:
-    """Replacement for one rehearsal strip match: "" to remove it, else what to keep.
-
-    An inactive name or a quoted example is kept. The tail pattern runs to EOF, so a match
-    that opens on a quoted example can still cover a later real call; keep the quoted part
-    and strip from that call on, or the truncated markup leaks into the answer."""
-    if enabled_tool_names is not None and m.group(1) not in enabled_tool_names:
-        return m.group(0)
-    if not _in_code(spans, m.start()):
+    """Strip from a later real call on, but never from inside the kept call args, or its tail is cut."""
+    if _markerless_promotable(m.group(1), enabled_tool_names) and not _in_code(spans, m.start()):
         return ""
+    # Resolved lazily: this scans the whole body, which made long blocked streams quadratic.
+    reh = _REHEARSAL_RE.search(text, m.start(), m.end())
+    cached_body_end: list = []
+
+    def body_end():
+        if not cached_body_end:
+            cached_body_end.append(
+                _balanced_json_span(text, reh.end()) if reh is not None else None
+            )
+        return cached_body_end[0]
+
     pos = m.start()
     while True:
         nxt = pat.search(text, pos + 1)
         if nxt is None or nxt.start() >= m.end():
             return m.group(0)
-        if not _in_code(spans, nxt.start()) and (
-            enabled_tool_names is None or nxt.group(1) in enabled_tool_names
+        if (
+            (body_end() is None or nxt.start() > body_end())
+            and not _in_code(spans, nxt.start())
+            and _markerless_promotable(nxt.group(1), enabled_tool_names)
         ):
             return m.group(0)[: nxt.start() - m.start()]
         pos = nxt.start()
@@ -146,11 +162,7 @@ def apply_tool_strip_patterns(
     patterns,
     enabled_tool_names = None,
 ) -> str:
-    """Apply strip ``patterns`` to ``text``. A bare rehearsal ``name[ARGS]{..}`` pattern
-    strips only when ``name`` is an enabled tool (or when ``enabled_tool_names`` is
-    ``None``) and the match is not inside markdown code; every other pattern is removed
-    unconditionally. A closed-pair pattern whose close token is absent is skipped so an
-    unclosed-marker stream stays linear."""
+    """Skips a closed-pair pattern whose close token is absent, keeping unclosed streams linear."""
     for pat in patterns:
         required = _PAT_REQUIRED_TOKEN.get(pat)
         scan_end = len(text)
@@ -166,8 +178,7 @@ def apply_tool_strip_patterns(
         elif required is not None and required not in text:
             continue
         if pat in _REHEARSAL_STRIP_PATS:
-            # Same two gates the parser applies in _iter_bracket_spans, so an unpromoted rehearsal stays visible
-            # instead of vanishing from the answer.
+            # Same two gates as the parser's _iter_bracket_spans, so unpromoted rehearsals stay visible.
             spans = _code_spans(text)
             _t = text
             text = pat.sub(lambda m: _rehearsal_strip(m, pat, _t, spans, enabled_tool_names), text)
@@ -176,8 +187,7 @@ def apply_tool_strip_patterns(
     return text
 
 
-# <|content_invoke_tool_json|> is TML Inkling's native call marker: its JSON uses an "args" key and
-# the block closes with <|end_message|>.
+# TML Inkling's native call marker: JSON uses "args", block closes with <|end_message|>.
 _TC_JSON_START_RE = re.compile(r"(?:<tool_call>|<\|content_invoke_tool_json\|>)\s*\{")
 _TC_GEMMA_START_RE = re.compile(r"<\|tool_call>\s*call\s*:\s*([\w.\-]+)\s*\{")
 _TC_FUNC_START_RE = re.compile(r"<function=([\w-]+)>\s*")
@@ -190,8 +200,7 @@ _TC_PARAM_CLOSE_RE = re.compile(r"\s*</parameter>\s*$")
 _GEMMA_QUOTE = '<|"|>'
 _PARAM_CLOSE_TAG = "</parameter>"
 _FUNC_CLOSE_TAG = "</function>"
-# A comma NOT followed by an identifier-shaped key token is part of a bare Gemma value (location:New
-# York, NY; meet at 10:00, 11:00).
+# A comma not followed by a key token is part of a bare Gemma value (New York, NY).
 _GEMMA_NEXT_KEY_RE = re.compile(r"\s*[A-Za-z_][\w.\-]*\s*:")
 
 # A candidate starting inside a think block is a rehearsal; "$" accepts an unclosed block mid-stream.
@@ -211,15 +220,12 @@ _MISTRAL_BRACKET_RE = re.compile(
 # The lookbehind keeps the v11 call-id from being taken as the function name.
 _REHEARSAL_RE = re.compile(r"(?<!\[CALL_ID\])\b([\w-]+)\[ARGS\]\s*(?=\{)")
 
-# Gates the markerless rehearsal form only, so quoting the syntax as documentation stays text
-# instead of executing. A fence's info string cannot contain backticks, so a triple-backtick run
-# opening a line is an inline span and not a fence running to EOF; the closer tolerates a CR so a
-# CRLF block still closes. Inline runs are enumerated by length rather than backreferenced: a
-# (`+)..\1 form backtracks over every candidate length and turned 21 KB of unmatched runs into a
-# 1.8s stall.
+# Gates only the markerless rehearsal form, so quoted syntax stays text. Inline runs are
+# enumerated by length, not backreferenced: (`+)..\1 backtracks catastrophically.
 _CODE_SPAN_RE = re.compile(
-    r"^[ \t]*(?:>[ \t]*)*(?:```+[^`\n]*|~~~+[^\n]*)$"
-    r".*?(?:^[ \t]*(?:>[ \t]*)*(?:```+|~~~+)[ \t\r]*$|\Z)"
+    r"^[ \t]*(?:>[ \t]*)*(?:"
+    r"(?P<bt>```+)[^`\n]*$.*?(?:^[ \t]*(?:>[ \t]*)*(?P=bt)`*[ \t\r]*$|\Z)"
+    r"|(?P<tl>~~~+)[^\n]*$.*?(?:^[ \t]*(?:>[ \t]*)*(?P=tl)~*[ \t\r]*$|\Z))"
     r"|``(?:[^`]|`(?!`))*?``|`[^`\n]*`",
     re.DOTALL | re.MULTILINE,
 )
@@ -233,6 +239,9 @@ def _balanced_json_span(text: str, start: int) -> int | None:
     or ``None`` if the braces don't balance. Honors escapes and strings.
     """
     if start >= len(text) or text[start] != "{":
+        return None
+    # A span only closes on "}"; the streaming path rescans a growing body, and find runs in C.
+    if text.find("}", start) < 0:
         return None
     depth = 0
     in_string = False
@@ -266,11 +275,7 @@ def _balanced_brace_end(
     *,
     gemma_quotes: bool = False,
 ) -> int | None:
-    """Index of the ``}`` matching the ``{`` at ``brace_start``, or None.
-
-    Shared with ``core/inference/tool_call_parser.py``. The guard makes a mispositioned
-    call return None instead of reporting an unrelated brace.
-    """
+    """Index of the brace matching brace_start, or None; shared with core/inference/tool_call_parser.py."""
     if brace_start >= len(content) or content[brace_start] != "{":
         return None
     depth = 0
@@ -310,14 +315,7 @@ def _balanced_bracket_end(
     *,
     braces_count: bool = True,
 ) -> int | None:
-    """Index of the ``]`` matching the ``[`` at ``start``, or None. Tracks nesting and
-    double-quoted strings.
-
-    With ``braces_count`` (the default) braces count toward the same depth, so a
-    truncated object cannot close an array early; the Gemma array normalizer needs that.
-    The display strip in ``tool_call_parser.py`` counts brackets only, so a stray ``}``
-    cannot end the span early and leave the rest of a malformed call visible.
-    """
+    """Braces count toward the same depth, so a truncated object cannot close an array early."""
     if start >= len(src) or src[start] != "[":
         return None
     openers = "[{" if braces_count else "["
@@ -346,15 +344,7 @@ def _balanced_bracket_end(
 
 
 def _decode_array_items(text: str, body_start: int, body_end: int):
-    """Return ``(objs, ends)`` for each top-level element of the JSON array between
-    ``body_start`` (at or before its ``[``) and ``body_end`` (exclusive): the decoded
-    object and its absolute exclusive end offset.
-
-    Decoding element-by-element with ``raw_decode`` tolerates the comma-less object
-    separators the repo's own Mistral/Ollama multi-call templates emit
-    (``[{...}{...}]``; see ollama_template_mappers.py). A single ``json.loads`` of the
-    whole body rejects that form and would drop every call. The ends also tile the
-    region across the calls' spans so a with_spans consumer strips each exactly once."""
+    """Decodes element by element with raw_decode: json.loads rejects the comma-less {...}{...} form."""
     decoder = json.JSONDecoder()
     objs: list = []
     ends: list[int] = []
@@ -377,17 +367,11 @@ def _decode_array_items(text: str, body_start: int, body_end: int):
     return objs, ends
 
 
-def _code_spans(text: str) -> list[tuple[int, int]]:
-    """Markdown code spans, used to keep a quoted rehearsal out of the call set.
-
-    A line-start fence cannot occur inside a call's JSON body (a raw newline is
-    invalid JSON there), so no tool-markup exclusion is needed; a stray inline span
-    can at worst hide a same-line rehearsal, which drops a call rather than
-    inventing one. Spans are ordered and non-overlapping, so ``_in_code`` bisects
-    them instead of rescanning from the front per candidate."""
+def _code_spans(text: str, start: int = 0) -> list[tuple[int, int]]:
+    """Returns ordered, non-overlapping spans so _in_code can bisect them instead of rescanning."""
     if "`" not in text and "~~~" not in text:
         return []
-    return [m.span() for m in _CODE_SPAN_RE.finditer(text)]
+    return [m.span() for m in _CODE_SPAN_RE.finditer(text, start)]
 
 
 def _in_code(spans, pos: int) -> bool:
@@ -401,25 +385,7 @@ def _iter_bracket_spans(
     start: int = 0,
     enabled_tool_names = None,
 ):
-    """Yield ``(span_start, span_end, kind, match)`` for each balanced bracket-tag
-    call from ``start`` on, in document order; ``span_end`` exclusive. ``kind`` is
-    ``"array"`` ([TOOL_CALLS] [..]), ``"name"`` ([TOOL_CALLS]name{..}, incl. v11
-    [CALL_ID]/[ARGS]) or ``"rehearsal"`` (name[ARGS]{..}).
-
-    ``enabled_tool_names`` (set, or None = unrestricted) gates only the ambiguous
-    bare rehearsal form: name[ARGS]{..} is a call ONLY when ``name`` is enabled, so a
-    prose ``foo[ARGS]{..}`` (foo disabled) is neither parsed nor stripped. Explicit
-    [TOOL_CALLS] markers stay unconditional, keeping parse/strip/detection symmetric.
-
-    A rehearsal inside markdown code (fenced block or inline span) is documentation
-    for the same reason -- the syntax has no sentinel, so quoting it would otherwise
-    BE a call -- and is likewise neither parsed nor stripped. Explicit markers stay
-    unconditional there too: a ```json block is still a real call for the templates
-    that emit one.
-
-    Balance-only (no JSON validation) so strip and parse share one scan. The cursor
-    jumps past each consumed span, so a marker inside consumed JSON is never
-    re-matched and each regex re-searches only once its match falls behind: linear."""
+    """Bare name[ARGS]{..} is a call only for a promotable name outside code; [TOOL_CALLS] always counts."""
     n = len(text)
     specs = (
         ("array", _MISTRAL_ARRAY_RE),
@@ -456,13 +422,8 @@ def _iter_bracket_spans(
         if end is None:
             cursor = m.end()
             continue
-        if (
-            kind == "rehearsal"
-            and enabled_tool_names is not None
-            and m.group(1) not in enabled_tool_names
-        ):
+        if kind == "rehearsal" and not _markerless_promotable(m.group(1), enabled_tool_names):
             # Quoted syntax, not a call: advance past its body without yielding.
-            # Inactive-name rehearsal is prose: advance past its body without yielding.
             cursor = end + 1
             continue
         if kind == "rehearsal":
@@ -505,14 +466,7 @@ def _split_top_level_commas(src: str) -> list:
 
 
 def _quote_gemma_array_elements(body: str) -> str:
-    """Normalise the elements of a Gemma array value so json.loads succeeds.
-
-    Gemma may emit ``labels:[bug,ui]`` without per-element quotes, or arrays of
-    objects (``items:[{path:a}]``) whose keys/values also lack quotes; left
-    as-is json.loads fails and the whole call is dropped. Bare string elements
-    are quoted, object and nested-array elements are normalised recursively, and
-    quoted strings (already normalised from ``<|"|>``), numbers, and JSON
-    literals are preserved."""
+    """Quotes bare Gemma array elements, since unquoted labels:[bug,ui] would make json.loads fail."""
     out: list[str] = []
     for element in _split_top_level_commas(body):
         stripped = element.strip()
@@ -607,8 +561,7 @@ def _quote_gemma_object_keys(src: str) -> str:
                 i += 1
             parts.append(src[ws:i])
             if i < len(src) and src[i] == "[":
-                # Array value: quote bare string elements (e.g. labels:[bug,ui]) so json.loads succeeds instead
-                # of dropping the call.
+                # Quote bare array elements (labels:[bug,ui]) so json.loads succeeds instead of dropping the call.
                 arr_end = _balanced_bracket_end(src, i)
                 if arr_end is None:
                     parts.append(src[i:])
@@ -656,12 +609,7 @@ def _inside_open_parameter(
     param_closers = (_PARAM_CLOSE_TAG,),
     func_closers = (_FUNC_CLOSE_TAG,),
 ) -> bool:
-    """Return True when ``pos`` falls inside an unclosed parameter value.
-
-    The opener regex and closer tags are parameters so
-    ``core/inference/tool_call_parser.py`` can share this body with its wider vocabulary
-    (``<param name="...">`` openers, ``</param>`` / ``</tool_call>`` closers).
-    """
+    """True when pos is inside an unclosed parameter value; shared with tool_call_parser.py"""
     if param_start_re is None:
         param_start_re = _TC_PARAM_START_RE
     last_param_start = -1
@@ -683,14 +631,12 @@ def _inside_open_parameter(
             last_param_start = match.start()
     if last_param_start < 0:
         return False
-    # The parameter's OWN close tag decides: one closing after pos makes the position argument data.
-    # Bounded, so an absent alternate spelling does not scan the whole suffix.
+    # The parameter's OWN close tag decides; bounded so an absent spelling skips the suffix scan.
     for tag in param_closers:
         found = content.find(tag, last_param_start, min(len(content), pos + len(tag)))
         if 0 <= found <= pos:
             return False
-    # Try the closer matching the opener spelling first. Cross-spelling closes are still accepted; the normal
-    # form just needs a shorter scan.
+    # Try the matching closer first; cross-spelling closes still work but need a longer scan.
     if content.startswith("<param", last_param_start) and not content.startswith(
         "<parameter", last_param_start
     ):
@@ -706,10 +652,7 @@ def _inside_open_parameter(
 
 
 def _func_close_index(content: str, body_start: int, body: str) -> int:
-    """Index in ``body`` of the first ``</function>`` that is not argument
-    data (not inside an open parameter value); -1 when every close is data.
-    Taking the LAST close swallowed prose between the real close and a
-    literal ``</function>`` mentioned later in the answer."""
+    """First close outside a parameter value; taking the last one swallowed prose after the real close."""
     idx = body.find(_FUNC_CLOSE_TAG)
     while idx >= 0:
         if not _inside_open_parameter(content, body_start + idx):
@@ -730,11 +673,7 @@ def _trim_param_value(val: str) -> str:
 
 
 def _marker_coverage(content: str, markers) -> list[tuple[int, int]]:
-    """Coverage ``[start, end]`` per marker, used to skip markers that are another
-    call's data. Closes pair to markers via a per-format stack so an inner close
-    is not mistaken for the outer's. Unbalanced braces cover to EOF; balanced with
-    a paired close cover through it (markers before the close are data); balanced
-    without one cover only the braces, so a later sibling is still recovered."""
+    """Unbalanced braces cover to EOF; a closeless balanced call covers only braces, so siblings survive."""
     n = len(content)
     brace_regions = sorted((s, be) for (s, be, _k, _m) in markers if be >= 0)
     brace_starts = []
@@ -751,8 +690,7 @@ def _marker_coverage(content: str, markers) -> list[tuple[int, int]]:
             events.append((brace_end, 0, _kind, idx))
     for kind, close_re in (("json", _TC_END_TAG_RE), ("gemma", _TC_GEMMA_END_TAG_RE)):
         for cm in close_re.finditer(content):
-            # A close inside another call's balanced braces is quoted data; it must not pop an earlier close-
-            # less marker and swallow a sibling.
+            # A close inside another call's braces is quoted data and must not pop an earlier marker.
             if brace_starts:
                 region_idx = bisect.bisect_left(brace_starts, cm.start()) - 1
                 inside_braces = region_idx >= 0 and cm.start() < brace_max_ends[region_idx]
@@ -824,24 +762,7 @@ def parse_tool_calls_from_text(
     enabled_tool_names = None,
     with_spans: bool = False,
 ):
-    """Parse OpenAI-format tool calls from model text.
-
-    Handles formats like:
-      <tool_call>{"name":"web_search","arguments":{"query":"..."}}</tool_call>
-      <|tool_call>call:web_search{query:"..."}<tool_call|>
-      <tool_call><function=web_search><parameter=query>...</parameter></function></tool_call>
-      [TOOL_CALLS]web_search{"query":"..."}        (Mistral / Devstral fallback)
-      web_search[ARGS]{"query":"..."}             (reasoning-model rehearsal)
-
-    A call rehearsed inside a ``<think>`` / ``[THINK]`` block is skipped, not
-    executed; the block is kept so a literal tag in a real argument is preserved.
-
-    With ``with_spans=True`` returns ``(tool_calls, spans)`` where ``spans[i]``
-    is the half-open ``(start, end)`` byte range of ``tool_calls[i]``'s markup
-    in ``content`` (including its close tag when present), so a caller can
-    remove exactly the parsed markup and keep every other byte intact.
-    """
-    # Candidates starting inside a think block are rehearsals; a think marker opening inside a call is argument data.
+    """Rehearsals in think blocks are skipped, not run; the block stays so literal tags in args survive."""
     _think_spans = _think_spans_outside_tool_markup(content)
     _think_starts = [s for s, _e in _think_spans]
 
@@ -854,7 +775,19 @@ def parse_tool_calls_from_text(
     call_spans: list[tuple] = []
     # A marker inside another call's coverage, even one that failed to parse, is data and is not executed.
     parsed_items = []
-    markers = [mk for mk in _build_markers(content) if not _in_think(mk[0])]
+    # Mask blocked markerless call bodies here too: passthrough healing reaches this parser unmasked.
+    try:
+        from core.inference.tool_call_parser import _blocked_markerless_body_spans
+        _blocked_spans = _blocked_markerless_body_spans(content, enabled_tool_names)
+    except Exception:  # noqa: BLE001 -- no spans just means the old, unmasked behaviour
+        _blocked_spans = []
+
+    def _in_blocked(pos: int) -> bool:
+        return any(begin <= pos < stop for begin, stop in _blocked_spans)
+
+    markers = [
+        mk for mk in _build_markers(content) if not _in_think(mk[0]) and not _in_blocked(mk[0])
+    ]
     coverage = _marker_coverage(content, markers)
     covered_until = -1
     for idx, (start, brace_end, kind, m) in enumerate(markers):
@@ -873,8 +806,7 @@ def parse_tool_calls_from_text(
             if kind == "json":
                 obj = json.loads(content[m.end() - 1 : brace_end + 1])
                 name = obj.get("name", "")
-                # Accept "parameters" (Llama-3.2 drift inside Hermes) and "args" (TML Inkling) as aliases for
-                # "arguments".
+                # Accept "parameters" (Llama-3.2) and "args" (TML Inkling) as aliases.
                 arguments = obj.get("arguments")
                 if arguments is None:
                     arguments = obj.get("parameters")
@@ -882,9 +814,7 @@ def parse_tool_calls_from_text(
                     arguments = obj.get("args", {})
                 if isinstance(arguments, dict):
                     arguments = json.dumps(arguments)
-                # Inkling echoes the bare tool NAME (and a role opener) before the marker:
-                # <|message_model|>NAME<|content_invoke_tool_json|>{...}. Fold that echo into the markup span so
-                # promotion removes it too.
+                # Inkling echoes the bare tool NAME before the marker; fold it into the span so it is stripped.
                 if name and content.startswith("<|content_invoke_tool_json|>", start):
                     pre = content[:start]
                     if pre.endswith(name):
@@ -909,6 +839,7 @@ def parse_tool_calls_from_text(
         for fm in _TC_FUNC_START_RE.finditer(content)
         if not _inside_open_parameter(content, fm.start())
         and not _in_think(fm.start())
+        and not _in_blocked(fm.start())
         and not any(s <= fm.start() < e for s, e in coverage)
     ]
     for idx, fm in enumerate(func_starts):
@@ -988,25 +919,22 @@ def parse_tool_calls_from_text(
         )
         call_spans.append((start, span_end))
 
-    # Patterns 3+4: Mistral [TOOL_CALLS] and bare rehearsal via one balanced scan in document order, so a
-    # Mistral call and a rehearsal in one message both parse.
+    # One balanced scan in document order, so Mistral calls and rehearsals in one message both parse.
     if not tool_calls:
         for start, end, kind, m in _iter_bracket_spans(
             content, enabled_tool_names = enabled_tool_names
         ):
-            if _in_think(start):
+            if _in_think(start) or _in_blocked(start):
                 continue
             # Extend the region over an immediately-following v11 closer so with_spans consumers strip it too.
             closer = re.match(r"\s*\[/TOOL_CALLS\]", content[end:])
             region_end = end + closer.end() if closer else end
             if kind == "array":
-                # Decode elements individually: one json.loads of the whole body rejects the comma-less multi-call
-                # arrays Mistral/Ollama templates emit.
+                # Decode elements individually: Mistral/Ollama templates emit comma-less multi-call arrays.
                 payload, item_ends = _decode_array_items(content, m.end(), end)
                 if not payload:
                     continue
-                # Tile the region so every byte belongs to exactly one span and promoted markup is stripped exactly
-                # once.
+                # Tile so every byte belongs to exactly one span and promoted markup is stripped once.
                 tile_start = start
                 last_span_idx = -1
                 for item_idx, item in enumerate(payload):
@@ -1020,8 +948,7 @@ def parse_tool_calls_from_text(
                         except (json.JSONDecodeError, ValueError):
                             pass
                     if not isinstance(args, (dict, str)):
-                        # A non-object scalar becomes {}, not the string "null" that auto-heal would mangle into
-                        # {"query":"null"}.
+                        # Non-object scalar becomes {}, not "null", which auto-heal would turn into {"query":"null"}.
                         args = {}
                     tool_calls.append(
                         {
@@ -1029,9 +956,7 @@ def parse_tool_calls_from_text(
                             "type": "function",
                             "function": {
                                 "name": item.get("name", ""),
-                                # A bare scalar string stays raw; json.dumps would double-encode it so the arg
-                                # healer wraps it with
-                                # literal quotes.
+                                # A bare string stays raw; json.dumps would double-encode it.
                                 "arguments": args if isinstance(args, str) else json.dumps(args),
                             },
                         }
@@ -1068,11 +993,7 @@ def parse_tool_calls_from_text(
 
 
 def _strip_bracket_tag_calls(text: str, enabled_tool_names = None) -> str:
-    """Strip complete [TOOL_CALLS] arrays / name / bare name[ARGS]{..} calls with one
-    balanced forward scan, so nested JSON args are removed whole (a fixed-depth regex
-    left two-level args behind). Truncated tails go to the caller's catch-all. Linear.
-    ``enabled_tool_names`` gates the rehearsal form (inactive-name prose kept; None
-    strips every span)."""
+    """Balanced scan removes nested args whole; enabled_tool_names gates rehearsals (None strips all)."""
     if len(text) > _MAX_BRACKET_SCAN_CHARS:
         return text
     out: list[str] = []
@@ -1085,11 +1006,7 @@ def _strip_bracket_tag_calls(text: str, enabled_tool_names = None) -> str:
 
 
 def _tool_call_markup_spans(text: str) -> list[tuple[int, int]]:
-    """Spans of tool-call markup, so a literal <think>/[THINK] inside a call's args is
-    stripped WITH the call, not kept as a reasoning block. Covers closed XML/bracket
-    calls and an unclosed XML call (run via allow_incomplete); without the open-ended
-    span the unclosed call's markup would leak after execution."""
-    # Skip a lazy closed-pair pattern whose close token is absent: its finditer rescans to EOF from every opener.
+    """Includes an unclosed XML call's open-ended span, so its markup does not leak after execution."""
     spans = []
     for pat in _TOOL_CLOSED_PATS:
         required = _PAT_REQUIRED_TOKEN.get(pat)
@@ -1116,10 +1033,7 @@ def _tool_call_markup_spans(text: str) -> list[tuple[int, int]]:
 
 
 def _think_spans_outside_tool_markup(text: str) -> list[tuple[int, int]]:
-    """<think>/[THINK] block spans, minus any whose opening marker sits INSIDE a
-    tool-call span (that tag is argument data, not reasoning). Keeping it would drop a
-    real call after it as rehearsed and leak the call's markup. START tested only, so
-    a greedy unclosed <think> past the call is still that call's argument data."""
+    """A think tag opening inside a tool-call span is argument data, so it is not a reasoning block."""
     think_spans = [m.span() for m in _THINK_TAG_RE.finditer(text)]
     call_spans = _tool_call_markup_spans(text)
     # Prefilled reasoning: the template opens <think> in the prompt, so a leading span skips calls rehearsed there.
@@ -1140,12 +1054,7 @@ def _think_spans_outside_tool_markup(text: str) -> list[tuple[int, int]]:
 
 
 def strip_outside_think(text: str, strip_segment) -> str:
-    """Apply ``strip_segment(segment, is_last)`` to visible text around <think>/[THINK]
-    blocks, preserving the blocks verbatim (tool-looking text inside is rehearsal).
-    ``is_last`` is True only after the final block, so trailing-tail patterns apply
-    only there. Shared by every strip path so they stay consistent."""
-    # A think marker opening inside a complete call is argument text; START-tested, so an unclosed match
-    # stays argument data.
+    """Applies strip_segment outside think blocks; is_last is True only after the final block."""
     think_spans = _think_spans_outside_tool_markup(text)
     if not think_spans:
         return strip_segment(text, True)
@@ -1176,8 +1085,7 @@ def _strip_gemma_native_spans(text: str, *, final: bool) -> str:
                 out.append(text[cursor:start])
                 cursor = len(text)
             break
-        # Junk between } and the close marker is malformed-call markup: strip through the close, and no
-        # close anywhere means stop.
+        # Junk between } and the close tag is malformed markup: strip through the close, or stop if none.
         close = _TC_GEMMA_END_TAG_RE.search(text, brace_end + 1)
         if close is None:
             if final:
@@ -1211,10 +1119,7 @@ def _gemma_span_ranges(text: str) -> list:
 
 
 def _strip_closed_blocks_outside_gemma(text: str) -> str:
-    """Closed JSON/function pre-pass that skips matches starting inside a complete
-    Gemma span: deleting across the span boundary would mangle the Gemma close and
-    truncate the tail. A skipped match resumes at the covering span's end, so a
-    real function-XML call after the span is still stripped."""
+    """Skips matches starting inside a Gemma span: deleting across its boundary mangles the close."""
     ranges = _gemma_span_ranges(text)
     if not ranges:
         return strip_tool_patterns(text, _TOOL_CLOSED_BLOCK_PATS)
@@ -1259,8 +1164,7 @@ def _strip_markup_segment(
     final: bool,
     enabled_tool_names = None,
 ) -> str:
-    # Bracket-tag balanced scan first, then the quote-aware Gemma passes so a literal marker in an
-    # argument cannot truncate a block, then the regex sweeps.
+    # Order matters: bracket-tag scan, then quote-aware Gemma passes, then the regex sweeps.
     text = _strip_bracket_tag_calls(text, enabled_tool_names = enabled_tool_names)
     text = _strip_closed_blocks_outside_gemma(text)
     text = _strip_gemma_native_spans(text, final = final)
@@ -1274,17 +1178,7 @@ def strip_tool_call_markup(
     final: bool = False,
     enabled_tool_names = None,
 ) -> str:
-    """Strip tool-call XML markup from text.
-
-    When ``final`` is False, only fully closed tool-call blocks are removed.
-    When ``final`` is True, trailing incomplete tool-call blocks are removed
-    too, and the result is stripped of surrounding whitespace.
-
-    ``<think>`` / ``[THINK]`` reasoning is preserved verbatim (see
-    ``strip_outside_think``); the trailing-tail patterns apply only after the
-    last block. ``enabled_tool_names`` keeps an inactive-name ``foo[ARGS]{..}``
-    example visible (it is prose, not a call) so display cleanup matches detection.
-    """
+    """final=True also strips trailing incomplete blocks and whitespace; think blocks kept verbatim."""
     result = strip_outside_think(
         text,
         lambda seg, is_last: _strip_markup_segment(

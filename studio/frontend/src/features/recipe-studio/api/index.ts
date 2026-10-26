@@ -2,6 +2,7 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import { authFetch } from "@/features/auth";
+import { apiUrl } from "@/lib/api-base";
 import {
   formatFastApiDetail,
   readFastApiError,
@@ -132,18 +133,15 @@ export type SeedInspectRequest = {
 };
 
 export type SeedInspectUploadRequest = {
-  // Legacy single-file
   filename?: string;
   // biome-ignore lint/style/useNamingConvention: api schema
   content_base64?: string;
-  // Multi-file
   // biome-ignore lint/style/useNamingConvention: api schema
   block_id?: string;
   // biome-ignore lint/style/useNamingConvention: api schema
   file_ids?: string[];
   // biome-ignore lint/style/useNamingConvention: api schema
   file_names?: string[];
-  // Shared
   // biome-ignore lint/style/useNamingConvention: api schema
   preview_size?: number;
   // biome-ignore lint/style/useNamingConvention: api schema
@@ -166,6 +164,8 @@ export type SeedInspectResponse = {
   subset?: string | null;
   // biome-ignore lint/style/useNamingConvention: api schema
   resolved_paths?: string[] | null;
+  // biome-ignore lint/style/useNamingConvention: api schema
+  total_rows?: number | null;
 };
 
 export type ValidateError = {
@@ -212,8 +212,7 @@ async function parseErrorResponse(response: Response): Promise<string> {
       // biome-ignore lint/style/useNamingConvention: api schema
       raw_detail?: string;
     };
-    // Use ||, not ??: an array detail is truthy but not nullish, and
-    // formatFastApiDetail returns null when it cannot flatten the value.
+    // Use ||, not ??: formatFastApiDetail returns null when it cannot flatten the value.
     const formatted = formatFastApiDetail(parsed.detail);
     if (formatted) return formatted;
     if (typeof parsed.message === "string" && parsed.message)
@@ -328,6 +327,32 @@ export async function getRecipeJobDataset(
   );
 }
 
+export type RecipeJobDownloadFormat = "jsonl" | "parquet";
+
+export async function downloadRecipeJobDataset(
+  jobId: string,
+  options?: {
+    format?: RecipeJobDownloadFormat;
+    artifactPath?: string | null;
+    filename?: string | null;
+  },
+): Promise<{ url: string; filename: string }> {
+  const params = new URLSearchParams();
+  params.set("format", options?.format ?? "jsonl");
+  if (options?.artifactPath) {
+    params.set("artifact_path", options.artifactPath);
+  }
+  if (options?.filename) {
+    params.set("filename", options.filename);
+  }
+  const { path, filename } = await getJson<{ path: string; filename: string }>(
+    `/jobs/${jobId}/download-url?${params.toString()}`,
+  );
+  // Drop the trailing slash: the native downloader refuses every 3xx redirect.
+  const base = DATA_DESIGNER_API_BASE.replace(/\/+$/, "");
+  return { url: apiUrl(`${base}${path}`), filename };
+}
+
 export async function cancelRecipeJob(
   jobId: string,
 ): Promise<JobStatusResponse> {
@@ -424,7 +449,6 @@ export async function streamRecipeJobEvents(options: {
       }
     }
   } finally {
-    // Release the stream lock now instead of leaking the reader until GC.
     try {
       await reader.cancel();
     } catch {
@@ -432,8 +456,6 @@ export async function streamRecipeJobEvents(options: {
     }
   }
 }
-
-// NOTE: preview endpoints removed from harness.
 
 type UnstructuredFileUploadResponse = {
   // biome-ignore lint/style/useNamingConvention: api schema
@@ -445,8 +467,7 @@ type UnstructuredFileUploadResponse = {
   error?: string;
 };
 
-/** A desktop drop, redeemed server-side: Tauri hands the webview a path, never
- * a File, so the bytes never cross the bridge. */
+/** A desktop drop, redeemed server-side so the bytes never cross the Tauri bridge. */
 export interface NativeUnstructuredUpload {
   nativePathLease: string;
   name: string;

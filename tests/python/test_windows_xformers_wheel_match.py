@@ -1,20 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""xFormers must match the CUDA build of the resident torch on Windows.
-
-xformers/_C.pyd is linked against ONE exact (torch, CUDA) pair. Loaded next to any
-other pair, ``torch.ops.load_library`` raises and xformers/_cpp_lib.py swallows it
-into a warning -- memory-efficient attention, SwiGLU and the sparse ops all vanish
-while the import still "succeeds". PyPI publishes only the CUDA-12.8 flavour, so a
-cu130 install that resolves xformers from PyPI loses every kernel silently.
-
-These tests pin the two halves of the fix that live in pyproject.toml:
-  * the CUDA-matched Windows route (the cuXXX-torchYYY extras) really does resolve
-    to a win_amd64 wheel from the MATCHING CUDA index, and
-  * the CUDA-agnostic ``windows`` extra can no longer float onto an arbitrary
-    xFormers release.
-"""
+"""xformers/_C.pyd is linked to one exact torch/CUDA pair; a mismatch only warns and drops kernels."""
 
 from __future__ import annotations
 
@@ -30,15 +17,8 @@ PYPROJECT = REPO_ROOT / "pyproject.toml"
 
 WHEEL_INDEX_BASE = "https://download.pytorch.org/whl"
 
-# (CUDA family, torch release) -> xFormers version, i.e. the wheel that index
-# actually publishes for that torch. Every row was HEAD-verified as live on
-# download.pytorch.org, and the cu128/cu130 0.0.34 wheels were downloaded and
-# their xformers/cpp_lib.json read back:
-#     cu128 -> {"cuda": 1208, "torch": "2.10.0+cu128"}
-#     cu130 -> {"cuda": 1300, "torch": "2.10.0+cu130"}
-# Keep this in step with _XFORMERS_WHEEL_VERSIONS in
-# studio/backend/utils/wheel_utils.py and $script:XformersWheelVersions in
-# install.ps1 -- test_xformers_matrix_agrees_with_wheel_utils below enforces it.
+# (CUDA family, torch release) -> xFormers version published by that index.
+# Keep in step with wheel_utils._XFORMERS_WHEEL_VERSIONS and install.ps1 (enforced below).
 XFORMERS_WHEEL_MATRIX: dict[tuple[str, str], str] = {
     ("cu126", "290"): "0.0.33.post1",
     ("cu128", "290"): "0.0.33.post1",
@@ -51,8 +31,7 @@ XFORMERS_WHEEL_MATRIX: dict[tuple[str, str], str] = {
     ("cu130", "2100"): "0.0.34",
 }
 
-# Torch releases with no xFormers wheel on any index; naming one in an extra would resolve
-# a wheel built for a different torch. Empty: 0.0.35 is stable-ABI and loads under 2.11 up.
+# Empty: 0.0.35 is stable-ABI and loads under 2.11 and up.
 TORCH_RELEASES_WITHOUT_XFORMERS_WHEELS: tuple[str, ...] = ()
 
 
@@ -68,8 +47,8 @@ def _extras() -> dict[str, list[str]]:
     return tomllib.loads(PYPROJECT.read_text(encoding = "utf-8"))["project"]["optional-dependencies"]
 
 
-def _windows_xformers_urls(deps: list[str]) -> list[str]:
-    """Every xformers direct-URL dep in ``deps`` whose marker holds on Windows x64."""
+def _windows_xformers(deps: list[str]) -> list[str]:
+    """Every xformers dep in ``deps``, URL or version pin, whose marker holds on Win x64."""
     markers = pytest.importorskip("packaging.markers")
     env = {
         "sys_platform": "win32",
@@ -81,15 +60,16 @@ def _windows_xformers_urls(deps: list[str]) -> list[str]:
         "implementation_name": "cpython",
         "platform_python_implementation": "CPython",
     }
-    urls: list[str] = []
+    found: list[str] = []
     for dep in deps:
         spec, _, marker_text = dep.partition(";")
-        if "xformers @ " not in spec:
+        spec = spec.strip()
+        if not spec.startswith("xformers"):
             continue
         if marker_text.strip() and not markers.Marker(marker_text.strip()).evaluate(env):
             continue
-        urls.append(spec.split("@", 1)[1].strip())
-    return urls
+        found.append(spec)
+    return found
 
 
 @pytest.mark.parametrize(("family", "torch_tag"), sorted(XFORMERS_WHEEL_MATRIX))
@@ -97,14 +77,21 @@ def test_windows_resolves_a_cuda_matched_wheel(family: str, torch_tag: str):
     """`unsloth[cu128-torch2100]` / `unsloth[cu130-torch2100]` and friends must land on
     a win_amd64 wheel served by their OWN CUDA index -- never PyPI, never a neighbour's."""
     version = XFORMERS_WHEEL_MATRIX[(family, torch_tag)]
-    deps = _extras()[f"{family}onlytorch{torch_tag}"]
-    urls = _windows_xformers_urls(deps)
+    extra = f"{family}onlytorch{torch_tag}"
+    specs = _windows_xformers(_extras()[extra])
 
-    assert len(urls) == 1, (
-        f"{family}onlytorch{torch_tag} must resolve exactly one xformers wheel on "
-        f"Windows, got {urls}"
-    )
-    assert urls[0] == (f"{WHEEL_INDEX_BASE}/{family}/xformers-{version}-cp39-abi3-win_amd64.whl")
+    assert (
+        len(specs) == 1
+    ), f"{extra} must resolve exactly one xformers wheel on Windows, got {specs}"
+    spec = specs[0]
+    if "@" in spec:
+        url = spec.split("@", 1)[1].strip()
+        assert url == f"{WHEEL_INDEX_BASE}/{family}/xformers-{version}-cp39-abi3-win_amd64.whl"
+    else:
+        # Index is the install-time --index-url; the pin must be the version it publishes for this torch.
+        assert (
+            spec == f"xformers=={version}"
+        ), f"{extra} must pin the {family} wheel version for torch {torch_tag}, got {spec!r}"
 
 
 @pytest.mark.parametrize(("family", "torch_tag"), sorted(XFORMERS_WHEEL_MATRIX))
@@ -119,8 +106,7 @@ def test_aggregate_extra_pulls_in_the_matched_wheel(family: str, torch_tag: str)
 @pytest.mark.parametrize("torch_tag", TORCH_RELEASES_WITHOUT_XFORMERS_WHEELS)
 def test_no_extras_invented_for_torch_without_xformers_wheels(torch_tag: str):
     extras = _extras()
-    # CUDA extras only -- the intel-gpu-torch2110 / intelgputorch2110 XPU extras carry
-    # no xformers row and are not affected.
+    # CUDA extras only; the XPU extras carry no xformers row.
     pattern = re.compile(rf"^cu\d+(?:only)?-?torch{torch_tag}$")
     offenders = [n for n in extras if pattern.match(n)]
     assert offenders == [], (
@@ -130,14 +116,7 @@ def test_no_extras_invented_for_torch_without_xformers_wheels(torch_tag: str):
 
 
 def test_windows_extra_xformers_spec_is_a_version_range():
-    """The windows extra is the CUDA-agnostic fallback, so it must stay a plain range.
-
-    It is deliberately uncapped. 0.0.35 declares torch>=2.10 rather than an exact pin
-    because xFormers moved to the PyTorch stable API/ABI in 0.0.34, and upstream states
-    that such builds "will be compatible with any later version". A cap would also strand
-    anyone on torch 2.10.1, since 0.0.34 pins torch==2.10.0 exactly. The CUDA family is
-    the axis that has to match, and this extra cannot see it -- install.ps1 does that.
-    """
+    """The windows extra is deliberately uncapped, since a cap would strand torch 2.10.1 users."""
     deps = _extras()["windows"]
     specs = [d for d in deps if d.split(";")[0].strip().startswith("xformers")]
     assert len(specs) == 1, f"expected one xformers spec in the windows extra, got {specs}"

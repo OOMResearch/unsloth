@@ -64,12 +64,7 @@ def reset_update_status_cache() -> None:
 
 
 def detect_install_source() -> str:
-    """Return a coarse install source without exposing local paths.
-
-    Conservative: PEP 610 local/vcs metadata wins. Legacy source
-    installs count as local only when package files resolve outside
-    site-packages/dist-packages and under a Git checkout.
-    """
+    """Coarse source, no local paths; PEP 610 local/vcs metadata wins; legacy installs are local only outside site-packages/dist-packages and in a Git checkout."""
     try:
         dist = distribution(PACKAGE_NAME)
     except PackageNotFoundError:
@@ -89,6 +84,10 @@ def detect_install_source() -> str:
             return "local_repo"
 
     return "pypi"
+
+
+def update_checks_disabled() -> bool:
+    return os.environ.get(DISABLE_ENV_VAR) == "1"
 
 
 def get_studio_install_source_status(current_version: str) -> dict[str, Any]:
@@ -119,10 +118,9 @@ def _is_version(value: str) -> bool:
 def get_studio_update_status(current_version: str) -> dict[str, Any]:
     """Return public, read-only update status for the web UI."""
     install_source = detect_install_source()
-    disabled = os.environ.get(DISABLE_ENV_VAR) == "1"
+    disabled = update_checks_disabled()
 
-    # Dev-only: the popup is PyPI-install-only, so fake a version to review it
-    # from a checkout. The documented opt-out still wins.
+    # Dev-only: fakes a version so the PyPI-only popup can be reviewed from a checkout.
     forced_version = os.environ.get(FAKE_UPDATE_ENV_VAR, "").strip()
     if forced_version and not disabled and _is_version(forced_version):
         return _status_response(

@@ -2,11 +2,15 @@
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
 import asyncio
+import json
+import math
 import os
 import sys
 import time
 import threading
 from types import SimpleNamespace
+
+import pytest
 
 _backend = os.path.join(os.path.dirname(__file__), "..")
 sys.path.insert(0, _backend)
@@ -14,9 +18,37 @@ sys.path.insert(0, _backend)
 import routes.inference as inf_mod  # noqa: E402
 
 
+class _Request:
+    async def is_disconnected(self):
+        return False
+
+
 def test_non_streaming_generation_timeout_has_read_deadline():
     timeout = inf_mod._llama_non_streaming_generation_timeout()
     assert timeout.read == inf_mod._DEFAULT_FIRST_TOKEN_TIMEOUT_S
+
+
+def test_an_infinite_env_value_does_not_remove_the_deadline(monkeypatch):
+    """Non-finite env values such as inf or 1e309 fall back to the default, so the deadline still
+    applies."""
+    for raw in ("inf", "Infinity", "1e309", "-inf"):
+        monkeypatch.setenv(inf_mod._OPENAI_COMPAT_FIRST_TOKEN_TIMEOUT_ENV, raw)
+        monkeypatch.setenv(inf_mod._OPENAI_COMPAT_STREAM_KEEPALIVE_ENV, raw)
+
+        first = inf_mod._first_token_timeout_s()
+        assert math.isfinite(first), (raw, first)
+        assert first == inf_mod._DEFAULT_FIRST_TOKEN_TIMEOUT_S, (raw, first)
+
+        keepalive = inf_mod._openai_passthrough_stream_keepalive_interval()
+        assert keepalive is None or math.isfinite(keepalive), (raw, keepalive)
+
+        timeout = inf_mod._llama_non_streaming_generation_timeout()
+        for field in ("connect", "read", "write", "pool"):
+            value = getattr(timeout, field)
+            assert value is None or math.isfinite(value), (raw, field, value)
+
+    monkeypatch.setenv(inf_mod._OPENAI_COMPAT_FIRST_TOKEN_TIMEOUT_ENV, "37.5")
+    assert inf_mod._first_token_timeout_s() == 37.5
 
 
 def test_stream_first_item_deadline_after_headers():
@@ -41,48 +73,57 @@ def test_stream_first_item_deadline_after_headers():
     asyncio.run(_run())
 
 
-def test_stream_first_item_deadline_does_not_hop_tasks():
-    async def _run():
-        outer_task = asyncio.current_task()
-        seen_tasks = []
+def test_stream_read_is_never_cancelled_to_implement_a_deadline():
+    """A stream read must never be cancelled to enforce a deadline, since cancelling truncates the body."""
 
-        class _One:
+    async def _run():
+        cancels = []
+        reads = []
+
+        class _Items:
             def __init__(self):
-                self.done = False
+                self.count = 0
 
             async def __anext__(self):
-                seen_tasks.append(asyncio.current_task())
-                if self.done:
+                reads.append(1)
+                try:
+                    await asyncio.sleep(0.05)
+                except asyncio.CancelledError:
+                    cancels.append(1)
+                    raise
+                self.count += 1
+                if self.count > 2:
                     raise StopAsyncIteration
-                self.done = True
                 return "data: {}"
 
         out = []
         async for item in inf_mod._aiter_llama_stream_items(
-            _One(),
-            first_token_deadline = time.monotonic() + 1,
+            _Items(),
+            first_token_deadline = time.monotonic() + 5,
+            keepalive_interval_s = 0.01,
         ):
+            if item is inf_mod._LLAMA_STREAM_KEEPALIVE:
+                continue
             out.append(item)
 
-        assert out == ["data: {}"]
-        assert seen_tasks == [outer_task, outer_task]
+        assert out == ["data: {}", "data: {}"]
+        assert cancels == [], "a keepalive tick must never cancel the in-flight read"
+        assert len(reads) == 3, reads
 
     asyncio.run(_run())
 
 
-def test_stream_first_item_deadline_uses_compat_timeout_without_task_hop(monkeypatch):
+def test_stream_pump_does_not_require_asyncio_timeout(monkeypatch):
+    """The repo floor is 3.9, which has no `asyncio.timeout`. The rewrite needs
+    only `ensure_future` + `wait`, so removing it must change nothing."""
     monkeypatch.setattr(inf_mod.asyncio, "timeout", None, raising = False)
 
     async def _run():
-        outer_task = asyncio.current_task()
-        seen_tasks = []
-
         class _One:
             def __init__(self):
                 self.done = False
 
             async def __anext__(self):
-                seen_tasks.append(asyncio.current_task())
                 if self.done:
                     raise StopAsyncIteration
                 self.done = True
@@ -96,7 +137,8 @@ def test_stream_first_item_deadline_uses_compat_timeout_without_task_hop(monkeyp
             out.append(item)
 
         assert out == ["data: {}"]
-        assert seen_tasks == [outer_task, outer_task]
+
+    asyncio.run(_run())
 
     asyncio.run(_run())
 
@@ -134,10 +176,6 @@ def test_stream_wait_does_not_shorten_upstream_read_for_disconnect_poll():
         response = SimpleNamespace(request = SimpleNamespace(extensions = {"timeout": {}}))
         seen_read_timeouts = []
 
-        class _Request:
-            async def is_disconnected(self):
-                return False
-
         class _NoItem:
             async def __anext__(self):
                 seen_read_timeouts.append(response.request.extensions["timeout"]["read"])
@@ -154,6 +192,141 @@ def test_stream_wait_does_not_shorten_upstream_read_for_disconnect_poll():
 
         assert seen_read_timeouts
         assert seen_read_timeouts[0] > inf_mod._STREAM_DISCONNECT_POLL_TIMEOUT_S
+
+    asyncio.run(_run())
+
+
+def test_latched_read_ceiling_covers_the_stall_guard():
+    """httpcore latches the read timeout before the body loop, so a low first-token value caps all reads."""
+
+    async def _run():
+        response = SimpleNamespace(request = SimpleNamespace(extensions = {"timeout": {}}))
+        armed = []
+
+        class _Items:
+            def __init__(self):
+                self.count = 0
+
+            async def __anext__(self):
+                armed.append(response.request.extensions["timeout"].get("read"))
+                self.count += 1
+                if self.count > 1:
+                    raise StopAsyncIteration
+                return "data: {}"
+
+        async for _ in inf_mod._aiter_llama_stream_items(
+            _Items(),
+            response = response,
+            first_token_deadline = time.monotonic() + 30.0,
+            post_first_item_read_timeout_s = 120.0,
+        ):
+            pass
+
+        assert armed[0] == 120.0, armed
+
+    asyncio.run(_run())
+
+
+def test_closing_the_pump_under_cancellation_re_raises_it(monkeypatch):
+    """A cancel during pump teardown must be re-raised, or the caller runs its completion path anyway."""
+
+    async def _run():
+        class _Blocks:
+            async def __anext__(self):
+                await asyncio.Future()
+
+        agen = inf_mod._aiter_llama_stream_items(
+            _Blocks(),
+            first_token_deadline = time.monotonic() + 30,
+            keepalive_interval_s = 0.01,
+        )
+        assert await agen.__anext__() is inf_mod._LLAMA_STREAM_KEEPALIVE
+
+        # monkeypatch, not assignment: inf_mod.asyncio is the stdlib module.
+        async def _cancelled_wait(*args, **kwargs):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(inf_mod.asyncio, "wait", _cancelled_wait)
+        try:
+            await agen.aclose()
+            outcome = "swallowed"
+        except asyncio.CancelledError:
+            outcome = "re-raised"
+        finally:
+            monkeypatch.undo()
+
+        assert outcome == "re-raised", (
+            "the pump absorbed a cancellation that _aclose_stream_resources "
+            "needs to see, so a cancelled stream would report a clean close"
+        )
+
+    asyncio.run(_run())
+
+
+def test_a_callable_bound_latches_no_socket_ceiling():
+    """A callable bound can rise later, so no socket ceiling is latched; the wall-clock deadline
+    enforces."""
+
+    async def _run():
+        response = SimpleNamespace(request = SimpleNamespace(extensions = {"timeout": {}}))
+        armed = []
+        values = iter([0.5, inf_mod._OPENAI_PASSTHROUGH_TERMINAL_GRACE_S])
+
+        class _Items:
+            def __init__(self):
+                self.count = 0
+
+            async def __anext__(self):
+                armed.append(response.request.extensions["timeout"].get("read"))
+                self.count += 1
+                if self.count > 2:
+                    raise StopAsyncIteration
+                return "data: {}"
+
+        async for _ in inf_mod._aiter_llama_stream_items(
+            _Items(),
+            response = response,
+            first_token_deadline = time.monotonic() + 0.5,
+            post_first_item_read_timeout_s = lambda: next(values, 0.5),
+        ):
+            pass
+
+        assert armed[0] is None, armed
+
+    asyncio.run(_run())
+
+
+def test_deadline_does_not_discard_a_read_that_already_landed():
+    """The deadline may fire only on an empty asyncio.wait, so a landed read is not discarded."""
+
+    async def _run():
+        gate = asyncio.Event()
+
+        class _Items:
+            def __init__(self):
+                self.count = 0
+
+            async def __anext__(self):
+                self.count += 1
+                if self.count > 1:
+                    raise StopAsyncIteration
+                await gate.wait()
+                return "data: {}"
+
+        out = []
+        agen = inf_mod._aiter_llama_stream_items(
+            _Items(),
+            first_token_deadline = time.monotonic() + 0.2,
+            keepalive_interval_s = 0.05,
+        )
+        async for item in agen:
+            if item is inf_mod._LLAMA_STREAM_KEEPALIVE:
+                gate.set()
+                await asyncio.sleep(0.4)
+                continue
+            out.append(item)
+
+        assert out == ["data: {}"], out
 
     asyncio.run(_run())
 
@@ -206,17 +379,11 @@ def test_preheader_send_cleanup_on_disconnect_and_cancel():
 
 
 def test_stream_stall_timeout_callable_re_resolved_each_read():
-    # The OpenAI passthrough passes a callable so the stall bound can switch to
-    # the short post-terminal grace mid-stream; it must be re-resolved per read,
-    # not captured once at generator start.
+    # Callable must be re-resolved per read, not captured at generator start.
     async def _run():
         response = SimpleNamespace(request = SimpleNamespace(extensions = {"timeout": {}}))
         values = iter([100.0, 2.0])
         seen = []
-
-        class _Request:
-            async def is_disconnected(self):
-                return False
 
         class _Items:
             def __init__(self):
@@ -239,9 +406,6 @@ def test_stream_stall_timeout_callable_re_resolved_each_read():
             seen.append(response.request.extensions["timeout"].get("read"))
 
         assert len(seen) == 3
-        # The callable is resolved right after the first item (arming the
-        # post-first window) and again before each later read, consuming
-        # successive values.
         assert seen[0] == 100.0
         assert 1.0 <= seen[1] <= 2.0
         assert 4.0 <= seen[2] <= 5.0
@@ -250,17 +414,10 @@ def test_stream_stall_timeout_callable_re_resolved_each_read():
 
 
 def test_stream_stall_timeout_disabled_clears_read_timeout():
-    # UNSLOTH_OPENAI_COMPAT_STREAM_STALL_TIMEOUT=0 disables the stall guard, so
-    # the callable returns None. Once a chunk has arrived the leftover
-    # first-token read timeout must be cleared, else a long post-first-chunk gap
-    # trips a stale deadline the operator asked to turn off.
+    # Stall guard disabled: the leftover first-token timeout must be cleared.
     async def _run():
         response = SimpleNamespace(request = SimpleNamespace(extensions = {"timeout": {}}))
         seen = []
-
-        class _Request:
-            async def is_disconnected(self):
-                return False
 
         class _Items:
             def __init__(self):
@@ -282,8 +439,110 @@ def test_stream_stall_timeout_disabled_clears_read_timeout():
         ):
             seen.append(response.request.extensions["timeout"].get("read"))
 
-        # The first-token path armed a finite read timeout; after the first chunk
-        # with the guard disabled, it is cleared to None on every subsequent read.
         assert seen == [None, None], seen
 
     asyncio.run(_run())
+
+
+@pytest.mark.parametrize("wire_format", ["lines", "bytes"])
+def test_prompt_progress_does_not_start_the_decode_timeout(wire_format):
+    async def run():
+        progress = "data: " + json.dumps(
+            {
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}}],
+                "prompt_progress": {"processed": 512, "total": 2048},
+            }
+        )
+        output = 'data: {"choices":[{"index":0,"delta":{"content":"ok"}}]}'
+        response = SimpleNamespace(request = SimpleNamespace(extensions = {"timeout": {}}))
+
+        async def items():
+            if wire_format == "bytes":
+                data = (progress + "\n\n").encode()
+                yield data[:40]
+                yield data[40:]
+            else:
+                yield progress
+                yield ""
+            await asyncio.sleep(0.08)
+            yield (output + "\n\n").encode() if wire_format == "bytes" else output
+            await asyncio.Future()
+
+        received = []
+        with pytest.raises(inf_mod.httpx.ReadTimeout, match = "mid-response"):
+            async for item in inf_mod._aiter_llama_stream_items(
+                items(),
+                response = response,
+                first_token_deadline = time.monotonic() + 1,
+                post_first_item_read_timeout_s = 0.02,
+                track_prefill_progress = True,
+            ):
+                received.append(item)
+                if "ok" not in str(item):
+                    assert response.request.extensions["timeout"]["read"] is None
+        assert any("ok" in str(item) for item in received)
+        assert response.request.extensions["timeout"]["read"] == 0.02
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("advancing", [True, False])
+def test_only_advancing_prefill_progress_renews_the_deadline(monkeypatch, advancing):
+    monkeypatch.setattr(inf_mod, "_first_token_timeout_s", lambda: 0.12)
+
+    async def run():
+        async def items():
+            for index in range(6):
+                yield "data: " + json.dumps(
+                    {
+                        "choices": [{"delta": {"role": "assistant", "content": None}}],
+                        "prompt_progress": {"processed": index if advancing else 0},
+                    }
+                )
+                await asyncio.sleep(0.04)
+            yield 'data: {"choices":[{"delta":{"content":"ok"}}]}'
+
+        received = []
+
+        async def drain():
+            async for item in inf_mod._aiter_llama_stream_items(
+                items(),
+                first_token_deadline = time.monotonic() + 0.12,
+                post_first_item_read_timeout_s = 0.02,
+                track_prefill_progress = True,
+            ):
+                received.append(item)
+
+        if advancing:
+            await drain()
+            assert '"ok"' in received[-1]
+        else:
+            with pytest.raises(inf_mod.httpx.ReadTimeout, match = "first token"):
+                await drain()
+            assert len(received) < 6
+
+    asyncio.run(run())
+
+
+def test_prefill_tracking_preserves_terminal_grace_without_output():
+    async def run():
+        response = SimpleNamespace(request = SimpleNamespace(extensions = {"timeout": {}}))
+        armed = []
+
+        async def items():
+            armed.append(response.request.extensions["timeout"]["read"])
+            yield 'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}'
+            await asyncio.Future()
+
+        with pytest.raises(inf_mod.httpx.ReadTimeout, match = "mid-response"):
+            async for _ in inf_mod._aiter_llama_stream_items(
+                items(),
+                response = response,
+                first_token_deadline = time.monotonic() + 1,
+                post_first_item_read_timeout_s = lambda: 0.02,
+                track_prefill_progress = True,
+            ):
+                pass
+        assert armed == [None]
+
+    asyncio.run(run())
