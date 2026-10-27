@@ -2631,7 +2631,9 @@ def _real_tokenizer_mlx_backend(monkeypatch, tokenizer, token_ids):
     sys.modules["mlx_lm"].stream_generate = _stream_generate
     # The fake mlx_lm hides the real detokenizer classes the incremental decode checks for.
     monkeypatch.setitem(sys.modules, "mlx_lm.tokenizer_utils", tokenizer_utils)
-    monkeypatch.setattr(tokenizer, "chat_template", "x", raising = False)
+    # TokenizerWrapper forwards the set to the HF tokenizer but cannot delete it on undo,
+    # and a failed undo leaves the fake mlx modules installed for later tests.
+    monkeypatch.setattr(tokenizer._tokenizer, "chat_template", "x", raising = False)
     backend._tokenizer = tokenizer
     return backend
 
