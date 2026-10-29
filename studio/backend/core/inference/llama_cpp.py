@@ -2189,6 +2189,7 @@ def _archive_and_recall(
     try:
         from core.inference.tools import build_conversation_recall
         from core.rag import conversation_archive
+        from core.rag.retrieval import query_vector_memo
 
         if not conversation_archive.enabled():
             return result
@@ -2236,48 +2237,50 @@ def _archive_and_recall(
                 break
             attempt_k = max(1, attempt_k // 2)
 
-        for index, k in enumerate(attempts):
-            recall = build_conversation_recall(
-                conversation,
-                thread_id,
-                style = style,
-                top_k = k,
-                branch_messages = branch_messages,
-            )
-            if not recall:
-                result["counts"] = counts
-                return result
-
-            candidate = _inject_recall(conversation, recall, style)
-            if candidate is None:
-                result["counts"] = counts
-                return result
-
-            grew = None
-            if count_tokens is not None and recall_budget_tokens > 0:
-                try:
-                    grew = count_tokens(candidate["conversation"]) - count_tokens(conversation)
-                except Exception:
-                    grew = None
-            if grew is not None and grew > recall_budget_tokens:
-                logger.info(
-                    "conversation_recall.over_budget grew=%s budget=%s top_k=%s",
-                    grew,
-                    recall_budget_tokens,
-                    k,
+        # One encode per query across the retries and the widenings inside each recall.
+        with query_vector_memo():
+            for index, k in enumerate(attempts):
+                recall = build_conversation_recall(
+                    conversation,
+                    thread_id,
+                    style = style,
+                    top_k = k,
+                    branch_messages = branch_messages,
                 )
-                if index + 1 < len(attempts):
-                    continue
-                logger.info(
-                    "conversation_recall.dropped_over_budget budget=%s", recall_budget_tokens
-                )
-                result["counts"] = counts
-                return result
+                if not recall:
+                    result["counts"] = counts
+                    return result
 
-            result["conversation"] = candidate["conversation"]
-            result["events"] = candidate["events"]
-            result["anchored"] = candidate["anchored"]
-            break
+                candidate = _inject_recall(conversation, recall, style)
+                if candidate is None:
+                    result["counts"] = counts
+                    return result
+
+                grew = None
+                if count_tokens is not None and recall_budget_tokens > 0:
+                    try:
+                        grew = count_tokens(candidate["conversation"]) - count_tokens(conversation)
+                    except Exception:
+                        grew = None
+                if grew is not None and grew > recall_budget_tokens:
+                    logger.info(
+                        "conversation_recall.over_budget grew=%s budget=%s top_k=%s",
+                        grew,
+                        recall_budget_tokens,
+                        k,
+                    )
+                    if index + 1 < len(attempts):
+                        continue
+                    logger.info(
+                        "conversation_recall.dropped_over_budget budget=%s", recall_budget_tokens
+                    )
+                    result["counts"] = counts
+                    return result
+
+                result["conversation"] = candidate["conversation"]
+                result["events"] = candidate["events"]
+                result["anchored"] = candidate["anchored"]
+                break
 
         counts["recalled_chunks"] = int(recall.get("sources") or 0)
         result["counts"] = counts
@@ -4019,6 +4022,9 @@ _TP_UNMEASURED_CTX = 4096
 
 # Auto offload context when no GPU subset holds the model; prefers a chat-useful size, kept separate from _FIT_MIN_CTX (search and Apple floor).
 _AUTO_OFFLOAD_CTX = 8192
+
+# Auto context on unified memory; 65536 is the floor unsloth start agents need.
+_APPLE_AUTO_CTX = 65536
 
 # Must stay >= fit search floor or the Auto re-check flips --fit off (test pins it). amd-smi vs HIP VRAM totals differing over 10% are different scopes.
 _AMD_SMI_TOTAL_TOLERANCE = 0.10
@@ -18311,6 +18317,8 @@ class LlamaCppBackend:
             total_ram_mib = self._total_system_memory_mib()
             if total_ram_mib is None:
                 return None
+            if self._host_offload_fits_without_gpus(argv, total_ram_mib):
+                return None
             probed = self._get_gpu_memory(binary)
             # an igpu and a MIG/vGPU line report total 0, leaving the ceiling unknown
             if any(total <= 0 for _idx, _free, total in probed):
@@ -18323,6 +18331,22 @@ class LlamaCppBackend:
         except Exception as e:  # noqa: BLE001 -- a probe that failed is not a verdict
             logger.debug("Host-RAM preflight failed for the route: %s", e)
         return None
+
+    def _host_offload_fits_without_gpus(self, argv: list[str], total_ram_mib: int) -> bool:
+        """Whole GGUF fits RAM less headroom: every credit (VRAM, lazy read) only lowers the
+        priced bytes, so no GPU probe can warn. False when unsure or opted out (that path logs)."""
+        if self._host_offload_warning_opted_out():
+            return False
+        model_path = _extra_args_device(argv, self._ARGV_MODEL)
+        if not model_path:
+            return False
+        try:
+            model_bytes = self._get_gguf_size_bytes(model_path)
+        except Exception:  # noqa: BLE001
+            return False
+        return 0 < model_bytes and model_bytes / (1024 * 1024) <= (
+            total_ram_mib - _HOST_RAM_HEADROOM_MIB
+        )
 
     # Each ask may take several 15s Hub calls, so the route hands its verdict to the load.
     # Taken once by its own load; the TTL only covers a route ask no load came for.
@@ -26393,7 +26417,7 @@ class LlamaCppBackend:
                             max_available_ctx = min(_metal_floor_ctx, native_ctx_for_cap)
                             _apple_ctx_unmeasured = True
                         if not explicit_ctx:
-                            effective_ctx = max_available_ctx
+                            effective_ctx = min(max_available_ctx, _APPLE_AUTO_CTX)
                         elif _apple_ctx_unmeasured:
                             # Never publish a ceiling below the launched context.
                             max_available_ctx = max(max_available_ctx, effective_ctx)
@@ -26509,9 +26533,10 @@ class LlamaCppBackend:
                                 and _vram_fit_ctx
                                 and min(_FIT_MIN_CTX, effective_ctx)
                                 <= _vram_fit_ctx
-                                < effective_ctx
+                                < max_available_ctx
                             ):
-                                effective_ctx = max_available_ctx = _vram_fit_ctx
+                                max_available_ctx = _vram_fit_ctx
+                                effective_ctx = min(effective_ctx, _vram_fit_ctx)
                         # Unmeasured floors still rely on llama.cpp's fitter.
                         _metal_full_offload_pinned = bool(
                             _apple_measured_ceiling is not None
@@ -33865,7 +33890,7 @@ class LlamaCppBackend:
 
     @staticmethod
     def _pid_start_identity(pid: int) -> str:
-        """True when the parent still runs, so the server is not orphaned; uncertainty reads as alive so a live server is never mistakenly reaped"""
+        """Process start time as a string ('' when unknown); a recycled PID will not match it."""
         try:
             import psutil
             try:
@@ -33886,7 +33911,7 @@ class LlamaCppBackend:
 
     @staticmethod
     def _pid_parent_is_alive(pid: int) -> bool:
-        """Reaps only true orphans so a second backend cannot kill a live server; recycled PIDs are rejected by start time and name; SIGKILL becomes SIGTERM on Windows"""
+        """True when the parent still runs, so the server is not orphaned; uncertainty reads as alive."""
         try:
             import psutil
 
@@ -33911,7 +33936,7 @@ class LlamaCppBackend:
             if ppid <= 1:
                 return False
             return Path(f"/proc/{ppid}").exists()
-        return False
+        return True  # no psutil and no /proc: unknown
 
     @staticmethod
     def _unlink_pidfile(path: Path) -> None:
@@ -33944,7 +33969,6 @@ class LlamaCppBackend:
             return 0  # never our own pid; leave the record alone
 
         if cls._pid_parent_is_alive(pid):
-            # Kills only Unsloth-root or env-override servers, gathering all candidates first so a failed scan kills none; a positive count arms the VRAM settle wait
             return 0
 
         # Parent is gone: candidate orphan. Reject a PID recycled to something else.
@@ -34160,7 +34184,6 @@ class LlamaCppBackend:
 
             # -- Ownership check, orphan check, kill ---------------------------
             for pid, binary, kill in candidates:
-                # atexit: log streams may be closed, so log nothing; stdlib loggers need raiseExceptions off, while the except covers structlog; neither alone is enough
                 if not _is_signalable_pid(pid):
                     continue
                 # Ownership: exact match OR binary under a known root.
@@ -35204,7 +35227,8 @@ class LlamaCppBackend:
 
             try:
                 # trust_env=False: an HTTP proxy can 503 for 127.0.0.1 and hang the load.
-                resp = httpx.get(url, timeout = 2.0, trust_env = False)
+                # Shared context: httpx otherwise loads the CA bundle on every probe.
+                resp = httpx.get(url, timeout = 2.0, trust_env = False, verify = _local_ssl_context())
                 if resp.status_code == 200:
                     # A cancel during the 2s probe must not publish the dropped model.
                     if cancelled is not None and cancelled():

@@ -2180,8 +2180,8 @@ export const en = {
       avatarShape: "Avatar shape",
       avatarShapeCircle: "Circle",
       avatarShapeRounded: "Rounded",
-      greetingSloth: "Sloth in greeting",
-      greetingSlothDescription: "Show the sloth in the chat greeting.",
+      greetingSloth: "Greeting",
+      greetingSlothDescription: "Show the greeting on new chats.",
       chooseSloth: "Or pick a sloth",
       noPicture: "No profile picture",
       noneLabel: "None",
@@ -2881,9 +2881,8 @@ export const en = {
       inlineEditResponse: "Edit response on responses",
       inlineEditResponseDescription:
         "Keep Edit response on every response, instead of in the More menu.",
-      modelDisclaimer: "Model disclaimer",
-      modelDisclaimerDescription:
-        'Show "LLMs can make mistakes" under the chat box.',
+      composerAtBottom: "Composer at the bottom",
+      composerAtBottomDescription: "Start new chats with the composer at the bottom of the page instead of the middle.",
       projectAttachments: "Share files across a project",
       projectAttachmentsDescription:
         "Make new chat attachments available to every chat in the project.",
@@ -3721,6 +3720,8 @@ export const en = {
       history: "History",
     },
     goToLibrary: "Go to Library",
+    imageTraining: "Image training",
+    goToImageTraining: "Train image LoRAs",
     loadingRuntime: "Loading training runtime...",
     checkingSupport: "Checking this machine for training support...",
     backToHistory: "Back to history",
